@@ -27,14 +27,15 @@ use ldk_node::lightning::ln::msgs::SocketAddress;
 use ldk_node::lightning::util::logger::Logger as _;
 use ldk_node::lightning::util::persist::KVStore;
 use ldk_node::lightning::{log_debug, log_info};
+use ldk_node::lightning_invoice::Bolt11Invoice;
 use ldk_node::payment::{PaymentKind as LightningPaymentKind, PaymentKind};
-use ldk_node::{BuildError, NodeError};
+use ldk_node::{BuildError, NodeError, bitcoin};
 
 use tokio::runtime::Runtime;
 
 use std::cmp;
 use std::collections::HashMap;
-use std::fmt::Write;
+use std::fmt::{self, Write};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
@@ -215,6 +216,36 @@ impl From<TrustedError> for WalletError {
 impl From<NodeError> for WalletError {
 	fn from(e: NodeError) -> WalletError {
 		WalletError::LdkNodeFailure(e)
+	}
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SingleUseReceiveUri {
+	pub address: Option<bitcoin::Address>,
+	pub invoice: Bolt11Invoice,
+	pub amount: Option<Amount>,
+}
+
+impl fmt::Display for SingleUseReceiveUri {
+	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+		let mut uri = "BITCOIN:".to_owned();
+		match &self.address {
+			Some(address) => {
+				write!(&mut uri, "{address}")?;
+				if let Some(amt) = self.amount {
+					write!(&mut uri, "?AMOUNT={}&", amt.btc_decimal_rounding_up_to_sats())?;
+				} else {
+					write!(&mut uri, "?")?;
+				}
+			},
+			None => {
+				write!(&mut uri, "?")?;
+			},
+		}
+		write!(&mut uri, "LIGHTNING={}", self.invoice)?;
+
+		let res = uri.to_ascii_uppercase();
+		write!(f, "{}", res)
 	}
 }
 
@@ -641,7 +672,7 @@ impl Wallet {
 	/// This is suitable for inclusion in a QR code.
 	pub async fn get_single_use_receive_uri(
 		&self, amount: Option<Amount>,
-	) -> Result<String, WalletError> {
+	) -> Result<SingleUseReceiveUri, WalletError> {
 		let (enable_onchain, bolt11) = if let Some(amt) = amount {
 			let enable_onchain = amt >= self.inner.tunables.onchain_receive_threshold;
 			// We always assume lighting balance is an overestimate by `rebalance_min`.
@@ -665,19 +696,12 @@ impl Wallet {
 				self.inner.trusted.get_bolt11_invoice(amount).await?,
 			)
 		};
-		let mut uri = "BITCOIN:".to_owned();
 		if enable_onchain {
-			write!(&mut uri, "{}", self.inner.ln_wallet.get_on_chain_address()?).unwrap();
-			if let Some(amt) = amount {
-				write!(&mut uri, "?AMOUNT={}&", amt.btc_decimal_rounding_up_to_sats()).unwrap();
-			} else {
-				write!(&mut uri, "?").unwrap();
-			}
+			let address = self.inner.ln_wallet.get_on_chain_address()?;
+			Ok(SingleUseReceiveUri { address: Some(address), invoice: bolt11, amount })
 		} else {
-			write!(&mut uri, "?").unwrap();
+			Ok(SingleUseReceiveUri { address: None, invoice: bolt11, amount })
 		}
-		write!(&mut uri, "LIGHTNING={}", bolt11).unwrap();
-		Ok(uri.to_ascii_uppercase())
 	}
 
 	/// Parses payment instructions from an arbitrary string provided by a user, scanned from a QR
