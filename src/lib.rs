@@ -54,7 +54,7 @@ type TrustedWallet = trusted_wallet::SparkWallet;
 use store::{PaymentId, TxMetadata, TxMetadataStore, TxType};
 pub use store::{PaymentType, Transaction, TxStatus};
 
-#[derive(Debug)]
+#[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Balances {
 	pub available_balance: Amount,
 	pub pending_balance: Amount,
@@ -75,28 +75,33 @@ pub struct Wallet {
 	inner: Arc<WalletImpl>,
 }
 
+#[derive(Debug, Clone)]
 pub enum VssAuth {
 	LNURLAuthServer(String),
 	FixedHeaders(HashMap<String, String>),
 }
 
+#[derive(Debug, Clone)]
 pub struct VssConfig {
 	vss_url: String,
 	store_id: String,
 	headers: VssAuth,
 }
 
+#[derive(Debug, Clone)]
 pub enum StorageConfig {
 	LocalSQLite(String),
 	//VSS(VssConfig),
 }
 
+#[derive(Debug, Clone)]
 pub enum ChainSource {
 	//Electrum(String),
 	Esplora(String),
 	BitcoindRPC { host: String, port: u16, user: String, password: String },
 }
 
+#[derive(Debug, Clone)]
 pub struct WalletConfig {
 	pub storage_config: StorageConfig,
 	pub chain_source: ChainSource,
@@ -106,7 +111,7 @@ pub struct WalletConfig {
 	pub tunables: Tunables,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Debug, Clone, Copy)]
 pub struct Tunables {
 	pub trusted_balance_limit: Amount,
 	/// Trusted balances below this threshold will not be transferred to non-trusted balance
@@ -134,6 +139,7 @@ impl Default for Tunables {
 }
 
 /// A payable version of [`PaymentInstructions`] (i.e. with a set amount).
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PaymentInfo((PaymentInstructions, Amount));
 
 impl PaymentInfo {

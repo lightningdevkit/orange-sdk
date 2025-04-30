@@ -24,23 +24,26 @@ use std::future::Future;
 use std::str::FromStr;
 use std::sync::Arc;
 
-#[derive(Clone, Copy, Hash, Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, Hash, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) struct TrustedPaymentId(uuid::Uuid);
 impl Readable for TrustedPaymentId {
 	fn read<R: io::Read>(r: &mut R) -> Result<Self, DecodeError> {
 		Ok(TrustedPaymentId(uuid::Uuid::from_bytes(Readable::read(r)?)))
 	}
 }
+
 impl Writeable for TrustedPaymentId {
 	fn write<W: Writer>(&self, w: &mut W) -> Result<(), io::Error> {
 		self.0.as_bytes().write(w)
 	}
 }
+
 impl fmt::Display for TrustedPaymentId {
 	fn fmt(&self, f: &mut fmt::Formatter) -> Result<(), fmt::Error> {
 		self.0.fmt(f)
 	}
 }
+
 impl FromStr for TrustedPaymentId {
 	type Err = <uuid::Uuid as FromStr>::Err;
 	fn from_str(s: &str) -> Result<Self, <uuid::Uuid as FromStr>::Err> {
@@ -50,6 +53,7 @@ impl FromStr for TrustedPaymentId {
 
 pub(crate) type Error = SparkSdkError;
 
+#[derive(Debug, Clone)]
 pub(crate) struct Payment {
 	pub(crate) id: TrustedPaymentId,
 	pub(crate) amount: Amount,

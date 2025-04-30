@@ -62,6 +62,7 @@ struct LightningWalletImpl {
 	ldk_node: ldk_node::Node,
 	payment_receipt_flag: watch::Receiver<()>,
 }
+
 pub(crate) struct LightningWallet {
 	inner: Arc<LightningWalletImpl>,
 }

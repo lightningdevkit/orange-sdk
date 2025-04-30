@@ -31,14 +31,14 @@ use std::time::Duration;
 const STORE_PRIMARY_KEY: &'static str = "orange_sdk";
 const STORE_SECONDARY_KEY: &'static str = "payment_store";
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TxStatus {
 	Pending,
 	Completed,
 	Failed,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Debug, Clone)]
 pub struct Transaction {
 	pub status: TxStatus,
 	pub outbound: bool,
@@ -48,7 +48,7 @@ pub struct Transaction {
 	pub time_since_epoch: Duration,
 }
 
-#[derive(Clone, Hash, PartialEq, Eq, Debug)]
+#[derive(Debug, Clone, Hash, PartialEq, Eq)]
 pub(crate) enum PaymentId {
 	Lightning([u8; 32]),
 	Trusted(TrustedPaymentId),
@@ -88,7 +88,7 @@ impl_writeable_tlv_based_enum!(PaymentId,
 	{1, Trusted} => (),
 );
 
-#[derive(Clone, Debug)]
+#[derive(Debug, Clone)]
 pub enum PaymentType {
 	OutgoingLightningBolt12 {
 		/// The lightning "payment preimage" which represents proof that the payment completed.
@@ -123,7 +123,7 @@ impl_writeable_tlv_based_enum!(PaymentType,
 
 );
 
-#[derive(Clone, Debug)]
+#[derive(Debug, Clone)]
 pub(crate) enum TxType {
 	TransferToNonTrusted {
 		trusted_payment: TrustedPaymentId,
