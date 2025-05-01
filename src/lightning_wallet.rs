@@ -58,6 +58,12 @@ impl From<&PaymentDetails> for PaymentType {
 	}
 }
 
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct LightningWalletBalance {
+	pub(crate) lightning: Amount,
+	pub(crate) onchain: Amount,
+}
+
 struct LightningWalletImpl {
 	ldk_node: ldk_node::Node,
 	payment_receipt_flag: watch::Receiver<()>,
@@ -186,12 +192,14 @@ impl LightningWallet {
 		self.inner.ldk_node.list_payments()
 	}
 
-	pub(crate) fn get_balance(&self) -> (Amount, Amount) {
+	pub(crate) fn get_balance(&self) -> LightningWalletBalance {
 		let balances = self.inner.ldk_node.list_balances();
-		(
-			Amount::from_sats(balances.total_lightning_balance_sats).expect("invalid amount"),
-			Amount::from_sats(balances.total_onchain_balance_sats).expect("invalid amount"),
-		)
+		LightningWalletBalance {
+			lightning: Amount::from_sats(balances.total_lightning_balance_sats)
+				.expect("invalid amount"),
+			onchain: Amount::from_sats(balances.total_onchain_balance_sats)
+				.expect("invalid amount"),
+		}
 	}
 
 	pub(crate) fn estimate_receivable_balance(&self) -> Amount {

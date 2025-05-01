@@ -642,14 +642,16 @@ impl Wallet {
 	/// Gets our current total balance
 	pub async fn get_balance(&self) -> Balances {
 		let trusted_balance = self.inner.trusted.get_balance();
-		let (available_ln, pending_balance) = self.inner.ln_wallet.get_balance();
+		let ln_balance = self.inner.ln_wallet.get_balance();
 		log_debug!(
 			self.inner.logger,
-			"Have trusted balance of {trusted_balance:?}, lightning available balance of {available_ln:?}",
+			"Have trusted balance of {trusted_balance:?}, lightning available balance of {:?}, and on chain balance of {:?}",
+			ln_balance.lightning,
+			ln_balance.onchain
 		);
 		Balances {
-			available_balance: available_ln.saturating_add(trusted_balance),
-			pending_balance,
+			available_balance: ln_balance.lightning.saturating_add(trusted_balance),
+			pending_balance: ln_balance.onchain,
 		}
 	}
 
@@ -734,7 +736,7 @@ impl Wallet {
 	// returns true once the payment is pending
 	pub async fn pay(&self, instructions: &PaymentInfo) -> Result<(), WalletError> {
 		let trusted_balance = self.inner.trusted.get_balance();
-		let (available_ln, _) = self.inner.ln_wallet.get_balance();
+		let ln_balance = self.inner.ln_wallet.get_balance();
 
 		let mut last_trusted_err = None;
 		let mut last_lightning_err = None;
@@ -775,11 +777,11 @@ impl Wallet {
 		};
 
 		let mut pay_lightning = async |method, ty: &dyn Fn() -> PaymentType| {
-			if instructions.0.1 <= available_ln {
+			if instructions.0.1 <= ln_balance.lightning {
 				if let Ok(lightning_fee) =
 					self.inner.ln_wallet.estimate_fee(method, instructions.0.1).await
 				{
-					if lightning_fee.saturating_add(instructions.0.1) <= available_ln {
+					if lightning_fee.saturating_add(instructions.0.1) <= ln_balance.lightning {
 						let res = self.inner.ln_wallet.pay(method, instructions.0.1).await;
 						match res {
 							Ok(id) => {
