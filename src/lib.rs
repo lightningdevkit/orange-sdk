@@ -910,6 +910,10 @@ impl Wallet {
 			last_trusted_err.unwrap_or(WalletError::LdkNodeFailure(NodeError::InsufficientFunds)),
 		))
 	}
+
+	pub fn get_tunables(&self) -> Tunables {
+		self.inner.tunables
+	}
 }
 
 impl Drop for Wallet {
