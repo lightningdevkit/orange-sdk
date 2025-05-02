@@ -939,11 +939,3 @@ impl Drop for Wallet {
 		self.inner.ln_wallet.stop();
 	}
 }
-
-#[cfg(test)]
-mod tests {
-	#[test]
-	fn test_node_start() {
-		// TODO
-	}
-}
