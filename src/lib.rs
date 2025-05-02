@@ -531,9 +531,18 @@ impl Wallet {
 			let lightning_receive_fee = match payment.kind {
 				PaymentKind::Bolt11Jit { counterparty_skimmed_fee_msat, .. } => {
 					let msats = counterparty_skimmed_fee_msat.unwrap_or(0);
+					debug_assert_eq!(payment.direction, PaymentDirection::Inbound);
 					Some(Amount::from_milli_sats(msats).expect("Must be valid"))
 				},
 				_ => None,
+			};
+			let fee = match payment.fee_paid_msat {
+				None => lightning_receive_fee,
+				Some(fee) => Some(
+					Amount::from_milli_sats(fee)
+						.unwrap()
+						.saturating_add(lightning_receive_fee.unwrap_or(Amount::ZERO)),
+				),
 			};
 			if let Some(tx_metadata) = tx_metadata.get(&PaymentId::Lightning(payment.id.0)) {
 				match &tx_metadata.ty {
@@ -561,7 +570,7 @@ impl Wallet {
 						let entry = internal_transfers
 							.entry(PaymentId::Lightning(payment.id.0))
 							.or_insert(InternalTransfer {
-								lightning_receive_fee: None,
+								lightning_receive_fee,
 								trusted_send_fee: None,
 								transaction: None,
 							});
@@ -572,7 +581,7 @@ impl Wallet {
 							status: payment.status.into(),
 							outbound: payment.direction == PaymentDirection::Outbound,
 							amount: Amount::from_milli_sats(payment.amount_msat.unwrap_or(0)).ok(), // TODO: when can this be none https://github.com/lightningdevkit/ldk-node/issues/495
-							fee: lightning_receive_fee,
+							fee,
 							payment_type: (&payment).into(),
 							time_since_epoch: tx_metadata.time,
 						});
@@ -582,7 +591,7 @@ impl Wallet {
 							status: payment.status.into(),
 							outbound: payment.direction == PaymentDirection::Outbound,
 							amount: Amount::from_milli_sats(payment.amount_msat.unwrap_or(0)).ok(), // TODO: when can this be none https://github.com/lightningdevkit/ldk-node/issues/495
-							fee: lightning_receive_fee,
+							fee,
 							payment_type: (&payment).into(),
 							time_since_epoch: tx_metadata.time,
 						})
@@ -607,7 +616,7 @@ impl Wallet {
 					status,
 					outbound: payment.direction == PaymentDirection::Outbound,
 					amount: payment.amount_msat.map(|a| Amount::from_milli_sats(a).unwrap()),
-					fee: lightning_receive_fee,
+					fee,
 					payment_type: (&payment).into(),
 					time_since_epoch: Duration::from_secs(payment.latest_update_timestamp),
 				})
