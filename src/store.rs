@@ -28,8 +28,8 @@ use std::str::FromStr;
 use std::sync::{Arc, RwLock, RwLockReadGuard};
 use std::time::Duration;
 
-const STORE_PRIMARY_KEY: &'static str = "orange_sdk";
-const STORE_SECONDARY_KEY: &'static str = "payment_store";
+const STORE_PRIMARY_KEY: &str = "orange_sdk";
+const STORE_SECONDARY_KEY: &str = "payment_store";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TxStatus {

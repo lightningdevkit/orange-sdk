@@ -523,7 +523,7 @@ impl Wallet {
 			} else {
 				// Apparently this can currently happen due to spark-internal transfers
 				continue;
-				debug_assert!(false, "Missing trusted payment {}", payment.id);
+				// debug_assert!(false, "Missing trusted payment {}", payment.id);
 			}
 		}
 		for payment in lightning_payments {
