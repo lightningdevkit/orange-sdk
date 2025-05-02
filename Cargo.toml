@@ -9,7 +9,7 @@ bitcoin-payment-instructions = { version = "0.4.0", features = ["http"] }
 chrono = { version = "0.4", default-features = false }
 tokio = { version = "1.0", default-features = false, features = ["rt-multi-thread", "sync"] }
 spark-rust = { version = "0.1.11" }
-spark-protos = { version = "0.1.9", default-features = false }
+spark-protos = { version = "=0.1.9", default-features = false }
 uuid = { version = "1.0", default-features = false }
 
 [dev-dependencies]
