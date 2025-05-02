@@ -692,6 +692,9 @@ impl Wallet {
 				.ln_wallet
 				.estimate_receivable_balance()
 				.saturating_sub(self.inner.tunables.rebalance_min);
+			// use trusted if the amount is both:
+			//   - Less than or equal to our trusted balance limit
+			//   - We don't have enough inbound capacity to receive on LN
 			let use_trusted =
 				amt <= self.inner.tunables.trusted_balance_limit && amt >= lightning_receivable;
 
@@ -786,11 +789,17 @@ impl Wallet {
 		};
 
 		let mut pay_lightning = async |method, ty: &dyn Fn() -> PaymentType| {
-			if instructions.0.1 <= ln_balance.lightning {
+			let typ = ty();
+			let balance = if matches!(typ, PaymentType::OutgoingOnChain { .. }) {
+				ln_balance.onchain
+			} else {
+				ln_balance.lightning
+			};
+			if instructions.0.1 <= balance {
 				if let Ok(lightning_fee) =
 					self.inner.ln_wallet.estimate_fee(method, instructions.0.1).await
 				{
-					if lightning_fee.saturating_add(instructions.0.1) <= ln_balance.lightning {
+					if lightning_fee.saturating_add(instructions.0.1) <= balance {
 						let res = self.inner.ln_wallet.pay(method, instructions.0.1).await;
 						match res {
 							Ok(id) => {
@@ -800,7 +809,7 @@ impl Wallet {
 								self.inner.tx_metadata.upsert(
 									PaymentId::Lightning(id.0),
 									TxMetadata {
-										ty: TxType::Payment { ty: ty() },
+										ty: TxType::Payment { ty: typ },
 										time: SystemTime::now()
 											.duration_since(SystemTime::UNIX_EPOCH)
 											.unwrap(),

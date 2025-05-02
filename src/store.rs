@@ -88,7 +88,7 @@ impl_writeable_tlv_based_enum!(PaymentId,
 	{1, Trusted} => (),
 );
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PaymentType {
 	OutgoingLightningBolt12 {
 		/// The lightning "payment preimage" which represents proof that the payment completed.
