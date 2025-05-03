@@ -25,7 +25,7 @@ use std::str::FromStr;
 use std::sync::Arc;
 
 #[derive(Debug, Clone, Copy, Hash, PartialEq, Eq, PartialOrd, Ord)]
-pub(crate) struct TrustedPaymentId(uuid::Uuid);
+pub(crate) struct TrustedPaymentId(pub(crate) uuid::Uuid);
 impl Readable for TrustedPaymentId {
 	fn read<R: io::Read>(r: &mut R) -> Result<Self, DecodeError> {
 		Ok(TrustedPaymentId(uuid::Uuid::from_bytes(Readable::read(r)?)))

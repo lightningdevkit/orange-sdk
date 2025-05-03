@@ -28,8 +28,8 @@ use std::str::FromStr;
 use std::sync::{Arc, RwLock, RwLockReadGuard};
 use std::time::Duration;
 
-const STORE_PRIMARY_KEY: &'static str = "orange_sdk";
-const STORE_SECONDARY_KEY: &'static str = "payment_store";
+const STORE_PRIMARY_KEY: &str = "orange_sdk";
+const STORE_SECONDARY_KEY: &str = "payment_store";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TxStatus {
@@ -88,7 +88,7 @@ impl_writeable_tlv_based_enum!(PaymentId,
 	{1, Trusted} => (),
 );
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PaymentType {
 	OutgoingLightningBolt12 {
 		/// The lightning "payment preimage" which represents proof that the payment completed.
@@ -225,5 +225,40 @@ impl TxMetadataStore {
 		} else {
 			Err(())
 		}
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+	use std::str::FromStr;
+
+	#[test]
+	fn test_payment_id_round_trip() {
+		let ln_id_bytes = [
+			1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24,
+			25, 26, 27, 28, 29, 30, 31, 32,
+		];
+		let ln_id = PaymentId::Lightning(ln_id_bytes);
+		let ln_id_str = ln_id.to_string();
+		assert_eq!(
+			ln_id_str,
+			"LN-0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20"
+		);
+		let parsed_ln_id = PaymentId::from_str(&ln_id_str).unwrap();
+		assert_eq!(ln_id, parsed_ln_id);
+
+		let trusted_uuid = uuid::Uuid::new_v4();
+		let trusted_id = PaymentId::Trusted(TrustedPaymentId(trusted_uuid));
+		let trusted_id_str = trusted_id.to_string();
+		assert_eq!(trusted_id_str, format!("TR-{trusted_uuid}"));
+		let parsed_trusted_id = PaymentId::from_str(&trusted_id_str).unwrap();
+		assert_eq!(trusted_id, parsed_trusted_id);
+
+		// Test invalid formats
+		assert!(PaymentId::from_str("INVALID").is_err());
+		assert!(PaymentId::from_str("LN-invalidhex").is_err());
+		assert!(PaymentId::from_str("TR-invaliduuid").is_err());
+		assert!(PaymentId::from_str("XX-something").is_err());
 	}
 }

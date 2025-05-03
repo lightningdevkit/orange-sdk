@@ -102,7 +102,10 @@ impl LightningWallet {
 			},
 			Network::Testnet4 => {},
 			Network::Signet => {},
-			Network::Regtest => {},
+			Network::Regtest => {
+				// We don't want to run an RGS server in tests so just enable p2p gossip
+				builder.set_gossip_source_p2p();
+			},
 			_ => unreachable!("Unknown network"),
 		}
 		builder.set_liquidity_source_lsps2(config.lsp.1, config.lsp.0, config.lsp.2);

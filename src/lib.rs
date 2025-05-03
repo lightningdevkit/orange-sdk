@@ -523,7 +523,7 @@ impl Wallet {
 			} else {
 				// Apparently this can currently happen due to spark-internal transfers
 				continue;
-				debug_assert!(false, "Missing trusted payment {}", payment.id);
+				// debug_assert!(false, "Missing trusted payment {}", payment.id);
 			}
 		}
 		for payment in lightning_payments {
@@ -531,9 +531,18 @@ impl Wallet {
 			let lightning_receive_fee = match payment.kind {
 				PaymentKind::Bolt11Jit { counterparty_skimmed_fee_msat, .. } => {
 					let msats = counterparty_skimmed_fee_msat.unwrap_or(0);
+					debug_assert_eq!(payment.direction, PaymentDirection::Inbound);
 					Some(Amount::from_milli_sats(msats).expect("Must be valid"))
 				},
 				_ => None,
+			};
+			let fee = match payment.fee_paid_msat {
+				None => lightning_receive_fee,
+				Some(fee) => Some(
+					Amount::from_milli_sats(fee)
+						.unwrap()
+						.saturating_add(lightning_receive_fee.unwrap_or(Amount::ZERO)),
+				),
 			};
 			if let Some(tx_metadata) = tx_metadata.get(&PaymentId::Lightning(payment.id.0)) {
 				match &tx_metadata.ty {
@@ -561,7 +570,7 @@ impl Wallet {
 						let entry = internal_transfers
 							.entry(PaymentId::Lightning(payment.id.0))
 							.or_insert(InternalTransfer {
-								lightning_receive_fee: None,
+								lightning_receive_fee,
 								trusted_send_fee: None,
 								transaction: None,
 							});
@@ -572,7 +581,7 @@ impl Wallet {
 							status: payment.status.into(),
 							outbound: payment.direction == PaymentDirection::Outbound,
 							amount: Amount::from_milli_sats(payment.amount_msat.unwrap_or(0)).ok(), // TODO: when can this be none https://github.com/lightningdevkit/ldk-node/issues/495
-							fee: lightning_receive_fee,
+							fee,
 							payment_type: (&payment).into(),
 							time_since_epoch: tx_metadata.time,
 						});
@@ -582,7 +591,7 @@ impl Wallet {
 							status: payment.status.into(),
 							outbound: payment.direction == PaymentDirection::Outbound,
 							amount: Amount::from_milli_sats(payment.amount_msat.unwrap_or(0)).ok(), // TODO: when can this be none https://github.com/lightningdevkit/ldk-node/issues/495
-							fee: lightning_receive_fee,
+							fee,
 							payment_type: (&payment).into(),
 							time_since_epoch: tx_metadata.time,
 						})
@@ -607,7 +616,7 @@ impl Wallet {
 					status,
 					outbound: payment.direction == PaymentDirection::Outbound,
 					amount: payment.amount_msat.map(|a| Amount::from_milli_sats(a).unwrap()),
-					fee: lightning_receive_fee,
+					fee,
 					payment_type: (&payment).into(),
 					time_since_epoch: Duration::from_secs(payment.latest_update_timestamp),
 				})
@@ -683,6 +692,9 @@ impl Wallet {
 				.ln_wallet
 				.estimate_receivable_balance()
 				.saturating_sub(self.inner.tunables.rebalance_min);
+			// use trusted if the amount is both:
+			//   - Less than or equal to our trusted balance limit
+			//   - We don't have enough inbound capacity to receive on LN
 			let use_trusted =
 				amt <= self.inner.tunables.trusted_balance_limit && amt >= lightning_receivable;
 
@@ -777,11 +789,17 @@ impl Wallet {
 		};
 
 		let mut pay_lightning = async |method, ty: &dyn Fn() -> PaymentType| {
-			if instructions.0.1 <= ln_balance.lightning {
+			let typ = ty();
+			let balance = if matches!(typ, PaymentType::OutgoingOnChain { .. }) {
+				ln_balance.onchain
+			} else {
+				ln_balance.lightning
+			};
+			if instructions.0.1 <= balance {
 				if let Ok(lightning_fee) =
 					self.inner.ln_wallet.estimate_fee(method, instructions.0.1).await
 				{
-					if lightning_fee.saturating_add(instructions.0.1) <= ln_balance.lightning {
+					if lightning_fee.saturating_add(instructions.0.1) <= balance {
 						let res = self.inner.ln_wallet.pay(method, instructions.0.1).await;
 						match res {
 							Ok(id) => {
@@ -791,7 +809,7 @@ impl Wallet {
 								self.inner.tx_metadata.upsert(
 									PaymentId::Lightning(id.0),
 									TxMetadata {
-										ty: TxType::Payment { ty: ty() },
+										ty: TxType::Payment { ty: typ },
 										time: SystemTime::now()
 											.duration_since(SystemTime::UNIX_EPOCH)
 											.unwrap(),
@@ -910,18 +928,14 @@ impl Wallet {
 			last_trusted_err.unwrap_or(WalletError::LdkNodeFailure(NodeError::InsufficientFunds)),
 		))
 	}
+
+	pub fn get_tunables(&self) -> Tunables {
+		self.inner.tunables
+	}
 }
 
 impl Drop for Wallet {
 	fn drop(&mut self) {
 		self.inner.ln_wallet.stop();
-	}
-}
-
-#[cfg(test)]
-mod tests {
-	#[test]
-	fn test_node_start() {
-		// TODO
 	}
 }
