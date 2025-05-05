@@ -105,7 +105,7 @@ fn test_pay_lightning_from_self_custody() {
 			third_party.bolt11_payment().receive(amount.milli_sats(), &desc, 300).unwrap();
 
 		let instr = wallet.parse_payment_instructions(invoice.to_string().as_str()).await.unwrap();
-		let info = PaymentInfo::set_amount(instr, amount).unwrap();
+		let info = PaymentInfo::build(instr, amount).unwrap();
 		wallet.pay(&info).await.unwrap();
 
 		// wait for payment to complete
@@ -169,7 +169,7 @@ fn test_pay_bolt12_from_self_custody() {
 			third_party.bolt12_payment().receive(amount.milli_sats(), "test", None, None).unwrap();
 
 		let instr = wallet.parse_payment_instructions(offer.to_string().as_str()).await.unwrap();
-		let info = PaymentInfo::set_amount(instr, amount).unwrap();
+		let info = PaymentInfo::build(instr, amount).unwrap();
 		wallet.pay(&info).await.unwrap();
 
 		// wait for payment to complete
@@ -250,7 +250,7 @@ fn test_pay_onchain_from_self_custody() {
 		let send_amount = Amount::from_sats(100_000).unwrap();
 
 		let instr = wallet.parse_payment_instructions(addr.to_string().as_str()).await.unwrap();
-		let info = PaymentInfo::set_amount(instr, send_amount).unwrap();
+		let info = PaymentInfo::build(instr, send_amount).unwrap();
 		wallet.pay(&info).await.unwrap();
 
 		// confirm the tx

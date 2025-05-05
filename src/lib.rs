@@ -141,7 +141,10 @@ impl Default for Tunables {
 
 /// A payable version of [`PaymentInstructions`] (i.e. with a set amount).
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PaymentInfo((PaymentInstructions, Amount));
+pub struct PaymentInfo {
+	instructions: PaymentInstructions,
+	amount: Amount,
+}
 
 impl PaymentInfo {
 	/// Prepares us to pay a [`PaymentInstructions`] by setting the amount.
@@ -152,10 +155,8 @@ impl PaymentInfo {
 	/// requirement is not met.
 	///
 	/// Otherwise, this amount can be any value.
-	pub fn set_amount(
-		instructions: PaymentInstructions, amount: Amount,
-	) -> Result<PaymentInfo, ()> {
-		Ok(PaymentInfo((instructions, amount)))
+	pub fn build(instructions: PaymentInstructions, amount: Amount) -> Result<PaymentInfo, ()> {
+		Ok(PaymentInfo { instructions, amount })
 		// todo
 		// let ln_amt = instructions.ln_payment_amount();
 		// let onchain_amt = instructions.onchain_payment_amount();
@@ -754,12 +755,12 @@ impl Wallet {
 		let mut last_lightning_err = None;
 
 		let mut pay_trusted = async |method, ty: &dyn Fn() -> PaymentType| {
-			if instructions.0.1 <= trusted_balance {
+			if instructions.amount <= trusted_balance {
 				if let Ok(trusted_fee) =
-					self.inner.trusted.estimate_fee(method, instructions.0.1).await
+					self.inner.trusted.estimate_fee(method, instructions.amount).await
 				{
-					if trusted_fee.saturating_add(instructions.0.1) <= trusted_balance {
-						let res = self.inner.trusted.pay(method, instructions.0.1).await;
+					if trusted_fee.saturating_add(instructions.amount) <= trusted_balance {
+						let res = self.inner.trusted.pay(method, instructions.amount).await;
 						match res {
 							Ok(id) => {
 								self.inner.tx_metadata.insert(
@@ -795,12 +796,12 @@ impl Wallet {
 			} else {
 				ln_balance.lightning
 			};
-			if instructions.0.1 <= balance {
+			if instructions.amount <= balance {
 				if let Ok(lightning_fee) =
-					self.inner.ln_wallet.estimate_fee(method, instructions.0.1).await
+					self.inner.ln_wallet.estimate_fee(method, instructions.amount).await
 				{
-					if lightning_fee.saturating_add(instructions.0.1) <= balance {
-						let res = self.inner.ln_wallet.pay(method, instructions.0.1).await;
+					if lightning_fee.saturating_add(instructions.amount) <= balance {
+						let res = self.inner.ln_wallet.pay(method, instructions.amount).await;
 						match res {
 							Ok(id) => {
 								// Note that the Payment Id can be repeated if we make a payment,
@@ -836,7 +837,7 @@ impl Wallet {
 			Err(())
 		};
 
-		let methods = match &instructions.0.0 {
+		let methods = match &instructions.instructions {
 			PaymentInstructions::ConfigurableAmount(conf) => conf
 				.methods()
 				.map(|m| match m {
