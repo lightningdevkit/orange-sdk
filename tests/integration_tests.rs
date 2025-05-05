@@ -49,7 +49,7 @@ fn test_receive_to_onchain() {
 		let recv_amt = Amount::from_sats(200_000).unwrap();
 
 		let uri = wallet.get_single_use_receive_uri(Some(recv_amt)).await.unwrap();
-		third_party
+		let txid = third_party
 			.onchain_payment()
 			.send_to_address(&uri.address.unwrap(), recv_amt.sats().unwrap(), None)
 			.unwrap();
@@ -76,7 +76,7 @@ fn test_receive_to_onchain() {
 		let tx = txs.into_iter().next().unwrap();
 		assert!(!tx.outbound);
 		assert_eq!(tx.status, TxStatus::Completed);
-		assert_eq!(tx.payment_type, PaymentType::IncomingOnChain {});
+		assert_eq!(tx.payment_type, PaymentType::IncomingOnChain { txid: Some(txid) });
 		assert_ne!(tx.time_since_epoch, Duration::ZERO);
 		assert_eq!(tx.amount, Some(recv_amt));
 		assert_eq!(tx.fee, Some(Amount::ZERO));

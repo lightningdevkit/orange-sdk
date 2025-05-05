@@ -910,7 +910,10 @@ impl Wallet {
 		// Finally, try trusted on-chain first,
 		for method in &methods {
 			if let PaymentMethod::OnChain { .. } = method {
-				if pay_trusted(method, &|| PaymentType::OutgoingOnChain {}).await.is_ok() {
+				if pay_trusted(method, &|| PaymentType::OutgoingOnChain { txid: None })
+					.await
+					.is_ok()
+				{
 					return Ok(());
 				};
 			}
@@ -919,7 +922,10 @@ impl Wallet {
 		// then pay on-chain out of the lightning wallet
 		for method in &methods {
 			if let PaymentMethod::OnChain { .. } = method {
-				if pay_lightning(method, &|| PaymentType::OutgoingOnChain {}).await.is_ok() {
+				if pay_lightning(method, &|| PaymentType::OutgoingOnChain { txid: None })
+					.await
+					.is_ok()
+				{
 					return Ok(());
 				};
 			}

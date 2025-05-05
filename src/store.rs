@@ -13,8 +13,8 @@
 
 use bitcoin_payment_instructions::amount::Amount;
 
+use ldk_node::bitcoin::Txid;
 use ldk_node::bitcoin::hex::{DisplayHex, FromHex};
-
 use ldk_node::lightning::types::payment::PaymentPreimage;
 use ldk_node::lightning::util::persist::KVStore;
 use ldk_node::lightning::util::ser::{Readable, Writeable};
@@ -104,10 +104,10 @@ pub enum PaymentType {
 		//invoice: Bolt11Invoice,
 	},
 	OutgoingOnChain {
-		// TODO txid
+		txid: Option<Txid>,
 	},
 	IncomingOnChain {
-		// TODO txid
+		txid: Option<Txid>,
 	},
 	IncomingLightning {
 		// TODO: Give all payment instructions an id so that incoming can get matched
@@ -117,8 +117,8 @@ pub enum PaymentType {
 impl_writeable_tlv_based_enum!(PaymentType,
 	(0, OutgoingLightningBolt12) => { (0, payment_preimage, option), },
 	(1, OutgoingLightningBolt11) => { (0, payment_preimage, option), },
-	(2, OutgoingOnChain) => { },
-	(3, IncomingOnChain) => { },
+	(2, OutgoingOnChain) => { (0, txid, option), },
+	(3, IncomingOnChain) => { (0, txid, option) },
 	(4, IncomingLightning) => { },
 
 );

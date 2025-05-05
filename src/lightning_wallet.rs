@@ -51,8 +51,12 @@ impl From<&PaymentDetails> for PaymentType {
 				debug_assert!(false);
 				PaymentType::OutgoingLightningBolt12 { payment_preimage: *preimage }
 			},
-			(PaymentKind::Onchain { .. }, true) => PaymentType::OutgoingOnChain {},
-			(PaymentKind::Onchain { .. }, false) => PaymentType::IncomingOnChain {},
+			(PaymentKind::Onchain { txid, .. }, true) => {
+				PaymentType::OutgoingOnChain { txid: Some(*txid) }
+			},
+			(PaymentKind::Onchain { txid, .. }, false) => {
+				PaymentType::IncomingOnChain { txid: Some(*txid) }
+			},
 			(_, false) => PaymentType::IncomingLightning {},
 		}
 	}
