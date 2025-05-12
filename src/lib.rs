@@ -92,12 +92,12 @@ pub struct VssConfig {
 #[derive(Debug, Clone)]
 pub enum StorageConfig {
 	LocalSQLite(String),
-	//VSS(VssConfig),
+	// todo VSS(VssConfig),
 }
 
 #[derive(Debug, Clone)]
 pub enum ChainSource {
-	//Electrum(String),
+	Electrum(String),
 	Esplora(String),
 	BitcoindRPC { host: String, port: u16, user: String, password: String },
 }

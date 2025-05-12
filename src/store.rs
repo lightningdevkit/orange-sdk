@@ -180,7 +180,6 @@ impl TxMetadataStore {
 				.expect("Invalid data in transaction metadata storage");
 			tx_metadata.insert(key, data);
 		}
-		// TODO: Read
 		TxMetadataStore { store, tx_metadata: RwLock::new(tx_metadata) }
 	}
 

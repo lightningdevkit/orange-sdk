@@ -115,6 +115,7 @@ impl LightningWallet {
 		builder.set_liquidity_source_lsps2(config.lsp.1, config.lsp.0, config.lsp.2);
 		match config.chain_source {
 			ChainSource::Esplora(url) => builder.set_chain_source_esplora(url, None),
+			ChainSource::Electrum(url) => builder.set_chain_source_electrum(url, None),
 			ChainSource::BitcoindRPC { host, port, user, password } => {
 				builder.set_chain_source_bitcoind_rpc(host, port, user, password)
 			},
@@ -169,8 +170,6 @@ impl LightningWallet {
 	pub(crate) async fn get_bolt11_invoice(
 		&self, amount: Option<Amount>,
 	) -> Result<Bolt11Invoice, NodeError> {
-		// TODO: `receive_via_jit_channel` should not use the jit channel if there's enough balance
-		// on the non-JIT channel, but we should check that (in the spec/impl?)
 		let desc = Bolt11InvoiceDescription::Direct(Description::empty());
 		if let Some(amt) = amount {
 			if self.estimate_receivable_balance() >= amt {
