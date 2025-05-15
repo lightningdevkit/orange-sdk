@@ -7,7 +7,7 @@ use std::io::{BufWriter, Write};
 use std::path::Path;
 use std::sync::Mutex;
 
-pub(crate) struct Logger(Mutex<fs::File>);
+pub struct Logger(Mutex<fs::File>);
 
 impl Logger {
 	pub(crate) fn new(path: &Path) -> Result<Logger, ()> {

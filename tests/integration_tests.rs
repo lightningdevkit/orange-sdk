@@ -1,3 +1,5 @@
+#![cfg(feature = "_test-utils")]
+
 use crate::test_utils::{TestParams, build_test_nodes, generate_blocks, open_channel_from_lsp};
 use bitcoin_payment_instructions::amount::Amount;
 use ldk_node::lightning_invoice::{Bolt11InvoiceDescription, Description};
@@ -15,6 +17,110 @@ fn test_node_start() {
 		let bal = wallet.get_balance().await;
 		assert_eq!(bal.available_balance, Amount::ZERO);
 		assert_eq!(bal.pending_balance, Amount::ZERO);
+	})
+}
+
+#[test]
+fn test_receive_to_trusted() {
+	let TestParams { wallet, lsp: _, bitcoind: _, third_party, rt } = build_test_nodes();
+
+	rt.block_on(async move {
+		let starting_bal = wallet.get_balance().await;
+		assert_eq!(starting_bal.available_balance, Amount::ZERO);
+		assert_eq!(starting_bal.pending_balance, Amount::ZERO);
+
+		let recv_amt = Amount::from_sats(100).unwrap();
+
+		let uri = wallet.get_single_use_receive_uri(Some(recv_amt)).await.unwrap();
+		let payment_id = third_party.bolt11_payment().send(&uri.invoice, None).unwrap();
+
+		// wait for payment success from payer side
+		let p = third_party.clone();
+		test_utils::wait_for_condition(Duration::from_secs(1), 10, "payer payment success", || {
+			let res = p.payment(&payment_id).is_some_and(|p| p.status == PaymentStatus::Succeeded);
+			async move { res }
+		})
+		.await
+		.expect("Payer payment did not succeed in time");
+
+		// wait for balance update on wallet side
+		test_utils::wait_for_condition(
+			Duration::from_secs(1),
+			10,
+			"wallet balance update after receive",
+			|| async { wallet.get_balance().await.available_balance > Amount::ZERO },
+		)
+		.await
+		.expect("Wallet balance did not update in time after receive");
+
+		let txs = wallet.list_transactions().await.unwrap();
+		assert_eq!(txs.len(), 1);
+		let tx = txs.into_iter().next().unwrap();
+		assert_eq!(tx.fee, Some(Amount::ZERO));
+		assert!(!tx.outbound);
+		assert_eq!(tx.status, TxStatus::Completed);
+		assert_eq!(tx.payment_type, PaymentType::IncomingLightning {});
+		assert_ne!(tx.time_since_epoch, Duration::ZERO);
+		assert_eq!(tx.amount, Some(recv_amt.saturating_sub(tx.fee.unwrap())));
+	})
+}
+
+#[test]
+fn test_sweep_to_ln() {
+	let TestParams { wallet, lsp, bitcoind: _, third_party, rt } = build_test_nodes();
+
+	rt.block_on(async move {
+		let starting_bal = wallet.get_balance().await;
+		assert_eq!(starting_bal.available_balance, Amount::ZERO);
+		assert_eq!(starting_bal.pending_balance, Amount::ZERO);
+
+		let starting_lsp_channels = lsp.list_channels();
+
+		// start with receiving half the limit
+		let limit = wallet.get_tunables();
+		let recv_amt =
+			Amount::from_milli_sats(limit.trusted_balance_limit.milli_sats() / 2).unwrap();
+
+		let uri = wallet.get_single_use_receive_uri(Some(recv_amt)).await.unwrap();
+		third_party.bolt11_payment().send(&uri.invoice, None).unwrap();
+
+		// wait for balance update on wallet side
+		test_utils::wait_for_condition(
+			Duration::from_secs(1),
+			10,
+			"wallet balance update after receive",
+			|| async { wallet.get_balance().await.available_balance > Amount::ZERO },
+		)
+		.await
+		.expect("Wallet balance did not update in time after receive");
+
+		let intermediate_amt = wallet.get_balance().await.available_balance;
+
+		// next receive the limit to trigger the rebalance
+		let recv_amt = Amount::from_milli_sats(limit.trusted_balance_limit.milli_sats()).unwrap();
+
+		let uri = wallet.get_single_use_receive_uri(Some(recv_amt)).await.unwrap();
+		third_party.bolt11_payment().send(&uri.invoice, None).unwrap();
+
+		// wait for balance update on wallet side
+		test_utils::wait_for_condition(
+			Duration::from_secs(1),
+			10,
+			"wallet balance update after receive",
+			|| async { wallet.get_balance().await.available_balance > intermediate_amt },
+		)
+		.await
+		.expect("Wallet balance did not update in time after receive");
+
+		// wait for rebalance
+		test_utils::wait_for_condition(
+			Duration::from_secs(1),
+			10,
+			"wait for new channel to be opened",
+			|| async { starting_lsp_channels.len() < lsp.list_channels().len() },
+		)
+		.await
+		.expect("Wallet did not receive new channel");
 	})
 }
 

@@ -1,5 +1,6 @@
 use crate::logging::Logger;
 use crate::{ChainSource, InitFailure, PaymentType, TxStatus, WalletConfig};
+use std::fmt::Debug;
 
 use bitcoin_payment_instructions::PaymentMethod;
 use bitcoin_payment_instructions::amount::Amount;
@@ -78,8 +79,8 @@ pub(crate) struct LightningWallet {
 }
 
 impl LightningWallet {
-	pub(super) fn init(
-		runtime: Arc<Runtime>, config: WalletConfig, store: Arc<dyn KVStore + Sync + Send>,
+	pub(super) fn init<E>(
+		runtime: Arc<Runtime>, config: WalletConfig<E>, store: Arc<dyn KVStore + Sync + Send>,
 		logger: Arc<Logger>,
 	) -> Result<Self, InitFailure> {
 		let anchor_channels_config = ldk_node::config::AnchorChannelsConfig {

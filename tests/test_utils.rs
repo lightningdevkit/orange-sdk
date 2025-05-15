@@ -1,3 +1,5 @@
+#![cfg(feature = "_test-utils")]
+
 use bitcoin_payment_instructions::amount::Amount;
 use corepc_node::client::bitcoin::Network;
 use corepc_node::{Conf, Node as Bitcoind, get_available_port};
@@ -6,6 +8,7 @@ use ldk_node::lightning::ln::msgs::SocketAddress;
 use ldk_node::liquidity::LSPS2ServiceConfig;
 use ldk_node::payment::PaymentStatus;
 use ldk_node::{Node, bitcoin};
+use orange_sdk::trusted_wallet::dummy::{DummyTrustedWallet, DummyTrustedWalletExtraConfig};
 use orange_sdk::{ChainSource, StorageConfig, Wallet, WalletConfig};
 use rand::RngCore;
 use std::env::temp_dir;
@@ -62,7 +65,7 @@ fn create_lsp(rt: Arc<Runtime>, uuid: Uuid, bitcoind: &Bitcoind) -> Arc<Node> {
 		cookie.password,
 	);
 
-	let tmp = temp_dir().join(format!("orange-test-{uuid}-lsp.sqlite"));
+	let tmp = temp_dir().join(format!("orange-test-{uuid}-lsp"));
 	builder.set_storage_dir_path(tmp.to_str().unwrap().to_string());
 
 	let lsps2_service_config = LSPS2ServiceConfig {
@@ -119,7 +122,7 @@ fn create_third_party(rt: Arc<Runtime>, uuid: Uuid, bitcoind: &Bitcoind) -> Arc<
 		cookie.password,
 	);
 
-	let tmp = temp_dir().join(format!("orange-test-{uuid}-payer.sqlite"));
+	let tmp = temp_dir().join(format!("orange-test-{uuid}-payer"));
 	builder.set_storage_dir_path(tmp.to_str().unwrap().to_string());
 
 	let port = get_available_port().unwrap();
@@ -151,10 +154,10 @@ fn fund_node(node: &Node, bitcoind: &Bitcoind) {
 	generate_blocks(bitcoind, 6);
 }
 
-fn build_wallet_config(
-	uuid: Uuid, bitcoind: &Bitcoind, lsp_pk: PublicKey, socket_addr: SocketAddress,
-) -> WalletConfig {
-	let tmp = temp_dir().join(format!("orange-test-{uuid}.sqlite"));
+fn build_wallet_config<E>(
+	uuid: Uuid, bitcoind: &Bitcoind, lsp_pk: PublicKey, socket_addr: SocketAddress, extra_config: E,
+) -> WalletConfig<E> {
+	let tmp = temp_dir().join(format!("orange-test-{uuid}/ldk-node.sqlite"));
 	let cookie = bitcoind.params.get_cookie_values().unwrap().unwrap();
 	let mut seed: [u8; 64] = [0; 64];
 	rand::thread_rng().fill_bytes(&mut seed);
@@ -170,19 +173,20 @@ fn build_wallet_config(
 		network: Network::Regtest,
 		seed,
 		tunables: Default::default(),
+		extra_config,
 	}
 }
 
 pub struct TestParams {
-	pub wallet: Wallet,
+	pub wallet: Wallet<DummyTrustedWallet>,
 	pub lsp: Arc<Node>,
 	pub third_party: Arc<Node>,
-	pub bitcoind: Bitcoind,
+	pub bitcoind: Arc<Bitcoind>,
 	pub rt: Arc<Runtime>,
 }
 
 pub fn build_test_nodes() -> TestParams {
-	let bitcoind = create_bitcoind();
+	let bitcoind = Arc::new(create_bitcoind());
 	generate_blocks(&bitcoind, 101);
 
 	let rt = Arc::new(tokio::runtime::Builder::new_multi_thread().enable_all().build().unwrap());
@@ -233,10 +237,15 @@ pub fn build_test_nodes() -> TestParams {
 	// make sure it actually became usable
 	assert!(third_party.list_channels().first().unwrap().is_usable);
 
-	let config = build_wallet_config(test_id, &bitcoind, lsp.node_id(), lsp_listen);
+	let dummy_wallet_config = DummyTrustedWalletExtraConfig {
+		uuid: test_id,
+		lsp: lsp.clone(),
+		bitcoind: bitcoind.clone(),
+		rt: rt.clone(),
+	};
 
-	// fixme: need this for spark to work?
-	rustls::crypto::aws_lc_rs::default_provider().install_default().ok();
+	let config =
+		build_wallet_config(test_id, &bitcoind, lsp.node_id(), lsp_listen, dummy_wallet_config);
 
 	let rt_clone = rt.clone();
 	let wallet = rt.block_on(async move { Wallet::new(rt_clone, config).await.unwrap() });
@@ -244,7 +253,9 @@ pub fn build_test_nodes() -> TestParams {
 	TestParams { wallet, lsp, third_party, bitcoind, rt }
 }
 
-pub async fn open_channel_from_lsp(wallet: &Wallet, payer: Arc<Node>) -> Amount {
+pub async fn open_channel_from_lsp(
+	wallet: &Wallet<DummyTrustedWallet>, payer: Arc<Node>,
+) -> Amount {
 	let starting_bal = wallet.get_balance().await;
 	assert_eq!(starting_bal.available_balance, Amount::ZERO);
 	assert_eq!(starting_bal.pending_balance, Amount::ZERO);

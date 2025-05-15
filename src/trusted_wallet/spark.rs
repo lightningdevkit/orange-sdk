@@ -1,101 +1,23 @@
 use crate::logging::Logger;
-use crate::{InitFailure, TxStatus, WalletConfig};
+use crate::trusted_wallet::{Error, Payment, TrustedPaymentId, TrustedWalletInterface};
+use crate::{InitFailure, WalletConfig};
 
 use ldk_node::bitcoin::Network;
 use ldk_node::bitcoin::hashes::Hash;
 use ldk_node::bitcoin::hashes::sha256::Hash as Sha256;
-use ldk_node::bitcoin::io;
-use ldk_node::lightning::ln::msgs::DecodeError;
-use ldk_node::lightning::util::ser::{Readable, Writeable, Writer};
 use ldk_node::lightning_invoice::Bolt11Invoice;
 
 use bitcoin_payment_instructions::PaymentMethod;
 use bitcoin_payment_instructions::amount::Amount;
 
-use spark_rust::error::SparkSdkError;
 use spark_rust::signer::default_signer::DefaultSigner;
 use spark_rust::signer::traits::SparkSigner;
 use spark_rust::{SparkNetwork, SparkSdk};
 
-use spark_protos::spark::TransferStatus;
-
-use std::fmt;
 use std::future::Future;
-use std::str::FromStr;
 use std::sync::Arc;
 
-#[derive(Debug, Clone, Copy, Hash, PartialEq, Eq, PartialOrd, Ord)]
-pub(crate) struct TrustedPaymentId(pub(crate) uuid::Uuid);
-impl Readable for TrustedPaymentId {
-	fn read<R: io::Read>(r: &mut R) -> Result<Self, DecodeError> {
-		Ok(TrustedPaymentId(uuid::Uuid::from_bytes(Readable::read(r)?)))
-	}
-}
-
-impl Writeable for TrustedPaymentId {
-	fn write<W: Writer>(&self, w: &mut W) -> Result<(), io::Error> {
-		self.0.as_bytes().write(w)
-	}
-}
-
-impl fmt::Display for TrustedPaymentId {
-	fn fmt(&self, f: &mut fmt::Formatter) -> Result<(), fmt::Error> {
-		self.0.fmt(f)
-	}
-}
-
-impl FromStr for TrustedPaymentId {
-	type Err = <uuid::Uuid as FromStr>::Err;
-	fn from_str(s: &str) -> Result<Self, <uuid::Uuid as FromStr>::Err> {
-		Ok(TrustedPaymentId(uuid::Uuid::from_str(s)?))
-	}
-}
-
-pub(crate) type Error = SparkSdkError;
-
-#[derive(Debug, Clone)]
-pub(crate) struct Payment {
-	pub(crate) id: TrustedPaymentId,
-	pub(crate) amount: Amount,
-	pub(crate) fee: Amount,
-	pub(crate) status: TxStatus,
-	pub(crate) outbound: bool,
-}
-
-impl From<TransferStatus> for TxStatus {
-	fn from(o: TransferStatus) -> TxStatus {
-		match o {
-			TransferStatus::SenderInitiated
-			| TransferStatus::SenderKeyTweakPending
-			| TransferStatus::SenderKeyTweaked
-			| TransferStatus::ReceiverKeyTweaked => TxStatus::Pending,
-			TransferStatus::Completed => TxStatus::Completed,
-			TransferStatus::Expired
-			| TransferStatus::Returned
-			| TransferStatus::TransferStatusrReceiverRefundSigned => TxStatus::Failed,
-		}
-	}
-}
-
-pub(crate) trait TrustedWalletInterface: Sized {
-	fn init(
-		config: &WalletConfig, logger: Arc<Logger>,
-	) -> impl Future<Output = Result<Self, InitFailure>> + Send;
-	fn get_balance(&self) -> Amount;
-	fn get_reusable_receive_uri(&self) -> impl Future<Output = Result<String, Error>> + Send;
-	fn get_bolt11_invoice(
-		&self, amount: Option<Amount>,
-	) -> impl Future<Output = Result<Bolt11Invoice, Error>> + Send;
-	fn list_payments(&self) -> impl Future<Output = Result<Vec<Payment>, Error>> + Send;
-	fn estimate_fee(
-		&self, method: &PaymentMethod, amount: Amount,
-	) -> impl Future<Output = Result<Amount, Error>> + Send;
-	fn pay(
-		&self, method: &PaymentMethod, amount: Amount,
-	) -> impl Future<Output = Result<TrustedPaymentId, Error>> + Send;
-}
-
-pub(crate) struct SparkWallet {
+pub struct SparkWallet {
 	spark_wallet: Arc<SparkSdk>,
 	logger: Arc<Logger>,
 }
@@ -107,8 +29,10 @@ impl SparkWallet {
 }
 
 impl TrustedWalletInterface for SparkWallet {
+	type ExtraConfig = ();
+
 	fn init(
-		config: &WalletConfig, logger: Arc<Logger>,
+		config: &WalletConfig<()>, logger: Arc<Logger>,
 	) -> impl Future<Output = Result<Self, InitFailure>> + Send {
 		async move {
 			let seed = Sha256::hash(&config.seed);
@@ -202,6 +126,12 @@ impl TrustedWalletInterface for SparkWallet {
 			} else {
 				Err(Error::General("Only BOLT 11 is currently supported".to_owned()))
 			}
+		}
+	}
+
+	fn sync(&self) -> impl Future<Output = ()> + Send {
+		async move {
+			let _ = self.spark_wallet.sync_wallet().await;
 		}
 	}
 }

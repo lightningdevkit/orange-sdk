@@ -3,16 +3,20 @@ name = "orange-sdk"
 version = "0.1.0"
 edition = "2024"
 
+[features]
+_test-utils = ["corepc-node"]
+
 [dependencies]
 ldk-node = { version = "0.5.0" }
 bitcoin-payment-instructions = { version = "0.4.0", features = ["http"] }
 chrono = { version = "0.4", default-features = false }
-tokio = { version = "1.0", default-features = false, features = ["rt-multi-thread", "sync"] }
+rand = "0.8.5"
 spark-rust = { version = "0.1.11" }
 spark-protos = { version = "=0.1.9", default-features = false }
+tokio = { version = "1.0", default-features = false, features = ["rt-multi-thread", "sync"] }
 uuid = { version = "1.0", default-features = false }
 
+corepc-node = { version = "0.7.1", features = ["28_0", "download"], optional = true }
+
 [dev-dependencies]
-corepc-node = { version = "0.7.0", features = ["28_0", "download"] }
-rand = "0.8.5"
 rustls = "0.23.26"

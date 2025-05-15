@@ -35,7 +35,7 @@ use tokio::runtime::Runtime;
 
 use std::cmp;
 use std::collections::HashMap;
-use std::fmt::{self, Write};
+use std::fmt::{self, Debug, Write};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
@@ -43,14 +43,12 @@ use std::time::{Duration, SystemTime};
 mod lightning_wallet;
 pub(crate) mod logging;
 mod store;
-mod trusted_wallet;
+pub mod trusted_wallet;
 
 use lightning_wallet::LightningWallet;
 use logging::Logger;
 use trusted_wallet::Error as TrustedError;
 use trusted_wallet::TrustedWalletInterface;
-
-type TrustedWallet = trusted_wallet::SparkWallet;
 
 use store::{PaymentId, TxMetadata, TxMetadataStore, TxType};
 pub use store::{PaymentType, Transaction, TxStatus};
@@ -61,9 +59,9 @@ pub struct Balances {
 	pub pending_balance: Amount,
 }
 
-struct WalletImpl {
+struct WalletImpl<T: TrustedWalletInterface> {
 	ln_wallet: LightningWallet,
-	trusted: TrustedWallet,
+	trusted: Arc<T>,
 	tunables: Tunables,
 	network: Network,
 	tx_metadata: TxMetadataStore,
@@ -72,8 +70,8 @@ struct WalletImpl {
 	logger: Arc<Logger>,
 }
 
-pub struct Wallet {
-	inner: Arc<WalletImpl>,
+pub struct Wallet<T: TrustedWalletInterface> {
+	inner: Arc<WalletImpl<T>>,
 }
 
 #[derive(Debug, Clone)]
@@ -102,14 +100,14 @@ pub enum ChainSource {
 	BitcoindRPC { host: String, port: u16, user: String, password: String },
 }
 
-#[derive(Debug, Clone)]
-pub struct WalletConfig {
+pub struct WalletConfig<E> {
 	pub storage_config: StorageConfig,
 	pub chain_source: ChainSource,
 	pub lsp: (SocketAddress, PublicKey, Option<String>),
 	pub network: Network,
 	pub seed: [u8; 64],
 	pub tunables: Tunables,
+	pub extra_config: E,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -250,13 +248,18 @@ impl fmt::Display for SingleUseReceiveUri {
 	}
 }
 
-impl Wallet {
+impl<E, T> Wallet<T>
+where
+	T: TrustedWalletInterface<ExtraConfig = E> + 'static,
+{
 	/// Constructs a new Wallet.
 	///
 	/// `runtime` must be a reference to the running `tokio` runtime which we are currently
 	/// operating in.
 	// TODO: WOW that is a terrible API lol
-	pub async fn new(runtime: Arc<Runtime>, config: WalletConfig) -> Result<Wallet, InitFailure> {
+	pub async fn new(
+		runtime: Arc<Runtime>, config: WalletConfig<E>,
+	) -> Result<Wallet<T>, InitFailure> {
 		let tunables = config.tunables;
 		let network = config.network;
 		let (store, logger): (Arc<dyn KVStore + Send + Sync>, _) = match &config.storage_config {
@@ -272,7 +275,7 @@ impl Wallet {
 				(store, logger)
 			},
 		};
-		let trusted = TrustedWallet::init(&config, Arc::clone(&logger)).await?;
+		let trusted = Arc::new(T::init(&config, Arc::clone(&logger)).await?);
 		let ln_wallet = LightningWallet::init(
 			Arc::clone(&runtime),
 			config,
@@ -280,7 +283,7 @@ impl Wallet {
 			Arc::clone(&logger),
 		)?;
 
-		let inner = Arc::new(WalletImpl {
+		let inner = Arc::new(WalletImpl::<T> {
 			trusted,
 			ln_wallet,
 			network,
@@ -360,7 +363,7 @@ impl Wallet {
 		Ok(Wallet { inner })
 	}
 
-	fn get_rebalance_amt(inner: &Arc<WalletImpl>) -> Option<Amount> {
+	fn get_rebalance_amt(inner: &Arc<WalletImpl<T>>) -> Option<Amount> {
 		// We always assume lighting balance is an overestimate by `rebalance_min`.
 		let lightning_receivable = inner
 			.ln_wallet
@@ -375,7 +378,9 @@ impl Wallet {
 		if transfer_amt > inner.tunables.rebalance_min { Some(transfer_amt) } else { None }
 	}
 
-	async fn do_trusted_rebalance(inner: &Arc<WalletImpl>, triggering_transaction_id: PaymentId) {
+	async fn do_trusted_rebalance(
+		inner: &Arc<WalletImpl<T>>, triggering_transaction_id: PaymentId,
+	) {
 		let _lock = inner.balance_mutex.lock().await;
 		log_info!(
 			inner.logger,
@@ -941,7 +946,10 @@ impl Wallet {
 	}
 }
 
-impl Drop for Wallet {
+impl<T> Drop for Wallet<T>
+where
+	T: TrustedWalletInterface,
+{
 	fn drop(&mut self) {
 		self.inner.ln_wallet.stop();
 	}
