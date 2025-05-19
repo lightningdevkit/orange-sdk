@@ -169,7 +169,7 @@ impl TxMetadataStore {
 		let keys = store
 			.list(STORE_PRIMARY_KEY, STORE_SECONDARY_KEY)
 			.expect("We do not allow reads to fail");
-		let mut tx_metadata = HashMap::new();
+		let mut tx_metadata = HashMap::with_capacity(keys.len());
 		for key in keys {
 			let data_bytes = store
 				.read(STORE_PRIMARY_KEY, STORE_SECONDARY_KEY, &key)
