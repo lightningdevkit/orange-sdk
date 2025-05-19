@@ -1,3 +1,5 @@
+#![deny(missing_docs)]
+
 //! A library implementing the full backend for a modern, highly usable, Bitcoin wallet focusing on
 //! maximizing security and self-custody without trading off user experience.
 //!
@@ -53,65 +55,116 @@ use trusted_wallet::TrustedWalletInterface;
 use store::{PaymentId, TxMetadata, TxMetadataStore, TxType};
 pub use store::{PaymentType, Transaction, TxStatus};
 
+/// Represents the balances of the wallet, including available and pending balances.
 #[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Balances {
+	/// The balance that is immediately available for spending.
 	pub available_balance: Amount,
+	/// The balance that is pending and not yet spendable.
+	/// This includes all on-chain balances. The on-chain balance will become
+	/// available after it has been spliced into a lightning channel.
 	pub pending_balance: Amount,
 }
 
+/// The main implementation of the wallet, containing both trusted and lightning wallet components.
 struct WalletImpl<T: TrustedWalletInterface> {
+	/// The main implementation of the wallet, containing both trusted and lightning wallet components.
 	ln_wallet: LightningWallet,
+	/// The trusted wallet interface for managing small balances.
 	trusted: Arc<T>,
+	/// Configuration parameters for when the wallet decides to use the lightning or trusted wallet.
 	tunables: Tunables,
+	/// The Bitcoin network the wallet operates on (e.g., Mainnet, Testnet).
 	network: Network,
+	/// Metadata store for tracking transactions.
 	tx_metadata: TxMetadataStore,
+	/// Mutex to ensure thread-safe balance operations.
 	balance_mutex: tokio::sync::Mutex<()>,
+	/// Key-value store for persistent storage.
 	store: Arc<dyn KVStore + Send + Sync>,
+	/// Logger for logging wallet operations.
 	logger: Arc<Logger>,
 }
 
+// todo better doc, include examples, etc
+/// The primary entry point for orange-sdk. This is the main wallet struct that
+/// contains the trusted wallet and the lightning wallet.
 pub struct Wallet<T: TrustedWalletInterface> {
+	/// The internal wallet implementation.
 	inner: Arc<WalletImpl<T>>,
 }
 
+/// Represents the authentication method for a Versioned Storage Service (VSS).
 #[derive(Debug, Clone)]
 pub enum VssAuth {
+	/// Authentication using an LNURL-auth server.
 	LNURLAuthServer(String),
+	/// Authentication using a fixed set of HTTP headers.
 	FixedHeaders(HashMap<String, String>),
 }
 
+/// Configuration for a Versioned Storage Service (VSS).
 #[derive(Debug, Clone)]
 pub struct VssConfig {
+	/// The URL of the VSS.
 	vss_url: String,
+	/// The store ID for the VSS.
 	store_id: String,
+	/// Authentication method for the VSS.
 	headers: VssAuth,
 }
 
+/// Configuration for wallet storage, either local SQLite or VSS.
 #[derive(Debug, Clone)]
 pub enum StorageConfig {
+	/// Local SQLite database configuration.
 	LocalSQLite(String),
 	// todo VSS(VssConfig),
 }
 
+/// Configuration for the blockchain data source.
 #[derive(Debug, Clone)]
 pub enum ChainSource {
+	/// Electrum server configuration.
 	Electrum(String),
+	/// Esplora server configuration.
 	Esplora(String),
-	BitcoindRPC { host: String, port: u16, user: String, password: String },
+	/// Bitcoind RPC configuration.
+	BitcoindRPC {
+		/// The host of the Bitcoind rpc server (e.g. 127.0.0.1).
+		host: String,
+		/// The port of the Bitcoind rpc server (e.g. 8332).
+		port: u16,
+		/// The username for the Bitcoind rpc server.
+		user: String,
+		/// The password for the Bitcoind rpc server.
+		password: String,
+	},
 }
 
+/// Configuration for initializing the wallet.
 pub struct WalletConfig<E> {
+	/// Configuration for wallet storage.
 	pub storage_config: StorageConfig,
+	/// Configuration for the blockchain data source.
 	pub chain_source: ChainSource,
+	/// Lightning Service Provider (LSP) configuration.
+	/// The address to connect to the LSP, the LSP node id, and an optional auth token.
 	pub lsp: (SocketAddress, PublicKey, Option<String>),
+	/// The Bitcoin network the wallet operates on.
 	pub network: Network,
-	pub seed: [u8; 64],
+	/// The seed used for wallet generation.
+	pub seed: [u8; 64], // todo allow for bip39, etc
+	/// Configuration parameters for when the wallet decides to use the lightning or trusted wallet.
 	pub tunables: Tunables,
+	/// Extra configuration specific to the trusted wallet implementation.
 	pub extra_config: E,
 }
 
+/// Configuration parameters for when the wallet decides to use the lightning or trusted wallet.
 #[derive(Debug, Clone, Copy)]
 pub struct Tunables {
+	/// The maximum balance that can be held in the trusted wallet.
 	pub trusted_balance_limit: Amount,
 	/// Trusted balances below this threshold will not be transferred to non-trusted balance
 	/// even if we have capacity to do so without paying for a new channel.
@@ -140,7 +193,9 @@ impl Default for Tunables {
 /// A payable version of [`PaymentInstructions`] (i.e. with a set amount).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PaymentInfo {
+	/// The payment instructions (e.g., BOLT 11 invoice, on-chain address).
 	instructions: PaymentInstructions,
+	/// The amount to be paid.
 	amount: Amount,
 }
 
@@ -168,11 +223,16 @@ impl PaymentInfo {
 	}
 }
 
+/// Represents possible failures during wallet initialization.
 #[derive(Debug)]
 pub enum InitFailure {
+	/// I/O error during initialization.
 	IoError(io::Error),
+	/// Failure to build the LDK node.
 	LdkNodeBuildFailure(BuildError),
+	/// Failure to start the LDK node.
 	LdkNodeStartFailure(NodeError),
+	/// Failure in the trusted wallet implementation.
 	TrustedFailure(TrustedError),
 }
 
@@ -200,9 +260,12 @@ impl From<TrustedError> for InitFailure {
 	}
 }
 
+/// Represents possible errors during wallet operations.
 #[derive(Debug)]
 pub enum WalletError {
+	/// Failure in the LDK node.
 	LdkNodeFailure(NodeError),
+	/// Failure in the trusted wallet implementation.
 	TrustedFailure(TrustedError),
 }
 
@@ -218,10 +281,15 @@ impl From<NodeError> for WalletError {
 	}
 }
 
+/// Represents a single-use Bitcoin URI for receiving payments.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SingleUseReceiveUri {
+	/// The optional on-chain Bitcoin address. Will be present based on the
+	/// wallet's configured tunables.
 	pub address: Option<bitcoin::Address>,
+	/// The BOLT 11 Lightning invoice.
 	pub invoice: Bolt11Invoice,
+	/// The optional amount for the payment.
 	pub amount: Option<Amount>,
 }
 
@@ -751,7 +819,14 @@ where
 		todo!()
 	}
 
-	// returns true once the payment is pending
+	/// Initiates a payment using the provided [`PaymentInfo`]. This will pay from the trusted
+	/// wallet if possible, otherwise it will pay from the lightning wallet.
+	///
+	/// If applicable, this will also initiate a rebalance from the trusted wallet to the
+	/// lightning wallet based on the resulting balance and configured tunables.
+	///
+	/// Returns true once the payment is pending, however, this does not mean that the
+	/// payment has been completed. The payment may still fail.
 	pub async fn pay(&self, instructions: &PaymentInfo) -> Result<(), WalletError> {
 		let trusted_balance = self.inner.trusted.get_balance();
 		let ln_balance = self.inner.ln_wallet.get_balance();
@@ -941,6 +1016,7 @@ where
 		))
 	}
 
+	/// Returns the wallet's configured tunables.
 	pub fn get_tunables(&self) -> Tunables {
 		self.inner.tunables
 	}

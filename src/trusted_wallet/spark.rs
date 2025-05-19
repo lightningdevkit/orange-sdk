@@ -1,3 +1,4 @@
+//! A implementation of `TrustedWalletInterface` using the Spark SDK.
 use crate::logging::Logger;
 use crate::trusted_wallet::{Error, Payment, TrustedPaymentId, TrustedWalletInterface};
 use crate::{InitFailure, WalletConfig};
@@ -17,6 +18,7 @@ use spark_rust::{SparkNetwork, SparkSdk};
 use std::future::Future;
 use std::sync::Arc;
 
+/// A wallet implementation using the Spark SDK.
 pub struct SparkWallet {
 	spark_wallet: Arc<SparkSdk>,
 	logger: Arc<Logger>,

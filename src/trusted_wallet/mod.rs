@@ -1,3 +1,5 @@
+//! This module defines the `TrustedWalletInterface` trait and its associated types.
+
 use crate::logging::Logger;
 use crate::{InitFailure, TxStatus, WalletConfig};
 
@@ -50,12 +52,21 @@ impl FromStr for TrustedPaymentId {
 // todo generic error type
 pub(crate) type Error = SparkSdkError;
 
+/// Represents a payment with its associated details.
+///
+/// This struct contains information about a payment, including its unique ID,
+/// amount, fee, status, and whether it is outbound or inbound.
 #[derive(Debug, Clone)]
 pub struct Payment {
+	/// The unique identifier for the payment.
 	pub id: TrustedPaymentId,
+	/// The amount of the payment.
 	pub amount: Amount,
+	/// The fee associated with the payment.
 	pub fee: Amount,
+	/// The current status of the payment (e.g., pending, completed, failed).
 	pub status: TxStatus,
+	/// Indicates whether the payment is outbound (`true`) or inbound (`false`).
 	pub outbound: bool,
 }
 

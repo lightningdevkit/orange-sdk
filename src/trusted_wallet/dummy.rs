@@ -1,4 +1,5 @@
 #![cfg(feature = "_test-utils")]
+//! A dummy implementation of `TrustedWalletInterface` for testing purposes.
 
 use crate::trusted_wallet::{Error, Payment, TrustedPaymentId, TrustedWalletInterface};
 use crate::{InitFailure, TxStatus, WalletConfig};
@@ -17,20 +18,29 @@ use std::time::Duration;
 use tokio::runtime::Runtime;
 use uuid::Uuid;
 
+/// A dummy implementation of `TrustedWalletInterface` for testing purposes.
+/// This wallet uses a local LDK node to handle payments and simulates a custodial wallet
+/// by keeping track of the balance and payments in memory.
 pub struct DummyTrustedWallet {
 	current_bal_msats: Arc<AtomicU64>,
 	payments: Arc<RwLock<Vec<Payment>>>,
 	ldk_node: Arc<Node>,
 }
 
+/// Extra configuration for the `DummyTrustedWallet`.
 pub struct DummyTrustedWalletExtraConfig {
+	/// The test uuid
 	pub uuid: Uuid,
+	/// The LSP node to connect to
 	pub lsp: Arc<Node>,
+	/// The Bitcoind node to connect to
 	pub bitcoind: Arc<Bitcoind>,
+	/// The runtime to use for async tasks
 	pub rt: Arc<Runtime>,
 }
 
 impl DummyTrustedWallet {
+	/// Creates a new `DummyTrustedWallet` instance.
 	pub async fn new(uuid: Uuid, lsp: &Node, bitcoind: &Bitcoind, rt: Arc<Runtime>) -> Self {
 		let mut builder = ldk_node::Builder::new();
 		builder.set_network(Network::Regtest);

@@ -31,20 +31,37 @@ use std::time::Duration;
 const STORE_PRIMARY_KEY: &str = "orange_sdk";
 const STORE_SECONDARY_KEY: &str = "payment_store";
 
+/// The status of a transaction. This is used to track the state of a transaction
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TxStatus {
+	/// A pending transaction has not yet been paid.
 	Pending,
+	/// A completed transaction has been paid.
 	Completed,
+	/// A transaction that has failed.
 	Failed,
 }
 
+/// A transaction is a record of a payment made or received. It contains information about the
+/// transaction, such as the amount, fee, and status. It is used to track the state of a payment
+/// and to provide information about the payment to the user.
 #[derive(Debug, Clone)]
 pub struct Transaction {
+	/// The transaction status, either (Pending, Completed, or Failed)
 	pub status: TxStatus,
+	/// Indicates whether the payment is outbound (`true`) or inbound (`false`).
 	pub outbound: bool,
+	/// The amount of the payment
+	///
+	/// None if the payment is not yet completed
 	pub amount: Option<Amount>,
+	/// The fee paid for the payment
+	///
+	/// None if the payment is not yet completed
 	pub fee: Option<Amount>,
+	/// Represents the type of payment, including its method and associated metadata.
 	pub payment_type: PaymentType,
+	/// The time the transaction was created
 	pub time_since_epoch: Duration,
 }
 
@@ -88,8 +105,14 @@ impl_writeable_tlv_based_enum!(PaymentId,
 	{1, Trusted} => (),
 );
 
+/// Represents the type of payment, including its method and associated metadata.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PaymentType {
+	/// An outgoing Lightning payment paying a BOLT 12 offer.
+	///
+	/// This type of payment includes a payment preimage, which serves as proof
+	/// that the payment was completed. The preimage will be set for any
+	/// [`TxStatus::Completed`] payments.
 	OutgoingLightningBolt12 {
 		/// The lightning "payment preimage" which represents proof that the payment completed.
 		/// Will be set for any [`TxStatus::Completed`] payments.
@@ -97,18 +120,40 @@ pub enum PaymentType {
 		//offer: Offer,
 		// TODO PoP
 	},
+	/// An outgoing Lightning payment paying a BOLT 11 invoice.
+	///
+	/// This type of payment includes a payment preimage, which serves as proof
+	/// that the payment was completed. The preimage will be set for any
+	/// [`TxStatus::Completed`] payments.
 	OutgoingLightningBolt11 {
 		/// The lightning "payment preimage" which represents proof that the payment completed.
 		/// Will be set for any [`TxStatus::Completed`] payments.
 		payment_preimage: Option<PaymentPreimage>,
 		//invoice: Bolt11Invoice,
 	},
+	/// An outgoing on-chain Bitcoin payment.
+	///
+	/// This type of payment includes an optional transaction ID (`txid`) that
+	/// identifies the on-chain transaction. This will be set for any
+	/// [`TxStatus::Completed`] payments.
 	OutgoingOnChain {
+		/// The optional transaction ID of the on-chain payment.
+		/// Will be set for any [`TxStatus::Completed`] payments.
 		txid: Option<Txid>,
 	},
+	/// An incoming on-chain Bitcoin payment.
+	///
+	/// This type of payment includes an optional transaction ID (`txid`) that
+	/// identifies the on-chain transaction. This will be set for any
+	/// [`TxStatus::Completed`] payments.
 	IncomingOnChain {
+		/// The optional transaction ID of the on-chain payment.
+		/// Will be set for any [`TxStatus::Completed`] payments.
 		txid: Option<Txid>,
 	},
+	/// An incoming Lightning payment.
+	///
+	/// This type of payment is used for Lightning payments that are received.
 	IncomingLightning {
 		// TODO: Give all payment instructions an id so that incoming can get matched
 	},
