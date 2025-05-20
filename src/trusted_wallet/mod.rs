@@ -13,8 +13,6 @@ use bitcoin_payment_instructions::amount::Amount;
 
 use spark_rust::error::SparkSdkError;
 
-use spark_protos::spark::TransferStatus;
-
 use std::fmt;
 use std::future::Future;
 use std::str::FromStr;
@@ -68,21 +66,6 @@ pub struct Payment {
 	pub status: TxStatus,
 	/// Indicates whether the payment is outbound (`true`) or inbound (`false`).
 	pub outbound: bool,
-}
-
-impl From<TransferStatus> for TxStatus {
-	fn from(o: TransferStatus) -> TxStatus {
-		match o {
-			TransferStatus::SenderInitiated
-			| TransferStatus::SenderKeyTweakPending
-			| TransferStatus::SenderKeyTweaked
-			| TransferStatus::ReceiverKeyTweaked => TxStatus::Pending,
-			TransferStatus::Completed => TxStatus::Completed,
-			TransferStatus::Expired
-			| TransferStatus::Returned
-			| TransferStatus::TransferStatusrReceiverRefundSigned => TxStatus::Failed,
-		}
-	}
 }
 
 // todo i dont think we need send + sync

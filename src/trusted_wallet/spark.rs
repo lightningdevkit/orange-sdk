@@ -1,7 +1,7 @@
 //! A implementation of `TrustedWalletInterface` using the Spark SDK.
 use crate::logging::Logger;
 use crate::trusted_wallet::{Error, Payment, TrustedPaymentId, TrustedWalletInterface};
-use crate::{InitFailure, WalletConfig};
+use crate::{InitFailure, TxStatus, WalletConfig};
 
 use ldk_node::bitcoin::Network;
 use ldk_node::bitcoin::hashes::Hash;
@@ -11,6 +11,7 @@ use ldk_node::lightning_invoice::Bolt11Invoice;
 use bitcoin_payment_instructions::PaymentMethod;
 use bitcoin_payment_instructions::amount::Amount;
 
+use spark_protos::spark::TransferStatus;
 use spark_rust::signer::default_signer::DefaultSigner;
 use spark_rust::signer::traits::SparkSigner;
 use spark_rust::{SparkNetwork, SparkSdk};
@@ -134,6 +135,21 @@ impl TrustedWalletInterface for SparkWallet {
 	fn sync(&self) -> impl Future<Output = ()> + Send {
 		async move {
 			let _ = self.spark_wallet.sync_wallet().await;
+		}
+	}
+}
+
+impl From<TransferStatus> for TxStatus {
+	fn from(o: TransferStatus) -> TxStatus {
+		match o {
+			TransferStatus::SenderInitiated
+			| TransferStatus::SenderKeyTweakPending
+			| TransferStatus::SenderKeyTweaked
+			| TransferStatus::ReceiverKeyTweaked => TxStatus::Pending,
+			TransferStatus::Completed => TxStatus::Completed,
+			TransferStatus::Expired
+			| TransferStatus::Returned
+			| TransferStatus::TransferStatusrReceiverRefundSigned => TxStatus::Failed,
 		}
 	}
 }
