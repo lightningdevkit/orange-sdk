@@ -21,6 +21,7 @@ use bitcoin_payment_instructions::{
 pub use bitcoin_payment_instructions::PaymentMethod;
 use bitcoin_payment_instructions::amount::Amount;
 
+use ldk_node::bip39::Mnemonic;
 use ldk_node::bitcoin::Network;
 use ldk_node::bitcoin::io;
 use ldk_node::bitcoin::secp256k1::PublicKey;
@@ -94,6 +95,20 @@ pub struct Wallet<T: TrustedWalletInterface> {
 	inner: Arc<WalletImpl<T>>,
 }
 
+/// Represents the seed used for wallet generation.
+#[derive(Debug, Clone)]
+pub enum Seed {
+	/// A BIP 39 mnemonic seed.
+	Mnemonic {
+		/// The mnemonic phrase.
+		mnemonic: Mnemonic,
+		/// The passphrase for the mnemonic.
+		passphrase: Option<String>,
+	},
+	/// A 64-byte seed for the wallet.
+	Seed64([u8; 64]),
+}
+
 /// Represents the authentication method for a Versioned Storage Service (VSS).
 #[derive(Debug, Clone)]
 pub enum VssAuth {
@@ -156,7 +171,7 @@ pub struct WalletConfig<E> {
 	/// The Bitcoin network the wallet operates on.
 	pub network: Network,
 	/// The seed used for wallet generation.
-	pub seed: [u8; 64], // todo allow for bip39, etc
+	pub seed: Seed,
 	/// Configuration parameters for when the wallet decides to use the lightning or trusted wallet.
 	pub tunables: Tunables,
 	/// Extra configuration specific to the trusted wallet implementation.

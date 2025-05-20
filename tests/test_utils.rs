@@ -9,7 +9,7 @@ use ldk_node::liquidity::LSPS2ServiceConfig;
 use ldk_node::payment::PaymentStatus;
 use ldk_node::{Node, bitcoin};
 use orange_sdk::trusted_wallet::dummy::{DummyTrustedWallet, DummyTrustedWalletExtraConfig};
-use orange_sdk::{ChainSource, StorageConfig, Wallet, WalletConfig};
+use orange_sdk::{ChainSource, Seed, StorageConfig, Wallet, WalletConfig};
 use rand::RngCore;
 use std::env::temp_dir;
 use std::future::Future;
@@ -172,7 +172,7 @@ fn build_wallet_config<E>(
 		},
 		lsp: (socket_addr, lsp_pk, None),
 		network: Network::Regtest,
-		seed,
+		seed: Seed::Seed64(seed),
 		tunables: Default::default(),
 		extra_config,
 	}

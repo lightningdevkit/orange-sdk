@@ -1,5 +1,5 @@
 use crate::logging::Logger;
-use crate::{ChainSource, InitFailure, PaymentType, TxStatus, WalletConfig};
+use crate::{ChainSource, InitFailure, PaymentType, Seed, TxStatus, WalletConfig};
 use std::fmt::Debug;
 
 use bitcoin_payment_instructions::PaymentMethod;
@@ -93,7 +93,14 @@ impl LightningWallet {
 		};
 		let mut builder = ldk_node::Builder::from_config(ldk_node_config);
 		builder.set_network(config.network);
-		builder.set_entropy_seed_bytes(config.seed);
+		match config.seed {
+			Seed::Seed64(seed) => {
+				builder.set_entropy_seed_bytes(seed);
+			},
+			Seed::Mnemonic { mnemonic, passphrase } => {
+				builder.set_entropy_bip39_mnemonic(mnemonic, passphrase);
+			},
+		}
 		match config.network {
 			Network::Bitcoin => {
 				builder.set_gossip_source_rgs(

@@ -1,7 +1,7 @@
 //! A implementation of `TrustedWalletInterface` using the Spark SDK.
 use crate::logging::Logger;
 use crate::trusted_wallet::{Error, Payment, TrustedPaymentId, TrustedWalletInterface};
-use crate::{InitFailure, TxStatus, WalletConfig};
+use crate::{InitFailure, Seed, TxStatus, WalletConfig};
 
 use ldk_node::bitcoin::Network;
 use ldk_node::bitcoin::hashes::Hash;
@@ -34,13 +34,27 @@ impl TrustedWalletInterface for SparkWallet {
 		config: &WalletConfig<()>, logger: Arc<Logger>,
 	) -> impl Future<Output = Result<Self, InitFailure>> + Send {
 		async move {
-			let seed = Sha256::hash(&config.seed);
 			let net = match config.network {
 				Network::Bitcoin => SparkNetwork::Mainnet,
 				Network::Regtest => SparkNetwork::Regtest,
 				_ => Err(Error::General("Unsupported network".to_owned()))?,
 			};
-			let signer = DefaultSigner::from_master_seed(&seed[..], net).await?;
+
+			let signer = match &config.seed {
+				Seed::Seed64(bytes) => {
+					// hash the seed to make sure it does not conflict with the lightning keys
+					let seed = Sha256::hash(bytes);
+					DefaultSigner::from_master_seed(&seed[..], net).await?
+				},
+				Seed::Mnemonic { mnemonic, passphrase } => {
+					// We don't hash the seed here, as mnemonics are meant to be easily recoverable
+					// and if we hashed them, then you could not recover your spark coins from the mnemonic
+					// in separate wallets.
+					let seed = mnemonic.to_seed(passphrase.as_deref().unwrap_or(""));
+					DefaultSigner::from_master_seed(&seed[..], net).await?
+				},
+			};
+
 			let spark_wallet = Arc::new(SparkSdk::new(net, signer).await?);
 
 			/*let spark_ref = Arc::clone(&spark_wallet);
