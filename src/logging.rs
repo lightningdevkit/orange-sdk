@@ -11,6 +11,9 @@ pub struct Logger(Mutex<fs::File>);
 
 impl Logger {
 	pub(crate) fn new(path: &Path) -> Result<Logger, ()> {
+		if path.parent().is_some_and(|p| !p.exists()) {
+			fs::create_dir_all(path.parent().unwrap()).map_err(|_| ())?;
+		}
 		Ok(Self(Mutex::new(
 			fs::OpenOptions::new().create(true).append(true).open(path).map_err(|_| ())?,
 		)))

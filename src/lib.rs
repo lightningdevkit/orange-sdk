@@ -146,6 +146,8 @@ pub enum ChainSource {
 pub struct WalletConfig<E> {
 	/// Configuration for wallet storage.
 	pub storage_config: StorageConfig,
+	/// Location of the wallet's log file.
+	pub log_file: PathBuf,
 	/// Configuration for the blockchain data source.
 	pub chain_source: ChainSource,
 	/// Lightning Service Provider (LSP) configuration.
@@ -330,17 +332,10 @@ where
 	) -> Result<Wallet<T>, InitFailure> {
 		let tunables = config.tunables;
 		let network = config.network;
-		let (store, logger): (Arc<dyn KVStore + Send + Sync>, _) = match &config.storage_config {
+		let logger = Arc::new(Logger::new(&config.log_file).expect("Failed to open log file"));
+		let store: Arc<dyn KVStore + Send + Sync> = match &config.storage_config {
 			StorageConfig::LocalSQLite(path) => {
-				let mut path: PathBuf = path.into();
-				let store = Arc::new(SqliteStore::new(
-					path.clone(),
-					Some("orange.sqlite".to_owned()),
-					None,
-				)?);
-				path.push("orange.log");
-				let logger = Arc::new(Logger::new(&path).expect("Failed to open log file"));
-				(store, logger)
+				Arc::new(SqliteStore::new(path.into(), Some("orange.sqlite".to_owned()), None)?)
 			},
 		};
 		let trusted = Arc::new(T::init(&config, Arc::clone(&logger)).await?);

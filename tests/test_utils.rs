@@ -157,12 +157,13 @@ fn fund_node(node: &Node, bitcoind: &Bitcoind) {
 fn build_wallet_config<E>(
 	uuid: Uuid, bitcoind: &Bitcoind, lsp_pk: PublicKey, socket_addr: SocketAddress, extra_config: E,
 ) -> WalletConfig<E> {
-	let tmp = temp_dir().join(format!("orange-test-{uuid}/ldk-node.sqlite"));
+	let tmp = temp_dir().join(format!("orange-test-{uuid}/ldk-node"));
 	let cookie = bitcoind.params.get_cookie_values().unwrap().unwrap();
 	let mut seed: [u8; 64] = [0; 64];
 	rand::thread_rng().fill_bytes(&mut seed);
 	WalletConfig {
 		storage_config: StorageConfig::LocalSQLite(tmp.to_str().unwrap().to_string()),
+		log_file: tmp.join("orange.log"),
 		chain_source: ChainSource::BitcoindRPC {
 			host: "127.0.0.1".to_string(),
 			port: bitcoind.params.rpc_socket.port(),
