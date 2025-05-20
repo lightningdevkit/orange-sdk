@@ -6,6 +6,8 @@ use crate::{InitFailure, TxStatus, WalletConfig};
 use ldk_node::bitcoin::Network;
 use ldk_node::bitcoin::hashes::Hash;
 use ldk_node::bitcoin::hashes::sha256::Hash as Sha256;
+use ldk_node::lightning::log_debug;
+use ldk_node::lightning::util::logger::Logger as _;
 use ldk_node::lightning_invoice::Bolt11Invoice;
 
 use bitcoin_payment_instructions::PaymentMethod;
@@ -23,12 +25,6 @@ use std::sync::Arc;
 pub struct SparkWallet {
 	spark_wallet: Arc<SparkSdk>,
 	logger: Arc<Logger>,
-}
-
-impl SparkWallet {
-	pub(crate) async fn sync(&self) {
-		let _ = self.spark_wallet.sync_wallet().await;
-	}
 }
 
 impl TrustedWalletInterface for SparkWallet {
@@ -134,6 +130,7 @@ impl TrustedWalletInterface for SparkWallet {
 
 	fn sync(&self) -> impl Future<Output = ()> + Send {
 		async move {
+			log_debug!(&self.logger, "SparkWallet syncing...");
 			let _ = self.spark_wallet.sync_wallet().await;
 		}
 	}
