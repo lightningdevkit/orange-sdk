@@ -258,8 +258,6 @@ pub async fn open_channel_from_lsp(
 	wallet: &Wallet<DummyTrustedWallet>, payer: Arc<Node>,
 ) -> Amount {
 	let starting_bal = wallet.get_balance().await;
-	assert_eq!(starting_bal.available_balance, Amount::ZERO);
-	assert_eq!(starting_bal.pending_balance, Amount::ZERO);
 
 	// recv 2x the trusted balance limit to trigger a lightning channel
 	let limit = wallet.get_tunables();
@@ -282,7 +280,7 @@ pub async fn open_channel_from_lsp(
 		Duration::from_secs(1),
 		10,
 		"wallet balance update after channel open",
-		|| async { wallet.get_balance().await.available_balance > Amount::ZERO },
+		|| async { wallet.get_balance().await.available_balance > starting_bal.available_balance },
 	)
 	.await
 	.expect("Wallet balance did not update in time after channel open");

@@ -31,6 +31,9 @@ fn test_receive_to_trusted() {
 
 		let recv_amt = Amount::from_sats(100).unwrap();
 
+		let limit = wallet.get_tunables();
+		assert!(recv_amt < limit.trusted_balance_limit);
+
 		let uri = wallet.get_single_use_receive_uri(Some(recv_amt)).await.unwrap();
 		let payment_id = third_party.bolt11_payment().send(&uri.invoice, None).unwrap();
 
