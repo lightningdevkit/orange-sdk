@@ -226,17 +226,38 @@ impl PaymentInfo {
 	///
 	/// Otherwise, this amount can be any value.
 	pub fn build(instructions: PaymentInstructions, amount: Amount) -> Result<PaymentInfo, ()> {
+		match &instructions {
+			PaymentInstructions::ConfigurableAmount(conf) => {
+				if conf.min_amt().unwrap_or(Amount::ZERO) > amount
+					|| conf.max_amt().unwrap_or(Amount::MAX) < amount
+				{
+					return Err(());
+				}
+			},
+			PaymentInstructions::FixedAmount(fixed) => {
+				match (fixed.ln_payment_amount(), fixed.onchain_payment_amount()) {
+					(Some(amt), None) => {
+						if amt != amount {
+							return Err(());
+						}
+					},
+					(None, Some(amt)) => {
+						if amt != amount {
+							return Err(());
+						}
+					},
+					(Some(ln), Some(chain)) => {
+						if ln != amount && chain != amount {
+							return Err(());
+						}
+					},
+					(None, None) => {
+						return Err(());
+					},
+				}
+			},
+		}
 		Ok(PaymentInfo { instructions, amount })
-		// todo
-		// let ln_amt = instructions.ln_payment_amount();
-		// let onchain_amt = instructions.onchain_payment_amount();
-		// let ln_amt_matches = ln_amt.is_some() && ln_amt.unwrap() == amount;
-		// let onchain_amt_matches = onchain_amt.is_some() && onchain_amt.unwrap() == amount;
-		//
-		// if (ln_amt.is_some() || onchain_amt.is_some()) && !ln_amt_matches && !onchain_amt_matches {
-		// 	Err(())
-		// } else {
-		// }
 	}
 }
 
