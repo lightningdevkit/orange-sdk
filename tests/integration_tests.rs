@@ -217,22 +217,10 @@ fn test_pay_lightning_from_self_custody() {
 		let info = PaymentInfo::build(instr, amount).unwrap();
 		wallet.pay(&info).await.unwrap();
 
-		// wait for payment to complete
-		test_utils::wait_for_condition(
-			Duration::from_secs(1),
-			10,
-			"lightning payment completion",
-			|| async {
-				let payments = wallet.list_transactions().await.unwrap();
-				let payment = payments.into_iter().find(|p| p.outbound);
-				if payment.as_ref().is_some_and(|p| p.status == TxStatus::Failed) {
-					panic!("Payment failed");
-				}
-				payment.is_some_and(|p| p.status == TxStatus::Completed)
-			},
-		)
-		.await
-		.expect("Payment did not complete in time");
+		let event = wallet.next_event_async().await;
+		wallet.event_handled().unwrap();
+		assert!(matches!(event, orange_sdk::Event::PaymentSuccessful { .. }));
+		assert_eq!(wallet.next_event(), None);
 
 		// check the payment is correct
 		let payments = wallet.list_transactions().await.unwrap();
@@ -281,22 +269,10 @@ fn test_pay_bolt12_from_self_custody() {
 		let info = PaymentInfo::build(instr, amount).unwrap();
 		wallet.pay(&info).await.unwrap();
 
-		// wait for payment to complete
-		test_utils::wait_for_condition(
-			Duration::from_secs(1),
-			10,
-			"lightning payment completion",
-			|| async {
-				let payments = wallet.list_transactions().await.unwrap();
-				let payment = payments.into_iter().find(|p| p.outbound);
-				if payment.as_ref().is_some_and(|p| p.status == TxStatus::Failed) {
-					panic!("Payment failed");
-				}
-				payment.is_some_and(|p| p.status == TxStatus::Completed)
-			},
-		)
-		.await
-		.expect("Payment did not complete in time");
+		let event = wallet.next_event_async().await;
+		wallet.event_handled().unwrap();
+		assert!(matches!(event, orange_sdk::Event::PaymentSuccessful { .. }));
+		assert_eq!(wallet.next_event(), None);
 
 		// check the payment is correct
 		let payments = wallet.list_transactions().await.unwrap();

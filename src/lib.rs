@@ -29,7 +29,7 @@ use ldk_node::io::sqlite_store::SqliteStore;
 use ldk_node::lightning::ln::msgs::SocketAddress;
 use ldk_node::lightning::util::logger::Logger as _;
 use ldk_node::lightning::util::persist::KVStore;
-use ldk_node::lightning::{log_debug, log_info};
+use ldk_node::lightning::{log_debug, log_error, log_info};
 use ldk_node::lightning_invoice::Bolt11Invoice;
 use ldk_node::payment::{PaymentKind as LightningPaymentKind, PaymentKind};
 use ldk_node::{BuildError, NodeError, bitcoin};
@@ -43,6 +43,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
+mod event;
 mod lightning_wallet;
 pub(crate) mod logging;
 mod store;
@@ -53,6 +54,8 @@ use logging::Logger;
 use trusted_wallet::Error as TrustedError;
 use trusted_wallet::TrustedWalletInterface;
 
+use crate::event::EventHandler;
+pub use event::Event;
 use store::{PaymentId, TxMetadata, TxMetadataStore, TxType};
 pub use store::{PaymentType, Transaction, TxStatus};
 
@@ -73,6 +76,8 @@ struct WalletImpl<T: TrustedWalletInterface> {
 	ln_wallet: LightningWallet,
 	/// The trusted wallet interface for managing small balances.
 	trusted: Arc<T>,
+	/// The event handler for processing wallet events.
+	event_handler: Arc<EventHandler>,
 	/// Configuration parameters for when the wallet decides to use the lightning or trusted wallet.
 	tunables: Tunables,
 	/// The Bitcoin network the wallet operates on (e.g., Mainnet, Testnet).
@@ -382,9 +387,12 @@ where
 			Arc::clone(&logger),
 		)?;
 
+		let event_handler = ln_wallet.inner.event_handler.clone();
+
 		let inner = Arc::new(WalletImpl::<T> {
 			trusted,
 			ln_wallet,
+			event_handler,
 			network,
 			tunables,
 			tx_metadata: TxMetadataStore::new(Arc::clone(&store)),
@@ -1050,6 +1058,54 @@ where
 	/// Returns the wallet's configured tunables.
 	pub fn get_tunables(&self) -> Tunables {
 		self.inner.tunables
+	}
+
+	/// Returns the next event in the event queue, if currently available.
+	///
+	/// Will return `Some(..)` if an event is available and `None` otherwise.
+	///
+	/// **Note:** this will always return the same event until handling is confirmed via [`Wallet::event_handled`].
+	///
+	/// **Caution:** Users must handle events as quickly as possible to prevent a large event backlog,
+	/// which can increase the memory footprint of [`Wallet`].
+	pub fn next_event(&self) -> Option<Event> {
+		self.inner.event_handler.event_queue.next_event()
+	}
+
+	/// Returns the next event in the event queue.
+	///
+	/// Will asynchronously poll the event queue until the next event is ready.
+	///
+	/// **Note:** this will always return the same event until handling is confirmed via [`Wallet::event_handled`].
+	///
+	/// **Caution:** Users must handle events as quickly as possible to prevent a large event backlog,
+	/// which can increase the memory footprint of [`Wallet`].
+	pub async fn next_event_async(&self) -> Event {
+		self.inner.event_handler.event_queue.next_event_async().await
+	}
+
+	/// Returns the next event in the event queue.
+	///
+	/// Will block the current thread until the next event is available.
+	///
+	/// **Note:** this will always return the same event until handling is confirmed via [`Wallet::event_handled`].
+	///
+	/// **Caution:** Users must handle events as quickly as possible to prevent a large event backlog,
+	/// which can increase the memory footprint of [`Wallet`].
+	pub fn wait_next_event(&self) -> Event {
+		self.inner.event_handler.event_queue.wait_next_event()
+	}
+
+	/// Confirm the last retrieved event handled.
+	///
+	/// **Note:** This **MUST** be called after each event has been handled.
+	pub fn event_handled(&self) -> Result<(), ()> {
+		self.inner.event_handler.event_queue.event_handled().map_err(|e| {
+			log_error!(
+				self.inner.logger,
+				"Couldn't mark event handled due to persistence failure: {e}"
+			);
+		})
 	}
 }
 

@@ -1,3 +1,4 @@
+use crate::event::{EventHandler, EventQueue};
 use crate::logging::Logger;
 use crate::{ChainSource, InitFailure, PaymentType, Seed, TxStatus, WalletConfig};
 use std::fmt::Debug;
@@ -5,17 +6,16 @@ use std::fmt::Debug;
 use bitcoin_payment_instructions::PaymentMethod;
 use bitcoin_payment_instructions::amount::Amount;
 
+use ldk_node::NodeError;
 use ldk_node::bitcoin::{Address, Network};
 use ldk_node::lightning::ln::channelmanager::PaymentId;
+use ldk_node::lightning::log_debug;
 use ldk_node::lightning::util::logger::Logger as _;
 use ldk_node::lightning::util::persist::KVStore;
-use ldk_node::lightning::{log_debug, log_error};
 use ldk_node::lightning_invoice::{Bolt11Invoice, Bolt11InvoiceDescription, Description};
 use ldk_node::payment::{PaymentDetails, PaymentDirection, PaymentKind, PaymentStatus};
-use ldk_node::{Event, NodeError};
 
 use std::sync::Arc;
-
 use tokio::runtime::Runtime;
 use tokio::sync::watch;
 
@@ -69,13 +69,14 @@ pub(crate) struct LightningWalletBalance {
 	pub(crate) onchain: Amount,
 }
 
-struct LightningWalletImpl {
-	ldk_node: ldk_node::Node,
+pub(crate) struct LightningWalletImpl {
+	ldk_node: Arc<ldk_node::Node>,
 	payment_receipt_flag: watch::Receiver<()>,
+	pub(crate) event_handler: Arc<EventHandler>,
 }
 
 pub(crate) struct LightningWallet {
-	inner: Arc<LightningWalletImpl>,
+	pub(crate) inner: Arc<LightningWalletImpl>,
 }
 
 impl LightningWallet {
@@ -131,34 +132,27 @@ impl LightningWallet {
 
 		builder.set_custom_logger(Arc::clone(&logger) as Arc<dyn ldk_node::logger::LogWriter>);
 
-		let ldk_node = builder.build_with_store(store)?;
+		let ldk_node = Arc::new(builder.build_with_store(store.clone())?);
 		let (payment_receipt_sender, payment_receipt_flag) = watch::channel(());
-		let inner = Arc::new(LightningWalletImpl { ldk_node, payment_receipt_flag });
+		let ev_handler = Arc::new(EventHandler {
+			event_queue: Arc::new(EventQueue::new(store, logger.clone())),
+			ldk_node: ldk_node.clone(),
+			payment_receipt_sender,
+			logger,
+		});
+		let inner = Arc::new(LightningWalletImpl {
+			ldk_node,
+			payment_receipt_flag,
+			event_handler: ev_handler.clone(),
+		});
 
 		inner.ldk_node.start_with_runtime(Arc::clone(&runtime))?;
 
-		let events_ref = Arc::clone(&inner);
 		runtime.spawn(async move {
 			loop {
-				let event = events_ref.ldk_node.next_event_async().await;
-				log_debug!(logger, "Got ldk-node event {:?}", event);
-				match event {
-					Event::PaymentSuccessful { .. } => {},
-					Event::PaymentFailed { .. } => {},
-					Event::PaymentReceived { .. } => {
-						let _ = payment_receipt_sender.send(());
-					},
-					Event::PaymentForwarded { .. } => {},
-					Event::PaymentClaimable { .. } => {},
-					Event::ChannelPending { .. } => {},
-					Event::ChannelReady { .. } => {},
-					Event::ChannelClosed { .. } => {
-						// TODO: Oof! Probably open a new channel with our LSP
-					},
-				}
-				if let Err(e) = events_ref.ldk_node.event_handled() {
-					log_error!(logger, "Failed to handle event: {e:?}");
-				}
+				let event = ev_handler.ldk_node.next_event_async().await;
+				log_debug!(ev_handler.logger, "Got ldk-node event {:?}", event);
+				ev_handler.handle_ldk_node_event(event);
 			}
 		});
 

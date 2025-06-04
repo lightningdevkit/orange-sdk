@@ -183,7 +183,6 @@ impl TrustedWalletInterface for DummyTrustedWallet {
 
 	fn get_balance(&self) -> Amount {
 		let msats = self.current_bal_msats.load(Ordering::SeqCst);
-		println!("current bal_msats: {msats}");
 		Amount::from_milli_sats(msats).expect("valid msats")
 	}
 

@@ -285,5 +285,15 @@ pub async fn open_channel_from_lsp(
 	.await
 	.expect("Wallet balance did not update in time after channel open");
 
+	let event = wallet.next_event_async().await;
+	wallet.event_handled().unwrap();
+	assert!(matches!(event, orange_sdk::Event::ChannelOpened { .. }));
+
+	let event = wallet.next_event_async().await;
+	wallet.event_handled().unwrap();
+	assert!(matches!(event, orange_sdk::Event::PaymentReceived { .. }));
+
+	assert_eq!(wallet.next_event(), None);
+
 	recv_amt
 }

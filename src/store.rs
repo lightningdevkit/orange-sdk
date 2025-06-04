@@ -66,7 +66,7 @@ pub struct Transaction {
 }
 
 #[derive(Debug, Clone, Hash, PartialEq, Eq)]
-pub(crate) enum PaymentId {
+pub enum PaymentId {
 	Lightning([u8; 32]),
 	Trusted(TrustedPaymentId),
 }
