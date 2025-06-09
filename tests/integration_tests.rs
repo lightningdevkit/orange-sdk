@@ -115,6 +115,15 @@ fn test_sweep_to_ln() {
 		.await
 		.expect("Wallet balance did not update in time after receive");
 
+		let event = wallet.next_event_async().await;
+		wallet.event_handled().unwrap();
+		assert!(matches!(event, orange_sdk::Event::RebalanceInitiated { .. }));
+
+		// wait for payment received
+		let event = wallet.next_event_async().await;
+		wallet.event_handled().unwrap();
+		assert!(matches!(event, orange_sdk::Event::ChannelOpened { .. }));
+
 		// wait for rebalance
 		test_utils::wait_for_condition(
 			Duration::from_secs(1),
@@ -124,6 +133,22 @@ fn test_sweep_to_ln() {
 		)
 		.await
 		.expect("Wallet did not receive new channel");
+
+		let event = wallet.next_event_async().await;
+		wallet.event_handled().unwrap();
+		assert!(matches!(event, orange_sdk::Event::PaymentReceived { .. }));
+
+		let event = wallet.next_event_async().await;
+		wallet.event_handled().unwrap();
+		match event {
+			orange_sdk::Event::RebalanceSuccessful { amount_msat, fee_msat, .. } => {
+				assert!(fee_msat > 0);
+				assert_eq!(amount_msat, intermediate_amt.saturating_add(recv_amt).milli_sats());
+			},
+			_ => panic!("Expected RebalanceSuccessful event"),
+		}
+
+		assert_eq!(wallet.next_event(), None);
 	})
 }
 

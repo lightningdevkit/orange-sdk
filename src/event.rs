@@ -100,8 +100,6 @@ pub enum Event {
 		trigger_payment_id: PaymentId,
 		/// The `payment_id` of the rebalance payment sent from the trusted wallet.
 		trusted_rebalance_payment_id: TrustedPaymentId,
-		/// The `payment_id` of the rebalance payment sent to the LN wallet.
-		ln_rebalance_payment_id: [u8; 32],
 		/// The amount, in msats, of the rebalance payment.
 		amount_msat: u64,
 	},
@@ -153,8 +151,7 @@ impl_writeable_tlv_based_enum!(Event,
 	(5, RebalanceInitiated) => {
 		(0, trigger_payment_id, required),
 		(2, trusted_rebalance_payment_id, required),
-		(4, ln_rebalance_payment_id, required),
-		(6, amount_msat, required),
+		(4, amount_msat, required),
 	},
 	(6, RebalanceSuccessful) => {
 		(0, trigger_payment_id, required),

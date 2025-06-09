@@ -31,7 +31,7 @@ use ldk_node::lightning::util::logger::Logger as _;
 use ldk_node::lightning::util::persist::KVStore;
 use ldk_node::lightning::{log_debug, log_error, log_info};
 use ldk_node::lightning_invoice::Bolt11Invoice;
-use ldk_node::payment::{PaymentKind as LightningPaymentKind, PaymentKind};
+use ldk_node::payment::PaymentKind;
 use ldk_node::{BuildError, NodeError, bitcoin};
 
 use tokio::runtime::Runtime;
@@ -508,20 +508,49 @@ where
 							inner.logger,
 							"Rebalance trusted transaction initiated, id {rebalance_id}. Waiting for LN payment."
 						);
+						if let Err(e) =
+							inner.event_handler.event_queue.add_event(Event::RebalanceInitiated {
+								trigger_payment_id: triggering_transaction_id.clone(),
+								trusted_rebalance_payment_id: rebalance_id,
+								amount_msat: transfer_amt.milli_sats(),
+							}) {
+							log_error!(
+								inner.logger,
+								"Failed to add RebalanceInitiated event: {e:?}"
+							);
+						}
+
+						// get the fee of the rebalance transaction
+						let trusted_txs = inner.trusted.list_payments().await.unwrap_or_default();
+						let rebalance_tx_fee = trusted_txs
+							.iter()
+							.find(|p| p.id == rebalance_id)
+							.map(|p| p.fee)
+							.unwrap_or(Amount::ZERO);
+
 						let mut received_payment_id = None;
+						let mut fee_msat: u64 = rebalance_tx_fee.milli_sats();
 						while received_payment_id.is_none() {
 							for payment in inner.ln_wallet.list_payments() {
-								if let LightningPaymentKind::Bolt11 { hash, .. } = payment.kind {
-									if hash.0[..] == expected_hash[..] {
-										match payment.status.into() {
-											TxStatus::Completed => {
-												received_payment_id = Some(payment.id);
-											},
-											TxStatus::Pending => {},
-											TxStatus::Failed => return,
-										}
-										break;
+								let (hash, counterparty_skimmed_fee_msat) = match payment.kind {
+									PaymentKind::Bolt11 { hash, .. } => (hash, None),
+									PaymentKind::Bolt11Jit {
+										hash,
+										counterparty_skimmed_fee_msat,
+										..
+									} => (hash, counterparty_skimmed_fee_msat),
+									_ => continue, // Ignore other payment kinds, we only care about the one we just sent.
+								};
+								if hash.0[..] == expected_hash[..] {
+									match payment.status.into() {
+										TxStatus::Completed => {
+											received_payment_id = Some(payment.id);
+											fee_msat += counterparty_skimmed_fee_msat.unwrap_or(0);
+										},
+										TxStatus::Pending => {},
+										TxStatus::Failed => return,
 									}
+									break;
 								}
 							}
 							if received_payment_id.is_none() {
@@ -546,16 +575,28 @@ where
 							ty: TxType::TransferToNonTrusted {
 								trusted_payment: rebalance_id,
 								lightning_payment: lightning_id,
-								payment_triggering_transfer: triggering_transaction_id,
+								payment_triggering_transfer: triggering_transaction_id.clone(),
 							},
 							time: SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap(),
 						};
 						inner
 							.tx_metadata
 							.insert(PaymentId::Trusted(rebalance_id), metadata.clone());
-						inner
-							.tx_metadata
-							.insert(PaymentId::Lightning(lightning_id), metadata.clone());
+						inner.tx_metadata.insert(PaymentId::Lightning(lightning_id), metadata);
+
+						if let Err(e) =
+							inner.event_handler.event_queue.add_event(Event::RebalanceSuccessful {
+								trigger_payment_id: triggering_transaction_id,
+								trusted_rebalance_payment_id: rebalance_id,
+								ln_rebalance_payment_id: lightning_id,
+								amount_msat: transfer_amt.milli_sats(),
+								fee_msat,
+							}) {
+							log_error!(
+								inner.logger,
+								"Failed to add RebalanceSuccessful event: {e:?}"
+							);
+						}
 					},
 					Err(e) => {
 						log_info!(inner.logger, "Rebalance trusted transaction failed with {e:?}",);
