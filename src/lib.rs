@@ -224,12 +224,11 @@ pub struct PaymentInfo {
 impl PaymentInfo {
 	/// Prepares us to pay a [`PaymentInstructions`] by setting the amount.
 	///
-	/// If [`PaymentInstructions`] already contains an `amount`, the `amount` must match either
-	/// [`PaymentInstructions::ln_payment_amount`] or
-	/// [`PaymentInstructions::onchain_payment_amount`] exactly. Will return `Err(())` if this
-	/// requirement is not met.
+	/// If [`PaymentInstructions`] is a [`PaymentInstructions::ConfigurableAmount`], the amount must be
+	/// within the specified range (if any).
 	///
-	/// Otherwise, this amount can be any value.
+	/// If [`PaymentInstructions`] is a [`PaymentInstructions::FixedAmount`], the amount must match the
+	/// fixed on-chain or lightning amount specified.
 	pub fn build(instructions: PaymentInstructions, amount: Amount) -> Result<PaymentInfo, ()> {
 		match &instructions {
 			PaymentInstructions::ConfigurableAmount(conf) => {
@@ -276,7 +275,7 @@ pub enum InitFailure {
 	/// Failure to start the LDK node.
 	LdkNodeStartFailure(NodeError),
 	/// Failure in the trusted wallet implementation.
-	TrustedFailure(TrustedError),
+	TrustedFailure(Box<TrustedError>),
 }
 
 impl From<io::Error> for InitFailure {
@@ -299,7 +298,7 @@ impl From<NodeError> for InitFailure {
 
 impl From<TrustedError> for InitFailure {
 	fn from(e: TrustedError) -> InitFailure {
-		InitFailure::TrustedFailure(e)
+		InitFailure::TrustedFailure(Box::new(e))
 	}
 }
 
@@ -876,9 +875,9 @@ where
 	///
 	/// See [`PaymentInstructions`] for the list of supported formats.
 	///
-	/// Note that a user might also be pasting or scanning a QR code containing a lightning BOLT 12
-	/// refund, which allow us to *receive* funds, and must be parsed with
-	/// [`Self::parse_claim_instructions`].
+	// Note that a user might also be pasting or scanning a QR code containing a lightning BOLT 12
+	// refund, which allow us to *receive* funds, and must be parsed with
+	// [`Self::parse_claim_instructions`].
 	pub async fn parse_payment_instructions(
 		&self, instructions: &str,
 	) -> Result<PaymentInstructions, instructions::ParseError> {

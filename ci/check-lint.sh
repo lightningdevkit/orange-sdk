@@ -18,3 +18,5 @@ RUSTFLAGS='-D warnings' cargo clippy -- \
 	-A clippy::option-as-ref-deref \
 	`# TODO eventually remove this` \
 	-A dead-code
+
+cargo doc --all-features
