@@ -466,7 +466,6 @@ where
 			}
 		});
 
-		// TODO: events from ldk-node up
 		Ok(Wallet { inner })
 	}
 
