@@ -12,6 +12,7 @@ use ldk_node::lightning::util::persist::KVStore;
 use ldk_node::lightning::util::ser::{Writeable, Writer};
 use ldk_node::lightning::{impl_writeable_tlv_based_enum, log_error, log_warn};
 use ldk_node::lightning_types::payment::{PaymentHash, PaymentPreimage};
+use ldk_node::payment::PaymentKind;
 use ldk_node::{CustomTlvRecord, UserChannelId};
 
 use std::sync::{Arc, Condvar, Mutex};
@@ -69,6 +70,9 @@ pub enum Event {
 		amount_msat: u64,
 		/// Custom TLV records received on the payment
 		custom_records: Vec<CustomTlvRecord>,
+		/// The value, in msats, that was skimmed off of this payment as an extra fee taken by LSP.
+		/// Typically, this is only present for payments that result in opening a channel.
+		lsp_fee_msats: Option<u64>,
 	},
 	/// A channel is ready to be used.
 	ChannelOpened {
@@ -135,6 +139,7 @@ impl_writeable_tlv_based_enum!(Event,
 		(2, payment_hash, required),
 		(4, amount_msat, required),
 		(5, custom_records, optional_vec),
+		(7, lsp_fee_msats, option),
 	},
 	(3, ChannelOpened) => {
 		(0, channel_id, required),
@@ -323,11 +328,20 @@ impl EventHandler {
 				amount_msat,
 				custom_records,
 			} => {
+				let payment_id = payment_id.expect("this is safe");
+				let lsp_fee_msats = self.ldk_node.payment(&payment_id).and_then(|p| {
+					if let PaymentKind::Bolt11Jit { counterparty_skimmed_fee_msat, .. } = p.kind {
+						counterparty_skimmed_fee_msat
+					} else {
+						None
+					}
+				});
 				if let Err(e) = self.event_queue.add_event(Event::PaymentReceived {
-					payment_id: PaymentId::Lightning(payment_id.unwrap().0), // safe
+					payment_id: PaymentId::Lightning(payment_id.0), // safe
 					payment_hash,
 					amount_msat,
 					custom_records,
+					lsp_fee_msats,
 				}) {
 					log_error!(self.logger, "Failed to add PaymentReceived event: {e:?}");
 					return;
