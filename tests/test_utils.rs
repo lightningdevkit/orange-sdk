@@ -3,6 +3,7 @@
 use bitcoin_payment_instructions::amount::Amount;
 use corepc_node::client::bitcoin::Network;
 use corepc_node::{Conf, Node as Bitcoind, get_available_port};
+use ldk_node::bitcoin::hashes::Hash;
 use ldk_node::bitcoin::secp256k1::PublicKey;
 use ldk_node::lightning::ln::msgs::SocketAddress;
 use ldk_node::liquidity::LSPS2ServiceConfig;
@@ -33,6 +34,20 @@ where
 		tokio::time::sleep(interval).await;
 	}
 	Err(format!("Timeout waiting for condition: {condition_name}"))
+}
+
+/// Waits for the next event from the wallet, polling every second for up to 10 seconds.
+/// If no event is received within this time, it panics.
+/// This is useful for testing purposes to ensure that the wallet is responsive and events are being processed.
+/// Otherwise, we can have the test hang indefinitely.
+pub async fn wait_next_event(wallet: &Wallet<DummyTrustedWallet>) -> orange_sdk::Event {
+	for _ in 0..10 {
+		if let Some(event) = wallet.next_event() {
+			return event;
+		}
+		tokio::time::sleep(Duration::from_secs(1)).await;
+	}
+	panic!("Timeout waiting for condition next event")
 }
 
 fn create_bitcoind() -> Bitcoind {
@@ -285,13 +300,18 @@ pub async fn open_channel_from_lsp(
 	.await
 	.expect("Wallet balance did not update in time after channel open");
 
-	let event = wallet.next_event_async().await;
+	let event = wait_next_event(&wallet).await;
 	wallet.event_handled().unwrap();
 	assert!(matches!(event, orange_sdk::Event::ChannelOpened { .. }));
 
-	let event = wallet.next_event_async().await;
+	let event = wait_next_event(&wallet).await;
 	wallet.event_handled().unwrap();
-	assert!(matches!(event, orange_sdk::Event::PaymentReceived { .. }));
+	match event {
+		orange_sdk::Event::PaymentReceived { payment_hash, .. } => {
+			assert_eq!(payment_hash.0, uri.invoice.payment_hash().to_byte_array())
+		},
+		_ => panic!("Expected PaymentReceived event"),
+	}
 
 	assert_eq!(wallet.next_event(), None);
 

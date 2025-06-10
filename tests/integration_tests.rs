@@ -1,6 +1,8 @@
 #![cfg(feature = "_test-utils")]
 
-use crate::test_utils::{TestParams, build_test_nodes, generate_blocks, open_channel_from_lsp};
+use crate::test_utils::{
+	TestParams, build_test_nodes, generate_blocks, open_channel_from_lsp, wait_next_event,
+};
 use bitcoin_payment_instructions::amount::Amount;
 use ldk_node::lightning_invoice::{Bolt11InvoiceDescription, Description};
 use ldk_node::payment::{PaymentDirection, PaymentStatus};
@@ -115,14 +117,9 @@ fn test_sweep_to_ln() {
 		.await
 		.expect("Wallet balance did not update in time after receive");
 
-		let event = wallet.next_event_async().await;
+		let event = wait_next_event(&wallet).await;
 		wallet.event_handled().unwrap();
 		assert!(matches!(event, orange_sdk::Event::RebalanceInitiated { .. }));
-
-		// wait for payment received
-		let event = wallet.next_event_async().await;
-		wallet.event_handled().unwrap();
-		assert!(matches!(event, orange_sdk::Event::ChannelOpened { .. }));
 
 		// wait for rebalance
 		test_utils::wait_for_condition(
@@ -134,11 +131,21 @@ fn test_sweep_to_ln() {
 		.await
 		.expect("Wallet did not receive new channel");
 
-		let event = wallet.next_event_async().await;
+		// wait for payment received
+		let event = wait_next_event(&wallet).await;
+		wallet.event_handled().unwrap();
+		match event {
+			orange_sdk::Event::ChannelOpened { counterparty_node_id, .. } => {
+				assert_eq!(counterparty_node_id, lsp.node_id());
+			},
+			_ => panic!("Expected ChannelOpened event"),
+		}
+
+		let event = wait_next_event(&wallet).await;
 		wallet.event_handled().unwrap();
 		assert!(matches!(event, orange_sdk::Event::PaymentReceived { .. }));
 
-		let event = wallet.next_event_async().await;
+		let event = wait_next_event(&wallet).await;
 		wallet.event_handled().unwrap();
 		match event {
 			orange_sdk::Event::RebalanceSuccessful { amount_msat, fee_msat, .. } => {
@@ -242,7 +249,7 @@ fn test_pay_lightning_from_self_custody() {
 		let info = PaymentInfo::build(instr, amount).unwrap();
 		wallet.pay(&info).await.unwrap();
 
-		let event = wallet.next_event_async().await;
+		let event = wait_next_event(&wallet).await;
 		wallet.event_handled().unwrap();
 		assert!(matches!(event, orange_sdk::Event::PaymentSuccessful { .. }));
 		assert_eq!(wallet.next_event(), None);
@@ -294,7 +301,7 @@ fn test_pay_bolt12_from_self_custody() {
 		let info = PaymentInfo::build(instr, amount).unwrap();
 		wallet.pay(&info).await.unwrap();
 
-		let event = wallet.next_event_async().await;
+		let event = wait_next_event(&wallet).await;
 		wallet.event_handled().unwrap();
 		assert!(matches!(event, orange_sdk::Event::PaymentSuccessful { .. }));
 		assert_eq!(wallet.next_event(), None);
