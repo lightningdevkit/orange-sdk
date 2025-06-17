@@ -31,7 +31,7 @@ use ldk_node::lightning::util::logger::Logger as _;
 use ldk_node::lightning::util::persist::KVStore;
 use ldk_node::lightning::{log_debug, log_error, log_info};
 use ldk_node::lightning_invoice::Bolt11Invoice;
-use ldk_node::payment::PaymentKind;
+use ldk_node::payment::{PaymentDirection, PaymentKind, PaymentStatus};
 use ldk_node::{BuildError, NodeError, bitcoin};
 
 use tokio::runtime::Runtime;
@@ -56,6 +56,7 @@ use trusted_wallet::TrustedWalletInterface;
 
 use crate::event::EventHandler;
 pub use event::Event;
+pub use ldk_node::payment::ConfirmationStatus;
 use store::{PaymentId, TxMetadata, TxMetadataStore, TxType};
 pub use store::{PaymentType, Transaction, TxStatus};
 
@@ -404,6 +405,8 @@ where
 		// This will withdraw from the trusted balance to our LN balance, possibly opening a channel.
 		let inner_ref = Arc::clone(&inner);
 		runtime.spawn(async move {
+			let mut onchain_sync_time =
+				inner_ref.ln_wallet.inner.ldk_node.status().latest_onchain_wallet_sync_timestamp;
 			loop {
 				if let Ok(trusted_payments) = inner_ref.trusted.list_payments().await {
 					let mut new_txn = Vec::new();
@@ -459,6 +462,68 @@ where
 							.await;
 					}
 				}
+
+				// detect if onchain was synced, if so, check if we need to rebalance
+				let new_onchain_sync_time = inner_ref
+					.ln_wallet
+					.inner
+					.ldk_node
+					.status()
+					.latest_onchain_wallet_sync_timestamp;
+				if new_onchain_sync_time.is_some() && onchain_sync_time != new_onchain_sync_time {
+					// find all new confirmed inbound onchain payments since last sync
+					let new_recvs =
+						inner_ref.ln_wallet.inner.ldk_node.list_payments_with_filter(|p| {
+							p.direction == PaymentDirection::Inbound
+								&& p.status == PaymentStatus::Succeeded
+								&& p.latest_update_timestamp > onchain_sync_time.unwrap_or(0)
+								&& matches!(
+									p.kind,
+									PaymentKind::Onchain {
+										status: ConfirmationStatus::Confirmed { .. },
+										..
+									}
+								)
+						});
+
+					onchain_sync_time = new_onchain_sync_time;
+
+					// now create events for these payments
+					for payment in new_recvs {
+						let payment_id = PaymentId::Lightning(payment.id.0);
+						let (txid, status) = match payment.kind {
+							PaymentKind::Onchain { txid, status } => (txid, status),
+							_ => continue,
+						};
+						if let Err(e) = inner_ref.event_handler.event_queue.add_event(
+							Event::OnchainPaymentReceived {
+								payment_id,
+								txid,
+								amount_sat: payment.amount_msat.unwrap() / 1_000,
+								status,
+							},
+						) {
+							log_error!(
+								inner_ref.logger,
+								"Failed to add OnchainPaymentReceived event: {e:?}"
+							);
+						}
+					}
+
+					// check if we have funds that aren't anchor reserve && > rebalance_min
+					let spendable = inner_ref
+						.ln_wallet
+						.inner
+						.ldk_node
+						.list_balances()
+						.spendable_onchain_balance_sats;
+
+					if spendable > inner_ref.tunables.rebalance_min.sats_rounding_up() {
+						// todo mark tx as rebalance
+						Self::onchain_rebalance(&inner_ref).await;
+					}
+				}
+
 				tokio::time::sleep(Duration::from_secs(1)).await;
 
 				inner_ref.trusted.sync().await; // TODO: Remove this when spark fixes their shit
@@ -602,6 +667,11 @@ where
 				}
 			}
 		}
+	}
+
+	async fn onchain_rebalance(inner: &Arc<WalletImpl<T>>) {
+		let _ = inner.balance_mutex.lock().await;
+		// todo for now we can only open a channel, eventually move to splicing
 	}
 
 	/// Lists the transactions which have been made.

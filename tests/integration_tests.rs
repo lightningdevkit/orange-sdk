@@ -5,8 +5,8 @@ use crate::test_utils::{
 };
 use bitcoin_payment_instructions::amount::Amount;
 use ldk_node::lightning_invoice::{Bolt11InvoiceDescription, Description};
-use ldk_node::payment::{PaymentDirection, PaymentStatus};
-use orange_sdk::{PaymentInfo, PaymentType, TxStatus};
+use ldk_node::payment::{ConfirmationStatus, PaymentDirection, PaymentStatus};
+use orange_sdk::{Event, PaymentInfo, PaymentType, TxStatus};
 use std::time::Duration;
 
 mod test_utils;
@@ -190,7 +190,7 @@ fn test_receive_to_onchain() {
 		let recv_amt = Amount::from_sats(200_000).unwrap();
 
 		let uri = wallet.get_single_use_receive_uri(Some(recv_amt)).await.unwrap();
-		let txid = third_party
+		let sent_txid = third_party
 			.onchain_payment()
 			.send_to_address(&uri.address.unwrap(), recv_amt.sats().unwrap(), None)
 			.unwrap();
@@ -212,12 +212,26 @@ fn test_receive_to_onchain() {
 		.await
 		.expect("Pending balance did not update in time");
 
+		let event = wait_next_event(&wallet).await;
+		wallet.event_handled().unwrap();
+
+		match event {
+			Event::OnchainPaymentReceived { txid, amount_sat, status, .. } => {
+				assert_eq!(txid, sent_txid);
+				assert_eq!(amount_sat, recv_amt.sats().unwrap());
+				assert!(matches!(status, ConfirmationStatus::Confirmed { .. }));
+			},
+			_ => panic!("Expected OnchainPaymentReceived event"),
+		}
+
+		assert!(wallet.next_event().is_none());
+
 		let txs = wallet.list_transactions().await.unwrap();
 		assert_eq!(txs.len(), 1);
 		let tx = txs.into_iter().next().unwrap();
 		assert!(!tx.outbound);
 		assert_eq!(tx.status, TxStatus::Completed);
-		assert_eq!(tx.payment_type, PaymentType::IncomingOnChain { txid: Some(txid) });
+		assert_eq!(tx.payment_type, PaymentType::IncomingOnChain { txid: Some(sent_txid) });
 		assert_ne!(tx.time_since_epoch, Duration::ZERO);
 		assert_eq!(tx.amount, Some(recv_amt));
 		assert_eq!(tx.fee, Some(Amount::ZERO));

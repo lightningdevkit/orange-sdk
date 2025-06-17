@@ -3,8 +3,8 @@ use crate::store::PaymentId;
 use crate::trusted_wallet::TrustedPaymentId;
 use std::collections::VecDeque;
 
-use ldk_node::bitcoin::OutPoint;
 use ldk_node::bitcoin::secp256k1::PublicKey;
+use ldk_node::bitcoin::{OutPoint, Txid};
 use ldk_node::lightning::events::{ClosureReason, PaymentFailureReason};
 use ldk_node::lightning::ln::types::ChannelId;
 use ldk_node::lightning::util::logger::Logger as _;
@@ -12,7 +12,7 @@ use ldk_node::lightning::util::persist::KVStore;
 use ldk_node::lightning::util::ser::{Writeable, Writer};
 use ldk_node::lightning::{impl_writeable_tlv_based_enum, log_error, log_warn};
 use ldk_node::lightning_types::payment::{PaymentHash, PaymentPreimage};
-use ldk_node::payment::PaymentKind;
+use ldk_node::payment::{ConfirmationStatus, PaymentKind};
 use ldk_node::{CustomTlvRecord, UserChannelId};
 
 use std::sync::{Arc, Condvar, Mutex};
@@ -61,8 +61,6 @@ pub enum Event {
 	/// A payment has been received.
 	PaymentReceived {
 		/// A local identifier used to track the payment.
-		///
-		/// Will only be `None` for events serialized with LDK Node v0.2.1 or prior.
 		payment_id: PaymentId,
 		/// The hash of the payment.
 		payment_hash: PaymentHash,
@@ -73,6 +71,17 @@ pub enum Event {
 		/// The value, in msats, that was skimmed off of this payment as an extra fee taken by LSP.
 		/// Typically, this is only present for payments that result in opening a channel.
 		lsp_fee_msats: Option<u64>,
+	},
+	/// A payment has been received.
+	OnchainPaymentReceived {
+		/// A local identifier used to track the payment.
+		payment_id: PaymentId,
+		/// The transaction ID.
+		txid: Txid,
+		/// The value, in sats, that has been received.
+		amount_sat: u64,
+		/// The confirmation status of this payment.
+		status: ConfirmationStatus,
 	},
 	/// A channel is ready to be used.
 	ChannelOpened {
@@ -141,24 +150,30 @@ impl_writeable_tlv_based_enum!(Event,
 		(5, custom_records, optional_vec),
 		(7, lsp_fee_msats, option),
 	},
-	(3, ChannelOpened) => {
+	(3, OnchainPaymentReceived) => {
+		(0, payment_id, required),
+		(2, txid, required),
+		(4, amount_sat, required),
+		(6, status, required),
+	},
+	(4, ChannelOpened) => {
 		(0, channel_id, required),
 		(2, user_channel_id, required),
 		(4, counterparty_node_id, required),
 		(6, funding_txo, required),
 	},
-	(4, ChannelClosed) => {
+	(5, ChannelClosed) => {
 		(0, channel_id, required),
 		(2, user_channel_id, required),
 		(4, counterparty_node_id, required),
 		(5, reason, upgradable_option),
 	},
-	(5, RebalanceInitiated) => {
+	(6, RebalanceInitiated) => {
 		(0, trigger_payment_id, required),
 		(2, trusted_rebalance_payment_id, required),
 		(4, amount_msat, required),
 	},
-	(6, RebalanceSuccessful) => {
+	(7, RebalanceSuccessful) => {
 		(0, trigger_payment_id, required),
 		(2, trusted_rebalance_payment_id, required),
 		(4, ln_rebalance_payment_id, required),

@@ -15,6 +15,8 @@ use ldk_node::lightning::util::persist::KVStore;
 use ldk_node::lightning_invoice::{Bolt11Invoice, Bolt11InvoiceDescription, Description};
 use ldk_node::payment::{PaymentDetails, PaymentDirection, PaymentKind, PaymentStatus};
 
+use ldk_node::bitcoin::secp256k1::PublicKey;
+use ldk_node::lightning::ln::msgs::SocketAddress;
 use std::sync::Arc;
 use tokio::runtime::Runtime;
 use tokio::sync::watch;
@@ -70,9 +72,12 @@ pub(crate) struct LightningWalletBalance {
 }
 
 pub(crate) struct LightningWalletImpl {
-	ldk_node: Arc<ldk_node::Node>,
+	pub(crate) ldk_node: Arc<ldk_node::Node>,
 	payment_receipt_flag: watch::Receiver<()>,
 	pub(crate) event_handler: Arc<EventHandler>,
+
+	lsp_node_id: PublicKey,
+	lsp_socket_addr: SocketAddress,
 }
 
 pub(crate) struct LightningWallet {
@@ -121,7 +126,8 @@ impl LightningWallet {
 			},
 			_ => unreachable!("Unknown network"),
 		}
-		builder.set_liquidity_source_lsps2(config.lsp.1, config.lsp.0, config.lsp.2);
+		let (lsp_socket_addr, lsp_node_id, lsp_token) = config.lsp;
+		builder.set_liquidity_source_lsps2(lsp_node_id, lsp_socket_addr.clone(), lsp_token);
 		match config.chain_source {
 			ChainSource::Esplora(url) => builder.set_chain_source_esplora(url, None),
 			ChainSource::Electrum(url) => builder.set_chain_source_electrum(url, None),
@@ -144,6 +150,8 @@ impl LightningWallet {
 			ldk_node,
 			payment_receipt_flag,
 			event_handler: ev_handler.clone(),
+			lsp_node_id,
+			lsp_socket_addr,
 		});
 
 		inner.ldk_node.start_with_runtime(Arc::clone(&runtime))?;
@@ -246,6 +254,18 @@ impl LightningWallet {
 				.send_to_address(address, amount.sats_rounding_up(), None)
 				.map(|txid| PaymentId(*txid.as_ref())),
 		}
+	}
+
+	pub(crate) async fn open_channel_with_lsp(&self) -> Result<(), NodeError> {
+		// self.inner.ldk_node.open_channel(
+		// 	self.inner.lsp_node_id,
+		// 	self.inner.lsp_socket_addr.clone(),
+		// 	todo!("channel amount"),
+		// 	None,
+		// 	None,
+		// )?;
+
+		Ok(())
 	}
 
 	pub(crate) fn stop(&self) {
