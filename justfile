@@ -1,5 +1,5 @@
 default:
     @just --list
 
-test:
-    cargo test --features _test-utils
+test *args:
+    cargo test {{args}} --features _test-utils
