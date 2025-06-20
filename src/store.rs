@@ -15,6 +15,7 @@ use bitcoin_payment_instructions::amount::Amount;
 
 use ldk_node::bitcoin::Txid;
 use ldk_node::bitcoin::hex::{DisplayHex, FromHex};
+use ldk_node::lightning::io;
 use ldk_node::lightning::types::payment::PaymentPreimage;
 use ldk_node::lightning::util::persist::KVStore;
 use ldk_node::lightning::util::ser::{Readable, Writeable};
@@ -270,6 +271,31 @@ impl TxMetadataStore {
 			Err(())
 		}
 	}
+}
+
+const REBALANCE_ENABLED_KEY: &str = "rebalance_enabled";
+
+pub(crate) fn get_rebalance_enabled(store: &dyn KVStore) -> bool {
+	match store.read(STORE_PRIMARY_KEY, "", REBALANCE_ENABLED_KEY) {
+		Ok(bytes) => Readable::read(&mut &bytes[..]).expect("Invalid data in rebalance_enabled"),
+		Err(e) if e.kind() == io::ErrorKind::NotFound => {
+			// if rebalance_enabled is not found, default to true
+			// and write it to the store so we don't have to do this again
+			let rebalance_enabled = true;
+			set_rebalance_enabled(store, rebalance_enabled);
+			rebalance_enabled
+		},
+		Err(e) => {
+			panic!("Failed to read rebalance_enabled: {e}");
+		},
+	}
+}
+
+pub(crate) fn set_rebalance_enabled(store: &dyn KVStore, enabled: bool) {
+	let bytes = enabled.encode();
+	store
+		.write(STORE_PRIMARY_KEY, "", REBALANCE_ENABLED_KEY, &bytes)
+		.expect("Failed to write rebalance_enabled");
 }
 
 #[cfg(test)]

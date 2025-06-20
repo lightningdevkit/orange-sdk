@@ -348,6 +348,9 @@ fn test_pay_onchain_from_self_custody() {
 	let TestParams { wallet, lsp: _, bitcoind, third_party, rt } = build_test_nodes();
 
 	rt.block_on(async move {
+		// disable rebalancing so we have on-chain funds
+		wallet.set_rebalance_enabled(false);
+
 		let starting_bal = wallet.get_balance().await;
 		assert_eq!(starting_bal.available_balance, Amount::ZERO);
 		assert_eq!(starting_bal.pending_balance, Amount::ZERO);

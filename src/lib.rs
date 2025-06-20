@@ -408,6 +408,9 @@ where
 			let mut onchain_sync_time =
 				inner_ref.ln_wallet.inner.ldk_node.status().latest_onchain_wallet_sync_timestamp;
 			loop {
+				// check if rebalance is enabled
+				let rebalance_enabled = store::get_rebalance_enabled(inner_ref.store.as_ref());
+
 				if let Ok(trusted_payments) = inner_ref.trusted.list_payments().await {
 					let mut new_txn = Vec::new();
 					let mut latest_tx: Option<(Duration, _)> = None;
@@ -450,7 +453,7 @@ where
 						}
 					}
 
-					if Self::get_rebalance_amt(&inner_ref).is_some() {
+					if rebalance_enabled && Self::get_rebalance_amt(&inner_ref).is_some() {
 						new_txn.sort_unstable();
 						let victim_id = new_txn.first().map(|(_, id)| *id).unwrap_or_else(|| {
 							// Should only happen due to races settling balance, pick the latest.
@@ -518,7 +521,9 @@ where
 						.list_balances()
 						.spendable_onchain_balance_sats;
 
-					if spendable > inner_ref.tunables.rebalance_min.sats_rounding_up() {
+					if rebalance_enabled
+						&& spendable > inner_ref.tunables.rebalance_min.sats_rounding_up()
+					{
 						// todo mark tx as rebalance
 						Self::onchain_rebalance(&inner_ref).await;
 					}
@@ -531,6 +536,11 @@ where
 		});
 
 		Ok(Wallet { inner })
+	}
+
+	/// Sets whether the wallet should automatically rebalance from trusted to lightning.
+	pub fn set_rebalance_enabled(&self, value: bool) {
+		store::set_rebalance_enabled(self.inner.store.as_ref(), value);
 	}
 
 	fn get_rebalance_amt(inner: &Arc<WalletImpl<T>>) -> Option<Amount> {
