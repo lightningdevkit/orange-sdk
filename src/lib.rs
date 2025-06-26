@@ -22,9 +22,10 @@ pub use bitcoin_payment_instructions::PaymentMethod;
 use bitcoin_payment_instructions::amount::Amount;
 
 use ldk_node::bip39::Mnemonic;
-use ldk_node::bitcoin::Network;
+use ldk_node::bitcoin::hashes::Hash;
 use ldk_node::bitcoin::io;
 use ldk_node::bitcoin::secp256k1::PublicKey;
+use ldk_node::bitcoin::{Network, Txid};
 use ldk_node::io::sqlite_store::SqliteStore;
 use ldk_node::lightning::ln::msgs::SocketAddress;
 use ldk_node::lightning::util::logger::Logger as _;
@@ -489,6 +490,7 @@ where
 								)
 						});
 
+					let prev_onchain_sync_time = onchain_sync_time;
 					onchain_sync_time = new_onchain_sync_time;
 
 					// now create events for these payments
@@ -524,8 +526,36 @@ where
 					if rebalance_enabled
 						&& spendable > inner_ref.tunables.rebalance_min.sats_rounding_up()
 					{
-						// todo mark tx as rebalance
-						Self::onchain_rebalance(&inner_ref).await;
+						// find the new onchain receives since last sync
+						// if we have multiple, select the largest one as the one to mark as triggering the rebalance
+						let txs = inner_ref.ln_wallet.list_payments();
+						let new = txs
+							.into_iter()
+							.filter(|t| {
+								t.status == PaymentStatus::Succeeded
+									&& t.direction == PaymentDirection::Inbound
+									&& matches!(t.kind, PaymentKind::Onchain { .. })
+									&& t.latest_update_timestamp
+										>= prev_onchain_sync_time.unwrap_or(0)
+							})
+							.max_by_key(|t| t.amount_msat);
+						match new {
+							Some(new) => {
+								if let PaymentKind::Onchain { txid, .. } = new.kind {
+									Self::onchain_rebalance(&inner_ref, txid).await;
+								} else {
+									unreachable!(
+										"PaymentKind::Onchain should always be present for onchain payments"
+									);
+								}
+							},
+							None => {
+								log_error!(
+									inner_ref.logger,
+									"Detected onchain sync with balance updates, but no new onchain payments found"
+								);
+							},
+						}
 					}
 				}
 
@@ -538,9 +568,14 @@ where
 		Ok(Wallet { inner })
 	}
 
-	/// Sets whether the wallet should automatically rebalance from trusted to lightning.
+	/// Sets whether the wallet should automatically rebalance from trusted/onchain to lightning.
 	pub fn set_rebalance_enabled(&self, value: bool) {
 		store::set_rebalance_enabled(self.inner.store.as_ref(), value);
+	}
+
+	/// Whether the wallet should automatically rebalance from trusted/onchain to lightning.
+	pub fn get_rebalance_enabled(&self) {
+		store::get_rebalance_enabled(self.inner.store.as_ref());
 	}
 
 	fn get_rebalance_amt(inner: &Arc<WalletImpl<T>>) -> Option<Amount> {
@@ -645,7 +680,7 @@ where
 								"TODO: This is race-y, we really need some kind of mutex on trusted rebalances happening",
 							);
 						let metadata = TxMetadata {
-							ty: TxType::TransferToNonTrusted {
+							ty: TxType::TrustedToLightning {
 								trusted_payment: rebalance_id,
 								lightning_payment: lightning_id,
 								payment_triggering_transfer: triggering_transaction_id.clone(),
@@ -679,9 +714,68 @@ where
 		}
 	}
 
-	async fn onchain_rebalance(inner: &Arc<WalletImpl<T>>) {
+	async fn onchain_rebalance(inner: &Arc<WalletImpl<T>>, triggering_txid: Txid) {
 		let _ = inner.balance_mutex.lock().await;
+
+		// make sure we have a metadata entry for the triggering transaction
+		let trigger = PaymentId::Lightning(triggering_txid.to_byte_array());
+		if inner.tx_metadata.read().get(&trigger).is_none() {
+			inner.tx_metadata.insert(
+				trigger.clone(),
+				TxMetadata {
+					ty: TxType::Payment {
+						ty: PaymentType::IncomingOnChain { txid: Some(triggering_txid) },
+					},
+					time: SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap(),
+				},
+			);
+		}
+
+		log_info!(inner.logger, "Opening channel with LSP with on-chain funds");
+
 		// todo for now we can only open a channel, eventually move to splicing
+		let user_chan_id = match inner.ln_wallet.open_channel_with_lsp().await {
+			Ok(chan_id) => chan_id,
+			Err(e) => {
+				log_error!(inner.logger, "Failed to open channel with LSP: {e:?}");
+				return;
+			},
+		};
+
+		log_info!(inner.logger, "Initiated channel opened with LSP");
+
+		// wait for channel to be opened
+		let mut channel_txid: Option<Txid> = None;
+		while channel_txid.is_none() {
+			channel_txid = inner
+				.ln_wallet
+				.inner
+				.ldk_node
+				.list_channels()
+				.iter()
+				.find(|c| c.user_channel_id == user_chan_id)
+				.and_then(|c| c.funding_txo.map(|t| t.txid));
+			if channel_txid.is_none() {
+				inner.ln_wallet.await_channel_pending().await;
+			}
+		}
+
+		let chan_txid =
+			channel_txid.expect("channel_txid must be set after waiting for channel to open");
+
+		log_info!(
+			inner.logger,
+			"Channel open succeeded. Assigned fees to onchain recv {triggering_txid} for channel open tx {chan_txid}"
+		);
+
+		inner.tx_metadata.set_tx_caused_rebalance(&trigger).expect(
+			"TODO: This is race-y, we really need some kind of mutex on trusted rebalances happening",
+		);
+		let metadata = TxMetadata {
+			ty: TxType::OnchainToLightning { channel_txid: chan_txid, triggering_txid },
+			time: SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap(),
+		};
+		inner.tx_metadata.insert(PaymentId::Lightning(chan_txid.to_byte_array()), metadata);
 	}
 
 	/// Lists the transactions which have been made.
@@ -693,42 +787,41 @@ where
 		let tx_metadata = self.inner.tx_metadata.read();
 
 		let mut internal_transfers = HashMap::new();
+		#[derive(Debug, Default)]
 		struct InternalTransfer {
-			lightning_receive_fee: Option<Amount>,
-			trusted_send_fee: Option<Amount>,
+			receive_fee: Option<Amount>,
+			send_fee: Option<Amount>,
 			transaction: Option<Transaction>,
 		}
 
 		for payment in trusted_payments {
 			if let Some(tx_metadata) = tx_metadata.get(&PaymentId::Trusted(payment.id)) {
 				match &tx_metadata.ty {
-					TxType::TransferToNonTrusted {
+					TxType::TrustedToLightning {
 						trusted_payment,
 						lightning_payment: _,
 						payment_triggering_transfer,
 					} => {
 						let entry = internal_transfers
 							.entry((*payment_triggering_transfer).clone())
-							.or_insert(InternalTransfer {
-								lightning_receive_fee: None,
-								trusted_send_fee: None,
-								transaction: None,
-							});
+							.or_insert(InternalTransfer::default());
 						if payment.id == *trusted_payment {
-							debug_assert!(entry.trusted_send_fee.is_none());
-							entry.trusted_send_fee = Some(payment.fee);
+							debug_assert!(entry.send_fee.is_none());
+							entry.send_fee = Some(payment.fee);
 						} else {
 							debug_assert!(false);
 						}
 					},
-					TxType::PaymentTriggeringTransferToNonTrusted { ty } => {
+					TxType::OnchainToLightning { .. } => {
+						debug_assert!(
+							false,
+							"Onchain to lightning transfer should not be in trusted payments list"
+						);
+					},
+					TxType::PaymentTriggeringTransferLightning { ty } => {
 						let entry = internal_transfers
 							.entry(PaymentId::Trusted(payment.id))
-							.or_insert(InternalTransfer {
-								lightning_receive_fee: None,
-								trusted_send_fee: None,
-								transaction: None,
-							});
+							.or_insert(InternalTransfer::default());
 						debug_assert!(entry.transaction.is_none());
 						entry.transaction = Some(Transaction {
 							status: payment.status,
@@ -778,36 +871,43 @@ where
 			};
 			if let Some(tx_metadata) = tx_metadata.get(&PaymentId::Lightning(payment.id.0)) {
 				match &tx_metadata.ty {
-					TxType::TransferToNonTrusted {
+					TxType::TrustedToLightning {
 						trusted_payment: _,
 						lightning_payment,
 						payment_triggering_transfer,
 					} => {
 						let entry = internal_transfers
 							.entry(payment_triggering_transfer.clone())
-							.or_insert(InternalTransfer {
-								lightning_receive_fee: None,
-								trusted_send_fee: None,
-								transaction: None,
-							});
+							.or_insert(InternalTransfer::default());
 						if payment.id.0 == *lightning_payment {
-							debug_assert!(entry.lightning_receive_fee.is_none());
-							entry.lightning_receive_fee =
-								lightning_receive_fee.or(Some(Amount::ZERO));
+							debug_assert!(entry.receive_fee.is_none());
+							entry.receive_fee = lightning_receive_fee.or(Some(Amount::ZERO));
 						} else {
 							debug_assert!(false);
 						}
 					},
-					TxType::PaymentTriggeringTransferToNonTrusted { ty: _ } => {
+					TxType::OnchainToLightning { channel_txid, triggering_txid } => {
+						let entry = internal_transfers
+							.entry(PaymentId::Lightning(triggering_txid.to_byte_array()))
+							.or_insert(InternalTransfer::default());
+						if &payment.id.0 == channel_txid.as_byte_array() {
+							debug_assert!(entry.send_fee.is_none());
+							entry.send_fee = payment
+								.fee_paid_msat
+								.map(|fee| Amount::from_milli_sats(fee).expect("Must be valid"));
+						} else {
+							debug_assert!(false);
+						}
+					},
+					TxType::PaymentTriggeringTransferLightning { ty: _ } => {
 						let entry = internal_transfers
 							.entry(PaymentId::Lightning(payment.id.0))
 							.or_insert(InternalTransfer {
-								lightning_receive_fee,
-								trusted_send_fee: None,
+								receive_fee: lightning_receive_fee,
+								send_fee: None,
 								transaction: None,
 							});
 						debug_assert!(entry.transaction.is_none());
-						debug_assert!(payment.direction == PaymentDirection::Outbound);
 
 						entry.transaction = Some(Transaction {
 							status: payment.status.into(),
@@ -856,21 +956,24 @@ where
 		}
 
 		for (_, tx_info) in internal_transfers {
-			debug_assert!(tx_info.lightning_receive_fee.is_some());
-			debug_assert!(tx_info.trusted_send_fee.is_some());
+			debug_assert!(
+				tx_info.send_fee.is_some(),
+				"Internal transfers must have a send fee, got {tx_info:?}",
+			);
 			debug_assert!(tx_info.transaction.is_some());
+
 			if let Some(mut transaction) = tx_info.transaction {
 				transaction.fee = Some(
 					transaction
 						.fee
 						.unwrap_or(Amount::ZERO)
-						.saturating_add(tx_info.lightning_receive_fee.unwrap_or(Amount::ZERO)),
+						.saturating_add(tx_info.receive_fee.unwrap_or(Amount::ZERO)),
 				);
 				transaction.fee = Some(
 					transaction
 						.fee
 						.unwrap_or(Amount::ZERO)
-						.saturating_add(tx_info.trusted_send_fee.unwrap_or(Amount::ZERO)),
+						.saturating_add(tx_info.send_fee.unwrap_or(Amount::ZERO)),
 				);
 				res.push(transaction);
 			}

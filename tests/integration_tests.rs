@@ -180,7 +180,7 @@ fn test_receive_to_ln() {
 
 #[test]
 fn test_receive_to_onchain() {
-	let TestParams { wallet, lsp: _, bitcoind, third_party, rt } = build_test_nodes();
+	let TestParams { wallet, lsp, bitcoind, third_party, rt } = build_test_nodes();
 
 	rt.block_on(async move {
 		let starting_bal = wallet.get_balance().await;
@@ -235,6 +235,33 @@ fn test_receive_to_onchain() {
 		assert_ne!(tx.time_since_epoch, Duration::ZERO);
 		assert_eq!(tx.amount, Some(recv_amt));
 		assert_eq!(tx.fee, Some(Amount::ZERO));
+
+		// a rebalance should be initiated, we need to mine the channel opening transaction
+		// for it to be confirmed and reflected in the wallet's history
+		generate_blocks(&bitcoind, 6);
+		tokio::time::sleep(Duration::from_secs(5)).await; // wait for sync
+		generate_blocks(&bitcoind, 6); // confirm the channel opening transaction
+		tokio::time::sleep(Duration::from_secs(5)).await; // wait for sync
+
+		//  wait for rebalance to be initiated
+		let event = wait_next_event(&wallet).await;
+		wallet.event_handled().unwrap();
+		match event {
+			Event::ChannelOpened { counterparty_node_id, .. } => {
+				assert_eq!(counterparty_node_id, lsp.node_id());
+			},
+			_ => panic!("Expected ChannelOpened event"),
+		}
+
+		let txs = wallet.list_transactions().await.unwrap();
+		assert_eq!(txs.len(), 1);
+		let tx = txs.into_iter().next().unwrap();
+		assert!(!tx.outbound);
+		assert_eq!(tx.status, TxStatus::Completed);
+		assert_eq!(tx.payment_type, PaymentType::IncomingOnChain { txid: Some(sent_txid) });
+		assert_ne!(tx.time_since_epoch, Duration::ZERO);
+		assert_eq!(tx.amount, Some(recv_amt));
+		assert_ne!(tx.fee, Some(Amount::ZERO));
 	})
 }
 

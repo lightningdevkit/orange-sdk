@@ -6,14 +6,14 @@ use std::fmt::Debug;
 use bitcoin_payment_instructions::PaymentMethod;
 use bitcoin_payment_instructions::amount::Amount;
 
-use ldk_node::NodeError;
-use ldk_node::bitcoin::{Address, Network};
+use ldk_node::bitcoin::{Address, Network, Script};
 use ldk_node::lightning::ln::channelmanager::PaymentId;
 use ldk_node::lightning::log_debug;
 use ldk_node::lightning::util::logger::Logger as _;
 use ldk_node::lightning::util::persist::KVStore;
 use ldk_node::lightning_invoice::{Bolt11Invoice, Bolt11InvoiceDescription, Description};
 use ldk_node::payment::{PaymentDetails, PaymentDirection, PaymentKind, PaymentStatus};
+use ldk_node::{NodeError, UserChannelId};
 
 use ldk_node::bitcoin::secp256k1::PublicKey;
 use ldk_node::lightning::ln::msgs::SocketAddress;
@@ -74,6 +74,7 @@ pub(crate) struct LightningWalletBalance {
 pub(crate) struct LightningWalletImpl {
 	pub(crate) ldk_node: Arc<ldk_node::Node>,
 	payment_receipt_flag: watch::Receiver<()>,
+	channel_pending_receipt_flag: watch::Receiver<()>,
 	pub(crate) event_handler: Arc<EventHandler>,
 
 	lsp_node_id: PublicKey,
@@ -140,15 +141,18 @@ impl LightningWallet {
 
 		let ldk_node = Arc::new(builder.build_with_store(store.clone())?);
 		let (payment_receipt_sender, payment_receipt_flag) = watch::channel(());
+		let (channel_pending_sender, channel_pending_receipt_flag) = watch::channel(());
 		let ev_handler = Arc::new(EventHandler {
 			event_queue: Arc::new(EventQueue::new(store, logger.clone())),
 			ldk_node: ldk_node.clone(),
 			payment_receipt_sender,
+			channel_pending_sender,
 			logger,
 		});
 		let inner = Arc::new(LightningWalletImpl {
 			ldk_node,
 			payment_receipt_flag,
+			channel_pending_receipt_flag,
 			event_handler: ev_handler.clone(),
 			lsp_node_id,
 			lsp_socket_addr,
@@ -169,6 +173,12 @@ impl LightningWallet {
 
 	pub(crate) async fn await_payment_receipt(&self) {
 		let mut flag = self.inner.payment_receipt_flag.clone();
+		flag.mark_unchanged();
+		let _ = flag.changed().await;
+	}
+
+	pub(crate) async fn await_channel_pending(&self) {
+		let mut flag = self.inner.channel_pending_receipt_flag.clone();
 		flag.mark_unchanged();
 		let _ = flag.changed().await;
 	}
@@ -256,16 +266,27 @@ impl LightningWallet {
 		}
 	}
 
-	pub(crate) async fn open_channel_with_lsp(&self) -> Result<(), NodeError> {
-		// self.inner.ldk_node.open_channel(
-		// 	self.inner.lsp_node_id,
-		// 	self.inner.lsp_socket_addr.clone(),
-		// 	todo!("channel amount"),
-		// 	None,
-		// 	None,
-		// )?;
+	pub(crate) async fn open_channel_with_lsp(&self) -> Result<UserChannelId, NodeError> {
+		let bal = self.inner.ldk_node.list_balances().spendable_onchain_balance_sats;
 
-		Ok(())
+		// need a dummy p2wsh address to estimate the fee, p2wsh is used for LN channels
+		let fake_addr = Address::p2wsh(Script::new(), self.inner.ldk_node.config().network);
+
+		let fee = self
+			.inner
+			.ldk_node
+			.onchain_payment()
+			.estimate_send_all_to_address(&fake_addr, true, None)?;
+
+		let id = self.inner.ldk_node.open_channel(
+			self.inner.lsp_node_id,
+			self.inner.lsp_socket_addr.clone(),
+			bal - fee.to_sat(),
+			None,
+			None,
+		)?;
+
+		Ok(id)
 	}
 
 	pub(crate) fn stop(&self) {

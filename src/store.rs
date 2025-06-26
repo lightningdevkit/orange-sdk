@@ -166,17 +166,22 @@ impl_writeable_tlv_based_enum!(PaymentType,
 	(2, OutgoingOnChain) => { (0, txid, option), },
 	(3, IncomingOnChain) => { (0, txid, option) },
 	(4, IncomingLightning) => { },
-
 );
 
 #[derive(Debug, Clone)]
 pub(crate) enum TxType {
-	TransferToNonTrusted {
+	TrustedToLightning {
 		trusted_payment: TrustedPaymentId,
 		lightning_payment: [u8; 32],
 		payment_triggering_transfer: PaymentId,
 	},
-	PaymentTriggeringTransferToNonTrusted {
+	OnchainToLightning {
+		/// The transaction ID of the tx that opens the channel.
+		channel_txid: Txid,
+		/// The transaction ID of the on-chain payment that triggered the Lightning payment.
+		triggering_txid: Txid,
+	},
+	PaymentTriggeringTransferLightning {
 		// TODO: We should remove `ty` once we get the info we need from the trusted end
 		ty: PaymentType,
 	},
@@ -187,13 +192,17 @@ pub(crate) enum TxType {
 }
 
 impl_writeable_tlv_based_enum!(TxType,
-	(0, TransferToNonTrusted) => {
+	(0, TrustedToLightning) => {
 		(0, trusted_payment, required),
 		(2, lightning_payment, required),
 		(4, payment_triggering_transfer, required),
 	},
-	(1, PaymentTriggeringTransferToNonTrusted) => { (0, ty, required), },
-	(2, Payment) => { (0, ty, required), },
+	(1, OnchainToLightning) => {
+		(0, channel_txid, required),
+		(2, triggering_txid, required),
+	},
+	(2, PaymentTriggeringTransferLightning) => { (0, ty, required), },
+	(3, Payment) => { (0, ty, required), },
 );
 
 #[derive(Clone, Debug)]
@@ -257,7 +266,7 @@ impl TxMetadataStore {
 		let mut tx_metadata = self.tx_metadata.write().unwrap();
 		if let Some(metadata) = tx_metadata.get_mut(payment_id) {
 			if let TxType::Payment { ty } = &mut metadata.ty {
-				metadata.ty = TxType::PaymentTriggeringTransferToNonTrusted { ty: ty.clone() };
+				metadata.ty = TxType::PaymentTriggeringTransferLightning { ty: ty.clone() };
 				let key_str = payment_id.to_string();
 				let ser = metadata.encode();
 				self.store

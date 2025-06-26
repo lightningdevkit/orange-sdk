@@ -10,7 +10,7 @@ use ldk_node::lightning::ln::types::ChannelId;
 use ldk_node::lightning::util::logger::Logger as _;
 use ldk_node::lightning::util::persist::KVStore;
 use ldk_node::lightning::util::ser::{Writeable, Writer};
-use ldk_node::lightning::{impl_writeable_tlv_based_enum, log_error, log_warn};
+use ldk_node::lightning::{impl_writeable_tlv_based_enum, log_debug, log_error, log_warn};
 use ldk_node::lightning_types::payment::{PaymentHash, PaymentPreimage};
 use ldk_node::payment::{ConfirmationStatus, PaymentKind};
 use ldk_node::{CustomTlvRecord, UserChannelId};
@@ -305,6 +305,7 @@ pub(crate) struct EventHandler {
 	pub(crate) event_queue: Arc<EventQueue>,
 	pub(crate) ldk_node: Arc<ldk_node::Node>,
 	pub(crate) payment_receipt_sender: watch::Sender<()>,
+	pub(crate) channel_pending_sender: watch::Sender<()>,
 	pub(crate) logger: Arc<Logger>,
 }
 
@@ -370,7 +371,9 @@ impl EventHandler {
 					"Unexpected PaymentClaimable event received. This is likely due to a bug in the LDK Node implementation."
 				);
 			},
-			ldk_node::Event::ChannelPending { .. } => {},
+			ldk_node::Event::ChannelPending { .. } => {
+				log_debug!(self.logger, "Received ChannelPending event");
+			},
 			ldk_node::Event::ChannelReady { channel_id, user_channel_id, counterparty_node_id } => {
 				let funding_txo = self
 					.ldk_node
@@ -389,6 +392,7 @@ impl EventHandler {
 					log_error!(self.logger, "Failed to add ChannelOpened event: {e:?}");
 					return;
 				}
+				let _ = self.channel_pending_sender.send(());
 			},
 			ldk_node::Event::ChannelClosed {
 				channel_id,
