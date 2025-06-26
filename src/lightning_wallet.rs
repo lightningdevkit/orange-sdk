@@ -139,12 +139,12 @@ impl LightningWallet {
 
 		builder.set_custom_logger(Arc::clone(&logger) as Arc<dyn ldk_node::logger::LogWriter>);
 
-		let ldk_node = Arc::new(builder.build_with_store(store.clone())?);
+		let ldk_node = Arc::new(builder.build_with_store(Arc::clone(&store))?);
 		let (payment_receipt_sender, payment_receipt_flag) = watch::channel(());
 		let (channel_pending_sender, channel_pending_receipt_flag) = watch::channel(());
 		let ev_handler = Arc::new(EventHandler {
-			event_queue: Arc::new(EventQueue::new(store, logger.clone())),
-			ldk_node: ldk_node.clone(),
+			event_queue: Arc::new(EventQueue::new(store, Arc::clone(&logger))),
+			ldk_node: Arc::clone(&ldk_node),
 			payment_receipt_sender,
 			channel_pending_sender,
 			logger,
@@ -153,7 +153,7 @@ impl LightningWallet {
 			ldk_node,
 			payment_receipt_flag,
 			channel_pending_receipt_flag,
-			event_handler: ev_handler.clone(),
+			event_handler: Arc::clone(&ev_handler),
 			lsp_node_id,
 			lsp_socket_addr,
 		});

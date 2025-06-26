@@ -105,7 +105,7 @@ fn create_lsp(rt: Arc<Runtime>, uuid: Uuid, bitcoind: &Bitcoind) -> Arc<Node> {
 
 	ldk_node.start_with_runtime(Arc::clone(&rt)).unwrap();
 
-	let events_ref = ldk_node.clone();
+	let events_ref = Arc::clone(&ldk_node);
 	rt.spawn(async move {
 		loop {
 			let event = events_ref.next_event_async().await;
@@ -149,7 +149,7 @@ fn create_third_party(rt: Arc<Runtime>, uuid: Uuid, bitcoind: &Bitcoind) -> Arc<
 
 	ldk_node.start_with_runtime(Arc::clone(&rt)).unwrap();
 
-	let events_ref = ldk_node.clone();
+	let events_ref = Arc::clone(&ldk_node);
 	rt.spawn(async move {
 		loop {
 			let event = events_ref.next_event_async().await;
@@ -209,14 +209,14 @@ pub fn build_test_nodes() -> TestParams {
 
 	let test_id = Uuid::new_v4();
 
-	let lsp = create_lsp(rt.clone(), test_id, &bitcoind);
+	let lsp = create_lsp(Arc::clone(&rt), test_id, &bitcoind);
 	fund_node(&lsp, &bitcoind);
-	let third_party = create_third_party(rt.clone(), test_id, &bitcoind);
+	let third_party = create_third_party(Arc::clone(&rt), test_id, &bitcoind);
 	let start_bal = third_party.list_balances().total_onchain_balance_sats;
 	fund_node(&third_party, &bitcoind);
 
 	// wait for node to sync (needs blocking wait as we are not in async context here)
-	let third = third_party.clone();
+	let third = Arc::clone(&third_party);
 	rt.block_on(async move {
 		wait_for_condition(
 			Duration::from_secs(1),
@@ -240,7 +240,7 @@ pub fn build_test_nodes() -> TestParams {
 	generate_blocks(&bitcoind, 10);
 
 	// wait for channel ready (needs blocking wait as we are not in async context here)
-	let third_party_clone = third_party.clone();
+	let third_party_clone = Arc::clone(&third_party);
 	rt.block_on(async move {
 		wait_for_condition(Duration::from_secs(1), 10, "channel to become usable", || {
 			let res = third_party_clone.list_channels().first().is_some_and(|c| c.is_usable);
@@ -255,15 +255,15 @@ pub fn build_test_nodes() -> TestParams {
 
 	let dummy_wallet_config = DummyTrustedWalletExtraConfig {
 		uuid: test_id,
-		lsp: lsp.clone(),
-		bitcoind: bitcoind.clone(),
-		rt: rt.clone(),
+		lsp: Arc::clone(&lsp),
+		bitcoind: Arc::clone(&bitcoind),
+		rt: Arc::clone(&rt),
 	};
 
 	let config =
 		build_wallet_config(test_id, &bitcoind, lsp.node_id(), lsp_listen, dummy_wallet_config);
 
-	let rt_clone = rt.clone();
+	let rt_clone = Arc::clone(&rt);
 	let wallet = rt.block_on(async move { Wallet::new(rt_clone, config).await.unwrap() });
 
 	TestParams { wallet, lsp, third_party, bitcoind, rt }
@@ -282,7 +282,7 @@ pub async fn open_channel_from_lsp(
 	let payment_id = payer.bolt11_payment().send(&uri.invoice, None).unwrap();
 
 	// wait for payment success from payer side
-	let p = payer.clone();
+	let p = Arc::clone(&payer);
 	wait_for_condition(Duration::from_secs(1), 10, "payer payment success", || {
 		let res = p.payment(&payment_id).is_some_and(|p| p.status == PaymentStatus::Succeeded);
 		async move { res }

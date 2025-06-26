@@ -388,7 +388,7 @@ where
 			Arc::clone(&logger),
 		)?;
 
-		let event_handler = ln_wallet.inner.event_handler.clone();
+		let event_handler = Arc::clone(&ln_wallet.inner.event_handler);
 
 		let inner = Arc::new(WalletImpl::<T> {
 			trusted,

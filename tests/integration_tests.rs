@@ -7,6 +7,7 @@ use bitcoin_payment_instructions::amount::Amount;
 use ldk_node::lightning_invoice::{Bolt11InvoiceDescription, Description};
 use ldk_node::payment::{ConfirmationStatus, PaymentDirection, PaymentStatus};
 use orange_sdk::{Event, PaymentInfo, PaymentType, TxStatus};
+use std::sync::Arc;
 use std::time::Duration;
 
 mod test_utils;
@@ -40,7 +41,7 @@ fn test_receive_to_trusted() {
 		let payment_id = third_party.bolt11_payment().send(&uri.invoice, None).unwrap();
 
 		// wait for payment success from payer side
-		let p = third_party.clone();
+		let p = Arc::clone(&third_party);
 		test_utils::wait_for_condition(Duration::from_secs(1), 10, "payer payment success", || {
 			let res = p.payment(&payment_id).is_some_and(|p| p.status == PaymentStatus::Succeeded);
 			async move { res }
@@ -164,7 +165,7 @@ fn test_receive_to_ln() {
 	let TestParams { wallet, lsp: _, bitcoind: _, third_party, rt } = build_test_nodes();
 
 	rt.block_on(async move {
-		let recv_amt = open_channel_from_lsp(&wallet, third_party.clone()).await;
+		let recv_amt = open_channel_from_lsp(&wallet, Arc::clone(&third_party)).await;
 
 		let txs = wallet.list_transactions().await.unwrap();
 		assert_eq!(txs.len(), 1);
@@ -271,7 +272,7 @@ fn test_pay_lightning_from_self_custody() {
 
 	rt.block_on(async move {
 		// get a channel so we can make a payment
-		open_channel_from_lsp(&wallet, third_party.clone()).await;
+		open_channel_from_lsp(&wallet, Arc::clone(&third_party)).await;
 
 		// wait for sync
 		generate_blocks(&bitcoind, 6);
@@ -324,7 +325,7 @@ fn test_pay_bolt12_from_self_custody() {
 
 	rt.block_on(async move {
 		// get a channel so we can make a payment
-		open_channel_from_lsp(&wallet, third_party.clone()).await;
+		open_channel_from_lsp(&wallet, Arc::clone(&third_party)).await;
 
 		// wait for sync
 		generate_blocks(&bitcoind, 6);

@@ -71,9 +71,9 @@ impl DummyTrustedWallet {
 		let current_bal_msats = Arc::new(AtomicU64::new(0));
 		let payments: Arc<RwLock<Vec<Payment>>> = Arc::new(RwLock::new(vec![]));
 
-		let events_ref = ldk_node.clone();
-		let bal = current_bal_msats.clone();
-		let pays = payments.clone();
+		let events_ref = Arc::clone(&ldk_node);
+		let bal = Arc::clone(&current_bal_msats);
+		let pays = Arc::clone(&payments);
 		rt.spawn(async move {
 			loop {
 				let event = events_ref.next_event_async().await;
