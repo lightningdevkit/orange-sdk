@@ -967,12 +967,7 @@ where
 					transaction
 						.fee
 						.unwrap_or(Amount::ZERO)
-						.saturating_add(tx_info.receive_fee.unwrap_or(Amount::ZERO)),
-				);
-				transaction.fee = Some(
-					transaction
-						.fee
-						.unwrap_or(Amount::ZERO)
+						.saturating_add(tx_info.receive_fee.unwrap_or(Amount::ZERO))
 						.saturating_add(tx_info.send_fee.unwrap_or(Amount::ZERO)),
 				);
 				res.push(transaction);
