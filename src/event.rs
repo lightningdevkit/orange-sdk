@@ -1,7 +1,7 @@
 use crate::logging::Logger;
+use crate::store;
 use crate::store::PaymentId;
 use crate::trusted_wallet::TrustedPaymentId;
-use std::collections::VecDeque;
 
 use ldk_node::bitcoin::secp256k1::PublicKey;
 use ldk_node::bitcoin::{OutPoint, Txid};
@@ -15,6 +15,7 @@ use ldk_node::lightning_types::payment::{PaymentHash, PaymentPreimage};
 use ldk_node::payment::{ConfirmationStatus, PaymentKind};
 use ldk_node::{CustomTlvRecord, UserChannelId};
 
+use std::collections::VecDeque;
 use std::sync::{Arc, Condvar, Mutex};
 use std::task::{Poll, Waker};
 use tokio::sync::watch;
@@ -95,6 +96,9 @@ pub enum Event {
 		funding_txo: OutPoint,
 	},
 	/// A channel has been closed.
+	///
+	/// When a channel is closed, we will disable automatic rebalancing
+	/// so new channels will not be opened until it is explicitly enabled again.
 	ChannelClosed {
 		/// The `channel_id` of the channel.
 		channel_id: ChannelId,
@@ -400,7 +404,9 @@ impl EventHandler {
 				counterparty_node_id,
 				reason,
 			} => {
-				// TODO: Oof! Probably open a new channel with our LSP
+				// We experienced a channel close, we disable rebalancing so we don't automatically
+				// try to reopen the channel.
+				store::set_rebalance_enabled(self.event_queue.kv_store.as_ref(), false);
 
 				if let Err(e) = self.event_queue.add_event(Event::ChannelClosed {
 					channel_id,
