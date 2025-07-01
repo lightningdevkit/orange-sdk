@@ -506,3 +506,39 @@ fn test_force_close_handling() {
 		assert!(!rebalancing);
 	})
 }
+
+#[test]
+fn test_close_all_channels() {
+	let TestParams { wallet, lsp, bitcoind, third_party, rt } = build_test_nodes();
+
+	rt.block_on(async move {
+		let starting_bal = wallet.get_balance().await;
+		assert_eq!(starting_bal.available_balance, Amount::ZERO);
+		assert_eq!(starting_bal.pending_balance, Amount::ZERO);
+
+		let rebalancing = wallet.get_rebalance_enabled();
+		assert!(rebalancing);
+
+		// get a channel so we can make a payment
+		open_channel_from_lsp(&wallet, Arc::clone(&third_party)).await;
+
+		// mine some blocks to ensure the channel is confirmed
+		generate_blocks(&bitcoind, 6);
+
+		// init closing all channels
+		wallet.close_channels().unwrap();
+
+		// wait for the channels to be closed
+		let event = wait_next_event(&wallet).await;
+		match event {
+			Event::ChannelClosed { counterparty_node_id, .. } => {
+				assert_eq!(counterparty_node_id, lsp.node_id());
+			},
+			_ => panic!("Expected ChannelClosed event"),
+		}
+
+		// rebalancing should be disabled after closing all channels
+		let rebalancing = wallet.get_rebalance_enabled();
+		assert!(!rebalancing);
+	})
+}

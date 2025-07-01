@@ -1277,6 +1277,19 @@ where
 		))
 	}
 
+	/// Initiates closing all channels in the lightning wallet. The channel will not be closed
+	/// until a [`Event::ChannelClosed`] event is emitted.
+	/// This will disable rebalancing before closing channels, so that we don't try to reopen them.
+	pub fn close_channels(&self) -> Result<(), WalletError> {
+		// we are explicitly disabling rebalancing here, so that we don't try to
+		// reopen channels after closing them.
+		self.set_rebalance_enabled(false);
+
+		self.inner.ln_wallet.close_channels()?;
+
+		Ok(())
+	}
+
 	/// Returns the wallet's configured tunables.
 	pub fn get_tunables(&self) -> Tunables {
 		self.inner.tunables

@@ -289,6 +289,24 @@ impl LightningWallet {
 		Ok(id)
 	}
 
+	pub(crate) fn close_channels(&self) -> Result<(), NodeError> {
+		let channels = self.inner.ldk_node.list_channels();
+		for chan in channels {
+			if chan.is_usable {
+				self.inner
+					.ldk_node
+					.close_channel(&chan.user_channel_id, chan.counterparty_node_id)?;
+			} else {
+				self.inner.ldk_node.force_close_channel(
+					&chan.user_channel_id,
+					chan.counterparty_node_id,
+					None,
+				)?;
+			}
+		}
+		Ok(())
+	}
+
 	pub(crate) fn stop(&self) {
 		let _ = self.inner.ldk_node.stop();
 	}
