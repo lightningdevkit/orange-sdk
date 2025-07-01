@@ -470,3 +470,48 @@ fn test_pay_onchain_from_self_custody() {
 		.expect("Payment did not complete in time");
 	})
 }
+
+#[test]
+fn test_force_close_handling() {
+	let TestParams { wallet, lsp, bitcoind, third_party, rt } = build_test_nodes();
+
+	rt.block_on(async move {
+		let starting_bal = wallet.get_balance().await;
+		assert_eq!(starting_bal.available_balance, Amount::ZERO);
+		assert_eq!(starting_bal.pending_balance, Amount::ZERO);
+
+		let rebalancing = wallet.get_rebalance_enabled();
+		assert!(rebalancing);
+
+		// get a channel so we can make a payment
+		open_channel_from_lsp(&wallet, Arc::clone(&third_party)).await;
+
+		// mine some blocks to ensure the channel is confirmed
+		generate_blocks(&bitcoind, 6);
+
+		// get channel details
+		let channel = lsp
+			.list_channels()
+			.into_iter()
+			.find(|c| c.counterparty_node_id == wallet.node_id())
+			.unwrap();
+
+		// force close the channel
+		lsp.force_close_channel(&channel.user_channel_id, channel.counterparty_node_id, None)
+			.unwrap();
+
+		// wait for the channel to be closed
+		let event = wait_next_event(&wallet).await;
+		wallet.event_handled().unwrap();
+		match event {
+			Event::ChannelClosed { counterparty_node_id, .. } => {
+				assert_eq!(counterparty_node_id, lsp.node_id());
+			},
+			_ => panic!("Expected ChannelClosed event"),
+		}
+
+		// rebalancing should be disabled after a force close
+		let rebalancing = wallet.get_rebalance_enabled();
+		assert!(!rebalancing);
+	})
+}

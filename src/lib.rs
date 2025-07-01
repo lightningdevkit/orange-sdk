@@ -574,8 +574,13 @@ where
 	}
 
 	/// Whether the wallet should automatically rebalance from trusted/onchain to lightning.
-	pub fn get_rebalance_enabled(&self) {
-		store::get_rebalance_enabled(self.inner.store.as_ref());
+	pub fn get_rebalance_enabled(&self) -> bool {
+		store::get_rebalance_enabled(self.inner.store.as_ref())
+	}
+
+	/// Returns the lightning wallet's node id.
+	pub fn node_id(&self) -> PublicKey {
+		self.inner.ln_wallet.inner.ldk_node.node_id()
 	}
 
 	fn get_rebalance_amt(inner: &Arc<WalletImpl<T>>) -> Option<Amount> {
