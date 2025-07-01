@@ -41,13 +41,10 @@ where
 /// This is useful for testing purposes to ensure that the wallet is responsive and events are being processed.
 /// Otherwise, we can have the test hang indefinitely.
 pub async fn wait_next_event(wallet: &Wallet<DummyTrustedWallet>) -> orange_sdk::Event {
-	for _ in 0..10 {
-		if let Some(event) = wallet.next_event() {
-			return event;
-		}
-		tokio::time::sleep(Duration::from_secs(1)).await;
-	}
-	panic!("Timeout waiting for condition next event")
+	let event =
+		tokio::time::timeout(Duration::from_secs(20), wallet.next_event_async()).await.unwrap();
+	wallet.event_handled().unwrap();
+	event
 }
 
 fn create_bitcoind() -> Bitcoind {
@@ -301,11 +298,9 @@ pub async fn open_channel_from_lsp(
 	.expect("Wallet balance did not update in time after channel open");
 
 	let event = wait_next_event(&wallet).await;
-	wallet.event_handled().unwrap();
 	assert!(matches!(event, orange_sdk::Event::ChannelOpened { .. }));
 
 	let event = wait_next_event(&wallet).await;
-	wallet.event_handled().unwrap();
 	match event {
 		orange_sdk::Event::PaymentReceived { payment_hash, amount_msat, lsp_fee_msats, .. } => {
 			assert!(lsp_fee_msats.is_some()); // we expect a fee to be paid for opening a channel
