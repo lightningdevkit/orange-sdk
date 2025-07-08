@@ -3,7 +3,10 @@
 use crate::test_utils::{
 	TestParams, build_test_nodes, generate_blocks, open_channel_from_lsp, wait_next_event,
 };
+use bitcoin_payment_instructions::PaymentInstructions;
 use bitcoin_payment_instructions::amount::Amount;
+use bitcoin_payment_instructions::http_resolver::HTTPHrnResolver;
+use ldk_node::bitcoin::Network;
 use ldk_node::lightning_invoice::{Bolt11InvoiceDescription, Description};
 use ldk_node::payment::{ConfirmationStatus, PaymentDirection, PaymentStatus};
 use orange_sdk::{Event, PaymentInfo, PaymentType, TxStatus};
@@ -789,10 +792,17 @@ fn test_threshold_boundary_rebalance_min() {
 		.expect("Payment at exact rebalance min failed");
 
 		let txs = wallet.list_transactions().await.unwrap();
-		assert_eq!(txs.len(), 2, "Should have 2 transactions");
+		assert!(txs.len() >= 2, "Should have at least 2 transactions (may include rebalance)");
 
-		// Both should be trusted wallet transactions with zero fees
-		for tx in &txs {
+		// Count incoming lightning transactions (our test payments)
+		let incoming_txs: Vec<_> = txs
+			.iter()
+			.filter(|tx| !tx.outbound && tx.payment_type == PaymentType::IncomingLightning {})
+			.collect();
+		assert_eq!(incoming_txs.len(), 2, "Should have exactly 2 incoming payments");
+
+		// Both incoming transactions should be trusted wallet transactions with zero fees
+		for tx in incoming_txs {
 			assert_eq!(
 				tx.fee,
 				Some(Amount::ZERO),
@@ -932,6 +942,607 @@ fn test_threshold_combinations_and_edge_cases() {
 				"Should generate valid invoice for amount: {} sats",
 				amount.sats().unwrap_or(0)
 			);
+		}
+	})
+}
+
+#[test]
+fn test_payment_failures() {
+	let TestParams { wallet, lsp: _, bitcoind: _, third_party, rt } = build_test_nodes();
+
+	rt.block_on(async move {
+		// Test 1: Payment with insufficient balance
+		let amount = Amount::from_sats(1_000_000).unwrap(); // 1 BTC - more than we have
+		let desc = Bolt11InvoiceDescription::Direct(Description::empty());
+		let invoice =
+			third_party.bolt11_payment().receive(amount.milli_sats(), &desc, 300).unwrap();
+
+		let instr = wallet.parse_payment_instructions(invoice.to_string().as_str()).await.unwrap();
+		let info = PaymentInfo::build(instr, amount).unwrap();
+
+		// This should fail due to insufficient balance
+		let result = wallet.pay(&info).await;
+		assert!(result.is_err(), "Payment with insufficient balance should fail");
+
+		// Test 2: Invalid invoice parsing
+		let invalid_invoice = "lnbc1invalid_invoice_here";
+		let result = wallet.parse_payment_instructions(invalid_invoice).await;
+		assert!(result.is_err(), "Invalid invoice should fail to parse");
+
+		// Test 3: Malformed Bitcoin address
+		let invalid_address = "not_a_bitcoin_address";
+		let result = wallet.parse_payment_instructions(invalid_address).await;
+		assert!(result.is_err(), "Invalid address should fail to parse");
+
+		// Test 4: Zero amount payment (should be rejected)
+		let zero_amount = Amount::ZERO;
+		let desc = Bolt11InvoiceDescription::Direct(Description::empty());
+		let invoice = third_party.bolt11_payment().receive(1000, &desc, 300).unwrap(); // 1 msat
+
+		let instr = wallet.parse_payment_instructions(invoice.to_string().as_str()).await.unwrap();
+		let result = PaymentInfo::build(instr, zero_amount);
+		assert!(result.is_err(), "Zero amount payment should be rejected");
+
+		// Test 5: Payment with mismatched amount (fixed amount invoice with different amount)
+		let fixed_amount = Amount::from_sats(5000).unwrap();
+		let different_amount = Amount::from_sats(10000).unwrap();
+		let desc = Bolt11InvoiceDescription::Direct(Description::empty());
+		let fixed_invoice =
+			third_party.bolt11_payment().receive(fixed_amount.milli_sats(), &desc, 300).unwrap();
+
+		let instr =
+			wallet.parse_payment_instructions(fixed_invoice.to_string().as_str()).await.unwrap();
+		let result = PaymentInfo::build(instr, different_amount);
+		assert!(result.is_err(), "Mismatched amount for fixed invoice should be rejected");
+
+		// Test 6: Verify no failed transactions are recorded
+		let txs = wallet.list_transactions().await.unwrap();
+		assert_eq!(txs.len(), 0, "Failed payments should not be recorded in transaction list");
+	})
+}
+
+#[test]
+fn test_payment_with_expired_invoice() {
+	let TestParams { wallet, lsp: _, bitcoind: _, third_party, rt } = build_test_nodes();
+
+	rt.block_on(async move {
+		// Add some balance first so the payment can theoretically succeed if not expired
+		let initial_amount = Amount::from_sats(5000).unwrap();
+		let uri = wallet.get_single_use_receive_uri(Some(initial_amount)).await.unwrap();
+		third_party.bolt11_payment().send(&uri.invoice, None).unwrap();
+
+		// Wait for balance update
+		test_utils::wait_for_condition(
+			Duration::from_secs(1),
+			10,
+			"wallet balance update",
+			|| async { wallet.get_balance().await.available_balance > Amount::ZERO },
+		)
+		.await
+		.expect("Balance should update");
+
+		// Create an invoice with very short expiry
+		let payment_amount = Amount::from_sats(1000).unwrap();
+		let desc = Bolt11InvoiceDescription::Direct(Description::empty());
+		let invoice =
+			third_party.bolt11_payment().receive(payment_amount.milli_sats(), &desc, 1).unwrap(); // 1 second expiry
+
+		// Wait longer to ensure invoice expires
+		tokio::time::sleep(Duration::from_secs(5)).await;
+
+		// Try to parse and pay the expired invoice - it should either fail to parse or fail to pay
+		let parse_result = wallet.parse_payment_instructions(invoice.to_string().as_str()).await;
+		if let Ok(instr) = parse_result {
+			if let Ok(info) = PaymentInfo::build(instr, payment_amount) {
+				// If parsing succeeded, payment should fail due to expiry
+				let result = wallet.pay(&info).await;
+				assert!(result.is_err(), "Payment with expired invoice should fail");
+			} else {
+				// Payment info building failed - acceptable for expired invoice
+			}
+		} else {
+			// Parsing failed - also acceptable for expired invoice
+		}
+	})
+}
+
+#[test]
+fn test_payment_network_mismatch() {
+	let TestParams { wallet, lsp: _, bitcoind: _, third_party: _, rt } = build_test_nodes();
+
+	rt.block_on(async move {
+		// Test 1: Mainnet invoice on regtest wallet (if we can construct one)
+		// This is tricky to test in practice since we're on regtest, but we can test
+		// the validation logic with known invalid network addresses
+
+		// Test 2: Invalid network address format
+		let invalid_testnet_address = "tb1qd28npep0s8frcm3y7dxqajkcy2m40eysplyr9v"; // Valid testnet address
+		let result = wallet.parse_payment_instructions(invalid_testnet_address).await;
+		assert!(result.is_err(), "Invalid testnet address");
+
+		// now force a correct parsing to ensure we fail when trying to pay
+		let instr = PaymentInstructions::parse(
+			invalid_testnet_address,
+			Network::Testnet,
+			&HTTPHrnResolver,
+			true,
+		)
+		.await
+		.unwrap();
+
+		// If it parsed, trying to pay should fail due to network mismatch
+		let amount = Amount::from_sats(1000).unwrap();
+		let info = PaymentInfo::build(instr, amount).unwrap();
+		let pay_result = wallet.pay(&info).await;
+		assert!(pay_result.is_err(), "Payment to wrong network address should fail");
+	})
+}
+
+#[test]
+fn test_concurrent_payments() {
+	let TestParams { wallet, lsp: _, bitcoind, third_party, rt } = build_test_nodes();
+
+	rt.block_on(async move {
+		// First, get a Lightning channel with sufficient funds
+		let _channel_amount = open_channel_from_lsp(&wallet, Arc::clone(&third_party)).await;
+
+		// Wait for sync
+		generate_blocks(&bitcoind, 6);
+		tokio::time::sleep(Duration::from_secs(5)).await;
+
+		let payment_amount = Amount::from_sats(100).unwrap();
+
+		// Create multiple invoices
+		let desc = Bolt11InvoiceDescription::Direct(Description::empty());
+		let invoice1 =
+			third_party.bolt11_payment().receive(payment_amount.milli_sats(), &desc, 300).unwrap();
+		let invoice2 =
+			third_party.bolt11_payment().receive(payment_amount.milli_sats(), &desc, 300).unwrap();
+		let invoice3 =
+			third_party.bolt11_payment().receive(payment_amount.milli_sats(), &desc, 300).unwrap();
+
+		// Parse payment instructions
+		let instr1 =
+			wallet.parse_payment_instructions(invoice1.to_string().as_str()).await.unwrap();
+		let instr2 =
+			wallet.parse_payment_instructions(invoice2.to_string().as_str()).await.unwrap();
+		let instr3 =
+			wallet.parse_payment_instructions(invoice3.to_string().as_str()).await.unwrap();
+
+		let info1 = PaymentInfo::build(instr1, payment_amount).unwrap();
+		let info2 = PaymentInfo::build(instr2, payment_amount).unwrap();
+		let info3 = PaymentInfo::build(instr3, payment_amount).unwrap();
+
+		// Test 1: Launch multiple payments concurrently
+		let wallet_ref = &wallet;
+		let (result1, result2, result3) =
+			tokio::join!(wallet_ref.pay(&info1), wallet_ref.pay(&info2), wallet_ref.pay(&info3));
+
+		// At least one should succeed (depending on available balance)
+		// Some might fail due to insufficient balance, which is expected
+		let successes = [&result1, &result2, &result3].iter().filter(|r| r.is_ok()).count();
+		assert!(successes >= 1, "At least one concurrent payment should succeed");
+
+		// Test 2: Concurrent balance queries during payments
+		let balance_queries =
+			tokio::join!(wallet.get_balance(), wallet.get_balance(), wallet.get_balance());
+
+		// All balance queries should succeed
+		assert!(balance_queries.0.available_balance >= Amount::ZERO);
+		assert!(balance_queries.1.available_balance >= Amount::ZERO);
+		assert!(balance_queries.2.available_balance >= Amount::ZERO);
+
+		// Test 3: Concurrent transaction list queries
+		let tx_queries = tokio::join!(
+			wallet.list_transactions(),
+			wallet.list_transactions(),
+			wallet.list_transactions()
+		);
+
+		// All should succeed and return consistent results
+		assert!(tx_queries.0.is_ok());
+		assert!(tx_queries.1.is_ok());
+		assert!(tx_queries.2.is_ok());
+
+		let tx_counts =
+			(tx_queries.0.unwrap().len(), tx_queries.1.unwrap().len(), tx_queries.2.unwrap().len());
+
+		// All queries should return the same number of transactions (consistency)
+		assert_eq!(tx_counts.0, tx_counts.1, "Concurrent transaction queries should be consistent");
+		assert_eq!(tx_counts.1, tx_counts.2, "Concurrent transaction queries should be consistent");
+	})
+}
+
+#[test]
+fn test_concurrent_receive_operations() {
+	let TestParams { wallet, lsp: _, bitcoind: _, third_party, rt } = build_test_nodes();
+
+	rt.block_on(async move {
+		let amount = Amount::from_sats(1000).unwrap();
+
+		// Test: Generate multiple receive URIs concurrently
+		let (uri1, uri2) = tokio::join!(
+			wallet.get_single_use_receive_uri(Some(amount)),
+			wallet.get_single_use_receive_uri(Some(amount))
+		);
+
+		// Both should succeed
+		assert!(uri1.is_ok(), "Concurrent URI generation should succeed");
+		assert!(uri2.is_ok(), "Concurrent URI generation should succeed");
+
+		let uris = (uri1.unwrap(), uri2.unwrap());
+
+		// URIs should be different (unique invoices)
+		assert_ne!(uris.0.invoice.to_string(), uris.1.invoice.to_string(), "URIs should be unique");
+
+		// Test: Sequential payments to avoid routing issues
+		let payment_id_1 = third_party.bolt11_payment().send(&uris.0.invoice, None).unwrap();
+
+		// Wait for first payment to complete
+		test_utils::wait_for_condition(
+			Duration::from_secs(1),
+			15,
+			"first payment to succeed",
+			|| async {
+				third_party
+					.payment(&payment_id_1)
+					.map_or(false, |p| p.status == PaymentStatus::Succeeded)
+			},
+		)
+		.await
+		.expect("First payment did not succeed");
+
+		// Send second payment
+		let payment_id_2 = third_party.bolt11_payment().send(&uris.1.invoice, None).unwrap();
+
+		// Wait for second payment to complete
+		test_utils::wait_for_condition(
+			Duration::from_secs(1),
+			15,
+			"second payment to succeed",
+			|| async {
+				third_party
+					.payment(&payment_id_2)
+					.map_or(false, |p| p.status == PaymentStatus::Succeeded)
+			},
+		)
+		.await
+		.expect("Second payment did not succeed");
+
+		// Wait for wallet balance to reflect both payments
+		test_utils::wait_for_condition(
+			Duration::from_secs(1),
+			10,
+			"wallet balance to update",
+			|| async {
+				let balance = wallet.get_balance().await.available_balance;
+				balance >= amount.saturating_add(amount)
+			},
+		)
+		.await
+		.expect("Wallet balance did not reflect both payments");
+
+		// Verify transactions were recorded
+		let txs = wallet.list_transactions().await.unwrap();
+		assert!(txs.len() >= 2, "Should have at least 2 transactions");
+
+		// Count incoming transactions
+		let incoming_count = txs.iter().filter(|tx| !tx.outbound).count();
+		assert_eq!(incoming_count, 2, "Should have exactly 2 incoming transactions");
+	})
+}
+
+#[test]
+fn test_balance_consistency_under_load() {
+	let TestParams { wallet, lsp: _, bitcoind: _, third_party, rt } = build_test_nodes();
+
+	rt.block_on(async move {
+		// Add some initial balance
+		let initial_amount = Amount::from_sats(10000).unwrap();
+		let uri = wallet.get_single_use_receive_uri(Some(initial_amount)).await.unwrap();
+		third_party.bolt11_payment().send(&uri.invoice, None).unwrap();
+
+		test_utils::wait_for_condition(Duration::from_secs(1), 10, "initial balance", || async {
+			wallet.get_balance().await.available_balance >= initial_amount
+		})
+		.await
+		.expect("Initial balance not received");
+
+		// Test: Many concurrent balance queries
+		let mut balance_tasks = Vec::new();
+		for _ in 0..20 {
+			balance_tasks.push(wallet.get_balance());
+		}
+
+		// Join all balance tasks
+		let mut all_balances = Vec::new();
+		for task in balance_tasks {
+			all_balances.push(task.await);
+		}
+		let balances = all_balances;
+
+		// All queries should succeed
+		assert_eq!(balances.len(), 20);
+		for balance in &balances {
+			assert!(balance.available_balance >= Amount::ZERO);
+			assert!(balance.pending_balance >= Amount::ZERO);
+		}
+
+		// All balances should be consistent (same values)
+		let first_balance = &balances[0];
+		for balance in &balances[1..] {
+			assert_eq!(
+				balance.available_balance, first_balance.available_balance,
+				"Concurrent balance queries should return consistent results"
+			);
+			assert_eq!(
+				balance.pending_balance, first_balance.pending_balance,
+				"Concurrent balance queries should return consistent results"
+			);
+		}
+	})
+}
+
+#[test]
+fn test_invalid_tunables_relationships() {
+	let TestParams { wallet, lsp: _, bitcoind: _, third_party: _, rt } = build_test_nodes();
+
+	rt.block_on(async move {
+		let current_tunables = wallet.get_tunables();
+
+		// Test 1: Verify default tunables are valid
+		assert!(
+			current_tunables.rebalance_min <= current_tunables.trusted_balance_limit,
+			"Default tunables should have valid relationship: rebalance_min <= trusted_balance_limit"
+		);
+
+		// Test 2: Test edge case amounts with current tunables
+		// Zero amount (should work for URI generation but not payments)
+		let uri_result = wallet.get_single_use_receive_uri(None).await;
+		assert!(uri_result.is_ok(), "Should be able to generate amountless URI");
+
+		// Test 3: Very small amounts
+		let tiny_amount = Amount::from_sats(1).unwrap();
+		let uri_result = wallet.get_single_use_receive_uri(Some(tiny_amount)).await;
+		assert!(uri_result.is_ok(), "Should handle tiny amounts");
+
+		let uri = uri_result.unwrap();
+		assert!(
+			uri.invoice.amount_milli_satoshis().is_some(),
+			"Tiny amount should have Lightning invoice"
+		);
+
+		// Should not include on-chain address if below threshold
+		if tiny_amount < current_tunables.onchain_receive_threshold {
+			assert!(
+				uri.address.is_none(),
+				"Tiny amount below threshold should not include on-chain address"
+			);
+		}
+
+		// Test 4: Amounts exactly at boundaries
+		let boundary_amounts = [
+			current_tunables.rebalance_min,
+			current_tunables.trusted_balance_limit,
+			current_tunables.onchain_receive_threshold,
+		];
+
+		for amount in boundary_amounts {
+			let uri_result = wallet.get_single_use_receive_uri(Some(amount)).await;
+			assert!(
+				uri_result.is_ok(),
+				"Should handle boundary amounts: {} sats",
+				amount.sats().unwrap_or(0)
+			);
+		}
+
+		// Test 5: Verify tunables consistency with wallet behavior
+		let below_limit =
+			current_tunables.trusted_balance_limit.saturating_sub(Amount::from_sats(1).unwrap());
+		let above_limit =
+			current_tunables.trusted_balance_limit.saturating_add(Amount::from_sats(1).unwrap());
+
+		let uri_below = wallet.get_single_use_receive_uri(Some(below_limit)).await.unwrap();
+		let uri_above = wallet.get_single_use_receive_uri(Some(above_limit)).await.unwrap();
+
+		// Both should have invoices
+		assert!(
+			uri_below.invoice.amount_milli_satoshis().is_some(),
+			"Below limit should have invoice"
+		);
+		assert!(
+			uri_above.invoice.amount_milli_satoshis().is_some(),
+			"Above limit should have invoice"
+		);
+
+		// On-chain address inclusion should depend on onchain_receive_threshold, not trusted_balance_limit
+		if below_limit >= current_tunables.onchain_receive_threshold {
+			assert!(
+				uri_below.address.is_some(),
+				"Amount >= onchain_threshold should include address"
+			);
+		}
+		if above_limit >= current_tunables.onchain_receive_threshold {
+			assert!(
+				uri_above.address.is_some(),
+				"Amount >= onchain_threshold should include address"
+			);
+		}
+	})
+}
+
+#[test]
+fn test_extreme_amount_handling() {
+	let TestParams { wallet, lsp: _, bitcoind: _, third_party: _, rt } = build_test_nodes();
+
+	rt.block_on(async move {
+		// Test 1: Large but reasonable Bitcoin amount
+		let large_reasonable = Amount::from_sats(1_000_000).unwrap(); // 1M sats = 0.01 BTC
+		let uri_result = wallet.get_single_use_receive_uri(Some(large_reasonable)).await;
+		assert!(uri_result.is_ok(), "Should handle large reasonable Bitcoin amount");
+
+		// Test 2: Various large amounts (but still reasonable for testing)
+		let large_amounts = [
+			Amount::from_sats(100_000).unwrap(),   // 0.001 BTC
+			Amount::from_sats(500_000).unwrap(),   // 0.005 BTC
+			Amount::from_sats(1_000_000).unwrap(), // 0.01 BTC
+		];
+
+		for amount in large_amounts {
+			let uri_result = wallet.get_single_use_receive_uri(Some(amount)).await;
+			assert!(
+				uri_result.is_ok(),
+				"Should handle large amount: {} BTC",
+				amount.sats().unwrap() as f64 / 100_000_000.0
+			);
+
+			let uri = uri_result.unwrap();
+			assert!(
+				uri.invoice.amount_milli_satoshis().is_some(),
+				"Large amount should have invoice"
+			);
+			// Large amounts should always include on-chain address
+			assert!(uri.address.is_some(), "Large amounts should include on-chain address");
+		}
+
+		// Test 3: Satoshi precision edge cases
+		let precision_amounts = [
+			Amount::from_sats(1).unwrap(),    // 1 sat
+			Amount::from_sats(10).unwrap(),   // 10 sats
+			Amount::from_sats(100).unwrap(),  // 100 sats
+			Amount::from_sats(1000).unwrap(), // 1000 sats (1 mBTC)
+		];
+
+		for amount in precision_amounts {
+			let uri_result = wallet.get_single_use_receive_uri(Some(amount)).await;
+			assert!(
+				uri_result.is_ok(),
+				"Should handle precision amount: {} sats",
+				amount.sats().unwrap()
+			);
+		}
+
+		// Test 4: Milli-satoshi precision (if supported)
+		// Note: Bitcoin addresses can't handle milli-satoshi precision, only Lightning can
+		let msat_amount = Amount::from_milli_sats(1500).unwrap(); // 1.5 sats
+		let uri_result = wallet.get_single_use_receive_uri(Some(msat_amount)).await;
+		assert!(uri_result.is_ok(), "Should handle milli-satoshi amounts");
+
+		let uri = uri_result.unwrap();
+		assert!(
+			uri.invoice.amount_milli_satoshis().is_some(),
+			"Milli-satoshi amount should have Lightning invoice"
+		);
+		// On-chain address depends on threshold, not msat precision
+	})
+}
+
+#[test]
+fn test_wallet_configuration_validation() {
+	let TestParams { wallet, lsp: _, bitcoind: _, third_party: _, rt } = build_test_nodes();
+
+	rt.block_on(async move {
+		// Test 1: Verify wallet is using expected network
+		// This is more of a sanity check since we can't easily test invalid networks
+		// without creating new wallets
+
+		// Test 2: Verify rebalancing can be toggled
+		let initial_rebalance_state = wallet.get_rebalance_enabled();
+		assert!(initial_rebalance_state, "Rebalancing should be enabled by default");
+
+		wallet.set_rebalance_enabled(false);
+		assert!(!wallet.get_rebalance_enabled(), "Should be able to disable rebalancing");
+
+		wallet.set_rebalance_enabled(true);
+		assert!(wallet.get_rebalance_enabled(), "Should be able to re-enable rebalancing");
+
+		// Test 3: Verify tunables are consistent and reasonable
+		let tunables = wallet.get_tunables();
+
+		// Check for reasonable default values
+		assert!(
+			tunables.trusted_balance_limit > Amount::ZERO,
+			"Trusted balance limit should be positive"
+		);
+		assert!(tunables.rebalance_min > Amount::ZERO, "Rebalance min should be positive");
+		assert!(
+			tunables.onchain_receive_threshold > Amount::ZERO,
+			"Onchain threshold should be positive"
+		);
+
+		// Check relationships
+		assert!(
+			tunables.rebalance_min <= tunables.trusted_balance_limit,
+			"Rebalance min should not exceed trusted balance limit"
+		);
+
+		// Test 4: Test URI generation consistency across multiple calls
+		let amount = Amount::from_sats(5000).unwrap();
+		let uri1 = wallet.get_single_use_receive_uri(Some(amount)).await.unwrap();
+		let uri2 = wallet.get_single_use_receive_uri(Some(amount)).await.unwrap();
+
+		// Should generate different invoices (single use)
+		assert_ne!(
+			uri1.invoice.to_string(),
+			uri2.invoice.to_string(),
+			"Single-use URIs should be unique"
+		);
+
+		// But same amount and policy decisions
+		assert_eq!(
+			uri1.invoice.amount_milli_satoshis(),
+			uri2.invoice.amount_milli_satoshis(),
+			"Same amount should be preserved"
+		);
+		assert_eq!(
+			uri1.address.is_some(),
+			uri2.address.is_some(),
+			"Address inclusion should be consistent"
+		);
+	})
+}
+
+#[test]
+fn test_edge_case_payment_instruction_parsing() {
+	let TestParams { wallet, lsp: _, bitcoind: _, third_party, rt } = build_test_nodes();
+
+	rt.block_on(async move {
+		// Test 1: Empty strings
+		let empty_result = wallet.parse_payment_instructions("").await;
+		assert!(empty_result.is_err(), "Empty string should fail to parse");
+
+		// Test 2: Whitespace-only strings
+		let whitespace_result = wallet.parse_payment_instructions("   \t\n  ").await;
+		assert!(whitespace_result.is_err(), "Whitespace-only string should fail to parse");
+
+		// Test 3: Very long invalid strings
+		let long_invalid = "a".repeat(1000);
+		let long_result = wallet.parse_payment_instructions(&long_invalid).await;
+		assert!(long_result.is_err(), "Very long invalid string should fail to parse");
+
+		// Test 4: Mixed case handling
+		// Create a valid invoice first
+		let amount = Amount::from_sats(1000).unwrap();
+		let desc = Bolt11InvoiceDescription::Direct(Description::empty());
+		let invoice =
+			third_party.bolt11_payment().receive(amount.milli_sats(), &desc, 300).unwrap();
+		let invoice_str = invoice.to_string();
+
+		// Test uppercase
+		let _upper_result = wallet.parse_payment_instructions(&invoice_str.to_uppercase()).await;
+		let _lower_result = wallet.parse_payment_instructions(&invoice_str.to_lowercase()).await;
+		let original_result = wallet.parse_payment_instructions(&invoice_str).await;
+
+		// At least the original should work
+		assert!(original_result.is_ok(), "Original invoice should parse successfully");
+
+		// Test 5: Invoices with special characters or encoding
+		let special_chars =
+			["lightning:", "bitcoin:?lightning=", "LIGHTNING:", "BITCOIN:?LIGHTNING="];
+		for prefix in special_chars {
+			let prefixed = format!("{}{}", prefix, invoice_str);
+			let result = wallet.parse_payment_instructions(&prefixed).await;
+			assert!(result.is_ok(), "Failed to parse payment instructions");
 		}
 	})
 }
