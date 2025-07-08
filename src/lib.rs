@@ -30,7 +30,7 @@ use ldk_node::io::sqlite_store::SqliteStore;
 use ldk_node::lightning::ln::msgs::SocketAddress;
 use ldk_node::lightning::util::logger::Logger as _;
 use ldk_node::lightning::util::persist::KVStore;
-use ldk_node::lightning::{log_debug, log_error, log_info};
+use ldk_node::lightning::{log_debug, log_error, log_info, log_warn};
 use ldk_node::lightning_invoice::Bolt11Invoice;
 use ldk_node::payment::{PaymentDirection, PaymentKind, PaymentStatus};
 use ldk_node::{BuildError, NodeError, bitcoin};
@@ -335,6 +335,9 @@ pub struct SingleUseReceiveUri {
 	pub invoice: Bolt11Invoice,
 	/// The optional amount for the payment.
 	pub amount: Option<Amount>,
+	/// Whether the URI was generated from a trusted wallet or from
+	/// the self-custodial LN wallet.
+	pub from_trusted: bool,
 }
 
 impl fmt::Display for SingleUseReceiveUri {
@@ -581,6 +584,11 @@ where
 	/// Returns the lightning wallet's node id.
 	pub fn node_id(&self) -> PublicKey {
 		self.inner.ln_wallet.inner.ldk_node.node_id()
+	}
+
+	/// Check if the lightning wallet is currently connected to the LSP.
+	pub fn is_connected_to_lsp(&self) -> bool {
+		self.inner.ln_wallet.is_connected_to_lsp()
 	}
 
 	fn get_rebalance_amt(inner: &Arc<WalletImpl<T>>) -> Option<Amount> {
@@ -1019,7 +1027,7 @@ where
 	pub async fn get_single_use_receive_uri(
 		&self, amount: Option<Amount>,
 	) -> Result<SingleUseReceiveUri, WalletError> {
-		let (enable_onchain, bolt11) = if let Some(amt) = amount {
+		let (enable_onchain, bolt11, from_trusted) = if let Some(amt) = amount {
 			let enable_onchain = amt >= self.inner.tunables.onchain_receive_threshold;
 			// We always assume lighting balance is an overestimate by `rebalance_min`.
 			let lightning_receivable = self
@@ -1027,29 +1035,54 @@ where
 				.ln_wallet
 				.estimate_receivable_balance()
 				.saturating_sub(self.inner.tunables.rebalance_min);
-			// use trusted if the amount is both:
-			//   - Less than or equal to our trusted balance limit
-			//   - We don't have enough inbound capacity to receive on LN
-			let use_trusted =
-				amt <= self.inner.tunables.trusted_balance_limit && amt >= lightning_receivable;
+			let lsp_online = self.inner.ln_wallet.is_connected_to_lsp();
 
-			let bolt11 = if use_trusted {
-				self.inner.trusted.get_bolt11_invoice(amount).await?
+			// use self custodial if the amount is either:
+			//   - Greater than our trusted balance limit
+			//   - Less than our incoming lightning receivable balance when the LSP is online
+			let use_ln = amt > self.inner.tunables.trusted_balance_limit
+				|| (amt < lightning_receivable && lsp_online);
+
+			let mut from_trusted = !use_ln;
+
+			let bolt11 = if use_ln {
+				let res = self.inner.ln_wallet.get_bolt11_invoice(amount).await;
+				match res {
+					Ok(inv) => inv,
+					Err(NodeError::ConnectionFailed) => {
+						log_warn!(
+							self.inner.logger,
+							"Failed to connect to LSP when getting BOLT 11 invoice, falling back to trusted wallet"
+						);
+						from_trusted = true;
+						self.inner.trusted.get_bolt11_invoice(amount).await?
+					},
+					Err(e) => {
+						log_error!(self.inner.logger, "Failed to get BOLT 11 invoice: {e:?}");
+						return Err(WalletError::LdkNodeFailure(e));
+					},
+				}
 			} else {
-				self.inner.ln_wallet.get_bolt11_invoice(amount).await?
+				self.inner.trusted.get_bolt11_invoice(amount).await?
 			};
-			(enable_onchain, bolt11)
+			(enable_onchain, bolt11, from_trusted)
 		} else {
 			(
 				self.inner.tunables.enable_amountless_receive_on_chain,
 				self.inner.trusted.get_bolt11_invoice(amount).await?,
+				false,
 			)
 		};
 		if enable_onchain {
 			let address = self.inner.ln_wallet.get_on_chain_address()?;
-			Ok(SingleUseReceiveUri { address: Some(address), invoice: bolt11, amount })
+			Ok(SingleUseReceiveUri {
+				address: Some(address),
+				invoice: bolt11,
+				amount,
+				from_trusted,
+			})
 		} else {
-			Ok(SingleUseReceiveUri { address: None, invoice: bolt11, amount })
+			Ok(SingleUseReceiveUri { address: None, invoice: bolt11, amount, from_trusted })
 		}
 	}
 

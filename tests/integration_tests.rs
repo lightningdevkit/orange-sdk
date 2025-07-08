@@ -1546,3 +1546,71 @@ fn test_edge_case_payment_instruction_parsing() {
 		}
 	})
 }
+
+#[test]
+fn test_lsp_connectivity_fallback() {
+	let TestParams { wallet, lsp, bitcoind, third_party, rt } = build_test_nodes();
+
+	rt.block_on(async move {
+		// open a channel with the LSP
+		open_channel_from_lsp(&wallet, Arc::clone(&third_party)).await;
+
+		// confirm channel
+		generate_blocks(&bitcoind, 6);
+		tokio::time::sleep(Duration::from_secs(5)).await;
+
+		// spend some of the balance so we have some inbound capacity
+		let amount = Amount::from_sats(10_000).unwrap();
+		let inv = third_party
+			.bolt11_payment()
+			.receive(
+				amount.milli_sats(),
+				&Bolt11InvoiceDescription::Direct(Description::empty()),
+				300,
+			)
+			.unwrap();
+		let instr = wallet.parse_payment_instructions(inv.to_string().as_str()).await.unwrap();
+		let info = PaymentInfo::build(instr, amount).unwrap();
+		let _ = wallet.pay(&info).await;
+
+		// Wait for the payment to be processed
+		let event = wait_next_event(&wallet).await;
+		assert!(matches!(event, Event::PaymentSuccessful { .. }));
+
+		// Get the wallet's tunables to find the trusted balance limit
+		let tunables = wallet.get_tunables();
+
+		// Use an amount that would normally go to Lightning (above trusted balance limit)
+		let additional_amount = Amount::from_sats(1000).unwrap();
+		let large_recv_amt = Amount::from_milli_sats(
+			tunables.trusted_balance_limit.milli_sats() + additional_amount.milli_sats(),
+		)
+		.unwrap();
+
+		// First, verify that with LSP online, this large amount would normally use Lightning
+		let uri_with_lsp = wallet.get_single_use_receive_uri(Some(large_recv_amt)).await.unwrap();
+		// This should work when LSP is online
+		assert!(!uri_with_lsp.from_trusted);
+
+		// Now simulate LSP being offline by stopping it
+		let _ = lsp.stop();
+
+		// Wait a moment for the stop to take effect
+		tokio::time::sleep(Duration::from_secs(2)).await;
+
+		// Now try to receive the same large amount that would normally trigger Lightning usage
+		// but should fall back to trusted wallet due to LSP being offline
+		let uri_result = wallet.get_single_use_receive_uri(Some(large_recv_amt)).await.unwrap();
+		assert!(uri_result.from_trusted);
+
+		// test with small amount that should succeed
+		let small_recv_amt = Amount::from_sats(100).unwrap();
+		let uri_small = wallet.get_single_use_receive_uri(Some(small_recv_amt)).await.unwrap();
+		assert_eq!(
+			uri_small.invoice.amount_milli_satoshis(),
+			Some(small_recv_amt.milli_sats()),
+			"Small amount should still generate a valid invoice even with LSP offline"
+		);
+		assert!(uri_small.from_trusted);
+	});
+}

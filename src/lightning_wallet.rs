@@ -307,6 +307,16 @@ impl LightningWallet {
 		Ok(())
 	}
 
+	/// Check if the wallet is currently connected to the LSP.
+	pub(crate) fn is_connected_to_lsp(&self) -> bool {
+		self.inner
+			.ldk_node
+			.list_peers()
+			.into_iter()
+			.find(|p| p.node_id == self.inner.lsp_node_id)
+			.is_some_and(|p| p.is_connected)
+	}
+
 	pub(crate) fn stop(&self) {
 		let _ = self.inner.ldk_node.stop();
 	}
