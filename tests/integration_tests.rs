@@ -62,12 +62,22 @@ fn test_receive_to_trusted() {
 		let txs = wallet.list_transactions().await.unwrap();
 		assert_eq!(txs.len(), 1);
 		let tx = txs.into_iter().next().unwrap();
-		assert_eq!(tx.fee, Some(Amount::ZERO));
-		assert!(!tx.outbound);
-		assert_eq!(tx.status, TxStatus::Completed);
-		assert_eq!(tx.payment_type, PaymentType::IncomingLightning {});
-		assert_ne!(tx.time_since_epoch, Duration::ZERO);
-		assert_eq!(tx.amount, Some(recv_amt.saturating_sub(tx.fee.unwrap())));
+
+		// Comprehensive validation for trusted wallet receive
+		assert_eq!(tx.fee, Some(Amount::ZERO), "Trusted wallet receive should have zero fees");
+		assert!(!tx.outbound, "Incoming payment should not be outbound");
+		assert_eq!(tx.status, TxStatus::Completed, "Payment should be completed");
+		assert_eq!(
+			tx.payment_type,
+			PaymentType::IncomingLightning {},
+			"Payment type should be IncomingLightning"
+		);
+		assert_ne!(tx.time_since_epoch, Duration::ZERO, "Time should be set");
+		assert_eq!(
+			tx.amount,
+			Some(recv_amt),
+			"Amount should equal received amount for trusted wallet (no fees deducted)"
+		);
 	})
 }
 
@@ -166,12 +176,33 @@ fn test_receive_to_ln() {
 		let txs = wallet.list_transactions().await.unwrap();
 		assert_eq!(txs.len(), 1);
 		let tx = txs.into_iter().next().unwrap();
-		assert!(tx.fee.is_some_and(|f| f > Amount::ZERO));
-		assert!(!tx.outbound);
-		assert_eq!(tx.status, TxStatus::Completed);
-		assert_eq!(tx.payment_type, PaymentType::IncomingLightning {});
-		assert_ne!(tx.time_since_epoch, Duration::ZERO);
-		assert_eq!(tx.amount, Some(recv_amt.saturating_sub(tx.fee.unwrap())));
+
+		// Comprehensive validation for lightning receive
+		assert!(
+			tx.fee.is_some_and(|f| f > Amount::ZERO),
+			"Lightning receive should have non-zero fees"
+		);
+		assert!(!tx.outbound, "Incoming payment should not be outbound");
+		assert_eq!(tx.status, TxStatus::Completed, "Payment should be completed");
+		assert_eq!(
+			tx.payment_type,
+			PaymentType::IncomingLightning {},
+			"Payment type should be IncomingLightning"
+		);
+		assert_ne!(tx.time_since_epoch, Duration::ZERO, "Time should be set");
+		assert_eq!(
+			tx.amount,
+			Some(recv_amt.saturating_sub(tx.fee.unwrap())),
+			"Amount should be receive amount minus fees"
+		);
+
+		// Validate fee is reasonable (should be less than 10% of received amount)
+		let fee_ratio = tx.fee.unwrap().milli_sats() as f64 / recv_amt.milli_sats() as f64;
+		assert!(
+			fee_ratio < 0.1,
+			"Fee should be less than 10% of received amount, got {:.2}%",
+			fee_ratio * 100.0
+		);
 	})
 }
 
@@ -225,12 +256,22 @@ fn test_receive_to_onchain() {
 		let txs = wallet.list_transactions().await.unwrap();
 		assert_eq!(txs.len(), 1);
 		let tx = txs.into_iter().next().unwrap();
-		assert!(!tx.outbound);
-		assert_eq!(tx.status, TxStatus::Completed);
-		assert_eq!(tx.payment_type, PaymentType::IncomingOnChain { txid: Some(sent_txid) });
-		assert_ne!(tx.time_since_epoch, Duration::ZERO);
-		assert_eq!(tx.amount, Some(recv_amt));
-		assert_eq!(tx.fee, Some(Amount::ZERO));
+
+		// Comprehensive validation for on-chain receive
+		assert!(!tx.outbound, "Incoming payment should not be outbound");
+		assert_eq!(tx.status, TxStatus::Completed, "Payment should be completed");
+		assert_eq!(
+			tx.payment_type,
+			PaymentType::IncomingOnChain { txid: Some(sent_txid) },
+			"Payment type should be IncomingOnChain with correct txid"
+		);
+		assert_ne!(tx.time_since_epoch, Duration::ZERO, "Time should be set");
+		assert_eq!(tx.amount, Some(recv_amt), "Amount should equal received amount");
+		assert_eq!(
+			tx.fee,
+			Some(Amount::ZERO),
+			"On-chain receive should have zero fees (paid by sender)"
+		);
 
 		// a rebalance should be initiated, we need to mine the channel opening transaction
 		// for it to be confirmed and reflected in the wallet's history
@@ -251,12 +292,29 @@ fn test_receive_to_onchain() {
 		let txs = wallet.list_transactions().await.unwrap();
 		assert_eq!(txs.len(), 1);
 		let tx = txs.into_iter().next().unwrap();
-		assert!(!tx.outbound);
-		assert_eq!(tx.status, TxStatus::Completed);
-		assert_eq!(tx.payment_type, PaymentType::IncomingOnChain { txid: Some(sent_txid) });
-		assert_ne!(tx.time_since_epoch, Duration::ZERO);
-		assert_eq!(tx.amount, Some(recv_amt));
-		assert_ne!(tx.fee, Some(Amount::ZERO));
+
+		// Comprehensive validation for on-chain receive after rebalance
+		assert!(!tx.outbound, "Incoming payment should not be outbound");
+		assert_eq!(tx.status, TxStatus::Completed, "Payment should be completed");
+		assert_eq!(
+			tx.payment_type,
+			PaymentType::IncomingOnChain { txid: Some(sent_txid) },
+			"Payment type should be IncomingOnChain with correct txid"
+		);
+		assert_ne!(tx.time_since_epoch, Duration::ZERO, "Time should be set");
+		assert_eq!(tx.amount, Some(recv_amt), "Amount should equal received amount");
+		assert!(
+			tx.fee.unwrap() > Amount::ZERO,
+			"On-chain receive should have rebalance fees after channel opening"
+		);
+
+		// Validate fee is reasonable (should be less than 5% of received amount for rebalance)
+		let fee_ratio = tx.fee.unwrap().milli_sats() as f64 / recv_amt.milli_sats() as f64;
+		assert!(
+			fee_ratio < 0.05,
+			"Rebalance fee should be less than 5% of received amount, got {:.2}%",
+			fee_ratio * 100.0
+		);
 	})
 }
 
@@ -292,12 +350,33 @@ fn test_pay_lightning_from_self_custody() {
 		// check the payment is correct
 		let payments = wallet.list_transactions().await.unwrap();
 		let payment = payments.into_iter().find(|p| p.outbound).unwrap();
-		assert_eq!(payment.amount, Some(amount));
-		assert!(payment.fee.is_some_and(|f| f > Amount::ZERO));
-		assert!(payment.outbound);
-		assert!(matches!(payment.payment_type, PaymentType::OutgoingLightningBolt11 { .. }));
-		assert_eq!(payment.status, TxStatus::Completed);
-		assert_ne!(payment.time_since_epoch, Duration::ZERO);
+
+		// Comprehensive validation for outgoing lightning bolt11 payment
+		assert_eq!(payment.amount, Some(amount), "Amount should equal sent amount");
+		assert!(
+			payment.fee.is_some_and(|f| f > Amount::ZERO),
+			"Lightning payment should have non-zero fees"
+		);
+		assert!(payment.outbound, "Outgoing payment should be outbound");
+		assert!(
+			matches!(payment.payment_type, PaymentType::OutgoingLightningBolt11 { .. }),
+			"Payment type should be OutgoingLightningBolt11"
+		);
+		assert_eq!(payment.status, TxStatus::Completed, "Payment should be completed");
+		assert_ne!(payment.time_since_epoch, Duration::ZERO, "Time should be set");
+
+		// Validate fee is reasonable
+		let fee_ratio = payment.fee.unwrap().milli_sats() as f64 / amount.milli_sats() as f64;
+		assert!(
+			fee_ratio < 0.1,
+			"Fee should be less than 10% of sent amount, got {:.2}%",
+			fee_ratio * 100.0
+		);
+
+		// Check that payment_type contains payment_preimage for completed payments
+		if let PaymentType::OutgoingLightningBolt11 { payment_preimage } = &payment.payment_type {
+			assert!(payment_preimage.is_some(), "Completed payment should have payment_preimage");
+		}
 
 		// check balance left our wallet
 		let bal = wallet.get_balance().await;
@@ -343,12 +422,33 @@ fn test_pay_bolt12_from_self_custody() {
 		// check the payment is correct
 		let payments = wallet.list_transactions().await.unwrap();
 		let payment = payments.into_iter().find(|p| p.outbound).unwrap();
-		assert_eq!(payment.amount, Some(amount));
-		assert!(payment.fee.is_some_and(|f| f > Amount::ZERO));
-		assert!(payment.outbound);
-		assert!(matches!(payment.payment_type, PaymentType::OutgoingLightningBolt12 { .. }));
-		assert_eq!(payment.status, TxStatus::Completed);
-		assert_ne!(payment.time_since_epoch, Duration::ZERO);
+
+		// Comprehensive validation for outgoing lightning bolt12 payment
+		assert_eq!(payment.amount, Some(amount), "Amount should equal sent amount");
+		assert!(
+			payment.fee.is_some_and(|f| f > Amount::ZERO),
+			"Lightning payment should have non-zero fees"
+		);
+		assert!(payment.outbound, "Outgoing payment should be outbound");
+		assert!(
+			matches!(payment.payment_type, PaymentType::OutgoingLightningBolt12 { .. }),
+			"Payment type should be OutgoingLightningBolt12"
+		);
+		assert_eq!(payment.status, TxStatus::Completed, "Payment should be completed");
+		assert_ne!(payment.time_since_epoch, Duration::ZERO, "Time should be set");
+
+		// Validate fee is reasonable
+		let fee_ratio = payment.fee.unwrap().milli_sats() as f64 / amount.milli_sats() as f64;
+		assert!(
+			fee_ratio < 0.1,
+			"Fee should be less than 10% of sent amount, got {:.2}%",
+			fee_ratio * 100.0
+		);
+
+		// Check that payment_type contains payment_preimage for completed payments
+		if let PaymentType::OutgoingLightningBolt12 { payment_preimage } = &payment.payment_type {
+			assert!(payment_preimage.is_some(), "Completed payment should have payment_preimage");
+		}
 
 		// check balance left our wallet
 		let bal = wallet.get_balance().await;
@@ -430,12 +530,33 @@ fn test_pay_onchain_from_self_custody() {
 		// check the payment is correct
 		let payments = wallet.list_transactions().await.unwrap();
 		let payment = payments.into_iter().find(|p| p.outbound).unwrap();
-		assert_eq!(payment.amount, Some(send_amount));
-		assert!(payment.fee.is_some_and(|f| f > Amount::ZERO));
-		assert!(payment.outbound);
-		assert!(matches!(payment.payment_type, PaymentType::OutgoingOnChain { .. }));
-		assert_eq!(payment.status, TxStatus::Completed);
-		assert_ne!(payment.time_since_epoch, Duration::ZERO);
+
+		// Comprehensive validation for outgoing on-chain payment
+		assert_eq!(payment.amount, Some(send_amount), "Amount should equal sent amount");
+		assert!(
+			payment.fee.is_some_and(|f| f > Amount::ZERO),
+			"On-chain payment should have non-zero fees"
+		);
+		assert!(payment.outbound, "Outgoing payment should be outbound");
+		assert!(
+			matches!(payment.payment_type, PaymentType::OutgoingOnChain { .. }),
+			"Payment type should be OutgoingOnChain"
+		);
+		assert_eq!(payment.status, TxStatus::Completed, "Payment should be completed");
+		assert_ne!(payment.time_since_epoch, Duration::ZERO, "Time should be set");
+
+		// Validate fee is reasonable for on-chain (should be less than 1% of sent amount)
+		let fee_ratio = payment.fee.unwrap().milli_sats() as f64 / send_amount.milli_sats() as f64;
+		assert!(
+			fee_ratio < 0.01,
+			"On-chain fee should be less than 1% of sent amount, got {:.2}%",
+			fee_ratio * 100.0
+		);
+
+		// Check that payment_type contains txid for completed payments
+		if let PaymentType::OutgoingOnChain { txid } = &payment.payment_type {
+			assert!(txid.is_some(), "Completed on-chain payment should have txid");
+		}
 
 		// check balance left our wallet
 		let bal = wallet.get_balance().await;
