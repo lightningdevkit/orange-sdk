@@ -663,3 +663,275 @@ fn test_close_all_channels() {
 		assert!(!rebalancing);
 	})
 }
+
+#[test]
+fn test_threshold_boundary_trusted_balance_limit() {
+	let TestParams { wallet, lsp: _, bitcoind: _, third_party, rt } = build_test_nodes();
+
+	rt.block_on(async move {
+		let tunables = wallet.get_tunables();
+
+		// Test 1: Payment exactly at the trusted balance limit should use trusted wallet
+		let exact_limit_amount = tunables.trusted_balance_limit;
+		let uri = wallet.get_single_use_receive_uri(Some(exact_limit_amount)).await.unwrap();
+		third_party.bolt11_payment().send(&uri.invoice, None).unwrap();
+
+		test_utils::wait_for_condition(
+			Duration::from_secs(1),
+			10,
+			"exact limit payment",
+			|| async { wallet.get_balance().await.available_balance >= exact_limit_amount },
+		)
+		.await
+		.expect("Payment at exact limit failed");
+
+		let txs = wallet.list_transactions().await.unwrap();
+		assert_eq!(txs.len(), 1);
+		let tx = &txs[0];
+		assert_eq!(tx.payment_type, PaymentType::IncomingLightning {});
+		assert_eq!(
+			tx.fee,
+			Some(Amount::ZERO),
+			"Payment at exact limit should use trusted wallet with zero fees"
+		);
+
+		// Test 2: Payment 1 sat above the limit should trigger Lightning channel
+		let above_limit_amount = exact_limit_amount.saturating_add(Amount::from_sats(1).unwrap());
+		let uri = wallet.get_single_use_receive_uri(Some(above_limit_amount)).await.unwrap();
+		third_party.bolt11_payment().send(&uri.invoice, None).unwrap();
+
+		// Wait for channel to be opened and payment to complete
+		test_utils::wait_for_condition(
+			Duration::from_secs(1),
+			15,
+			"above limit payment with channel",
+			|| async {
+				let balance = wallet.get_balance().await.available_balance;
+				balance
+					>= exact_limit_amount.saturating_add(
+						above_limit_amount.saturating_sub(Amount::from_sats(50000).unwrap()),
+					)
+			},
+		)
+		.await
+		.expect("Payment above limit failed");
+
+		// Should have received a ChannelOpened event
+		let event = test_utils::wait_next_event(&wallet).await;
+		assert!(
+			matches!(event, Event::ChannelOpened { .. }),
+			"Payment above limit should trigger channel opening"
+		);
+
+		let event = test_utils::wait_next_event(&wallet).await;
+		assert!(
+			matches!(event, Event::PaymentReceived { .. }),
+			"Should receive payment through Lightning"
+		);
+
+		let txs = wallet.list_transactions().await.unwrap();
+		let lightning_tx = txs.iter().find(|tx| tx.fee.is_some_and(|f| f > Amount::ZERO)).unwrap();
+		assert_eq!(lightning_tx.payment_type, PaymentType::IncomingLightning {});
+		assert!(
+			lightning_tx.fee.unwrap() > Amount::ZERO,
+			"Payment above limit should use Lightning with fees"
+		);
+	})
+}
+
+#[test]
+fn test_threshold_boundary_rebalance_min() {
+	let TestParams { wallet, lsp: _, bitcoind: _, third_party, rt } = build_test_nodes();
+
+	rt.block_on(async move {
+		let tunables = wallet.get_tunables();
+		let rebalance_min = tunables.rebalance_min;
+
+		// Test 1: Payment below rebalance_min should use trusted wallet
+		let below_rebalance = rebalance_min.saturating_sub(Amount::from_sats(1).unwrap());
+		let uri = wallet.get_single_use_receive_uri(Some(below_rebalance)).await.unwrap();
+		third_party.bolt11_payment().send(&uri.invoice, None).unwrap();
+
+		test_utils::wait_for_condition(
+			Duration::from_secs(1),
+			10,
+			"below rebalance min payment",
+			|| async { wallet.get_balance().await.available_balance >= below_rebalance },
+		)
+		.await
+		.expect("Payment below rebalance min failed");
+
+		let txs = wallet.list_transactions().await.unwrap();
+		assert_eq!(txs.len(), 1);
+		let tx = &txs[0];
+		assert_eq!(
+			tx.fee,
+			Some(Amount::ZERO),
+			"Below rebalance_min should use trusted wallet with zero fees"
+		);
+		assert_eq!(tx.payment_type, PaymentType::IncomingLightning {});
+
+		// Test 2: Payment exactly at rebalance_min should use trusted wallet
+		let exact_rebalance = rebalance_min;
+		let uri = wallet.get_single_use_receive_uri(Some(exact_rebalance)).await.unwrap();
+		third_party.bolt11_payment().send(&uri.invoice, None).unwrap();
+
+		test_utils::wait_for_condition(
+			Duration::from_secs(1),
+			10,
+			"exact rebalance min payment",
+			|| async {
+				let balance = wallet.get_balance().await.available_balance;
+				balance >= below_rebalance.saturating_add(exact_rebalance)
+			},
+		)
+		.await
+		.expect("Payment at exact rebalance min failed");
+
+		let txs = wallet.list_transactions().await.unwrap();
+		assert_eq!(txs.len(), 2, "Should have 2 transactions");
+
+		// Both should be trusted wallet transactions with zero fees
+		for tx in &txs {
+			assert_eq!(
+				tx.fee,
+				Some(Amount::ZERO),
+				"Payments at/below rebalance_min should use trusted wallet"
+			);
+			assert_eq!(tx.payment_type, PaymentType::IncomingLightning {});
+		}
+
+		// Test 3: Verify that the rebalance logic respects the minimum threshold
+		// The total balance should still be below what would trigger Lightning usage
+		let total_balance = wallet.get_balance().await.available_balance;
+		assert!(
+			total_balance < tunables.trusted_balance_limit,
+			"Total balance should still be below trusted_balance_limit"
+		);
+	})
+}
+
+#[test]
+fn test_threshold_boundary_onchain_receive_threshold() {
+	let TestParams { wallet, lsp: _, bitcoind: _, third_party: _, rt } = build_test_nodes();
+
+	rt.block_on(async move {
+		let tunables = wallet.get_tunables();
+		let onchain_threshold = tunables.onchain_receive_threshold;
+
+		// Test 1: Amount below onchain_receive_threshold should not include on-chain address
+		let below_threshold = onchain_threshold.saturating_sub(Amount::from_sats(1).unwrap());
+		let uri = wallet.get_single_use_receive_uri(Some(below_threshold)).await.unwrap();
+
+		assert!(
+			uri.address.is_none(),
+			"Payment below onchain threshold should not include on-chain address"
+		);
+		assert!(uri.invoice.amount_milli_satoshis().is_some(), "Should include Lightning invoice");
+
+		// Test 2: Amount exactly at onchain_receive_threshold should include on-chain address
+		let exact_threshold = onchain_threshold;
+		let uri = wallet.get_single_use_receive_uri(Some(exact_threshold)).await.unwrap();
+
+		assert!(
+			uri.address.is_some(),
+			"Payment at exact onchain threshold should include on-chain address"
+		);
+		assert!(
+			uri.invoice.amount_milli_satoshis().is_some(),
+			"Should also include Lightning invoice"
+		);
+
+		// Test 3: Amount above onchain_receive_threshold should include on-chain address
+		let above_threshold = onchain_threshold.saturating_add(Amount::from_sats(1000).unwrap());
+		let uri = wallet.get_single_use_receive_uri(Some(above_threshold)).await.unwrap();
+
+		assert!(
+			uri.address.is_some(),
+			"Payment above onchain threshold should include on-chain address"
+		);
+		assert!(
+			uri.invoice.amount_milli_satoshis().is_some(),
+			"Should also include Lightning invoice"
+		);
+
+		// Test 4: Amountless receive behavior with enable_amountless_receive_on_chain
+		let uri = wallet.get_single_use_receive_uri(None).await.unwrap();
+
+		if tunables.enable_amountless_receive_on_chain {
+			assert!(
+				uri.address.is_some(),
+				"Amountless receive should include on-chain address when enabled"
+			);
+		} else {
+			assert!(
+				uri.address.is_none(),
+				"Amountless receive should not include on-chain address when disabled"
+			);
+		}
+		assert!(
+			uri.invoice.amount_milli_satoshis().is_none(),
+			"Amountless invoice should have no fixed amount"
+		);
+	})
+}
+
+#[test]
+fn test_threshold_combinations_and_edge_cases() {
+	let TestParams { wallet, lsp: _, bitcoind: _, third_party: _, rt } = build_test_nodes();
+
+	rt.block_on(async move {
+		let tunables = wallet.get_tunables();
+
+		// Test edge case: ensure thresholds are properly ordered
+		assert!(
+			tunables.rebalance_min <= tunables.trusted_balance_limit,
+			"rebalance_min should be <= trusted_balance_limit for proper wallet operation"
+		);
+
+		// Test minimum amount handling (1 sat)
+		let min_amount = Amount::from_sats(1).unwrap();
+		let uri = wallet.get_single_use_receive_uri(Some(min_amount)).await.unwrap();
+
+		assert!(
+			uri.invoice.amount_milli_satoshis().is_some(),
+			"Should handle minimum 1 sat amount"
+		);
+		assert!(uri.address.is_none(), "1 sat should be below onchain threshold");
+
+		// Test large amount (but reasonable for testing)
+		let large_amount = Amount::from_sats(1_000_000).unwrap(); // 1 BTC - large but reasonable
+		let uri = wallet.get_single_use_receive_uri(Some(large_amount)).await.unwrap();
+
+		assert!(uri.invoice.amount_milli_satoshis().is_some(), "Should handle large amounts");
+		assert!(uri.address.is_some(), "Large amount should include on-chain address");
+
+		// Test zero amount (should be handled by amountless logic)
+		let uri = wallet.get_single_use_receive_uri(None).await.unwrap();
+		assert!(
+			uri.invoice.amount_milli_satoshis().is_none(),
+			"Amountless invoice should have no amount"
+		);
+
+		// Verify the wallet can handle payments at multiple threshold boundaries
+		let test_amounts = [
+			tunables.rebalance_min.saturating_sub(Amount::from_sats(1).unwrap()),
+			tunables.rebalance_min,
+			tunables.rebalance_min.saturating_add(Amount::from_sats(1).unwrap()),
+			tunables.onchain_receive_threshold.saturating_sub(Amount::from_sats(1).unwrap()),
+			tunables.onchain_receive_threshold,
+			tunables.onchain_receive_threshold.saturating_add(Amount::from_sats(1).unwrap()),
+			tunables.trusted_balance_limit.saturating_sub(Amount::from_sats(1).unwrap()),
+			tunables.trusted_balance_limit,
+		];
+
+		for amount in test_amounts {
+			let uri = wallet.get_single_use_receive_uri(Some(amount)).await.unwrap();
+			assert!(
+				uri.invoice.amount_milli_satoshis().is_some(),
+				"Should generate valid invoice for amount: {} sats",
+				amount.sats().unwrap_or(0)
+			);
+		}
+	})
+}
