@@ -1085,16 +1085,38 @@ fn test_concurrent_payments() {
 	let TestParams { wallet, lsp: _, bitcoind, third_party, rt } = build_test_nodes();
 
 	rt.block_on(async move {
-		// First, get a Lightning channel with sufficient funds
+		// First, build up sufficient balance for concurrent sending
 		let _channel_amount = open_channel_from_lsp(&wallet, Arc::clone(&third_party)).await;
 
 		// Wait for sync
 		generate_blocks(&bitcoind, 6);
 		tokio::time::sleep(Duration::from_secs(5)).await;
 
-		let payment_amount = Amount::from_sats(100).unwrap();
+		// receive to trusted wallet as well
+		let uri =
+			wallet.get_single_use_receive_uri(Some(Amount::from_sats(150).unwrap())).await.unwrap();
+		third_party.bolt11_payment().send(&uri.invoice, None).unwrap();
+		let ev = wait_next_event(&wallet).await;
+		assert!(matches!(ev, Event::PaymentReceived { .. }), "Expected PaymentReceived event");
 
-		// Create multiple invoices
+		// Verify we have sufficient balance for multiple outgoing payments
+		let initial_balance = wallet.get_balance().await;
+		let payment_amount = Amount::from_sats(100).unwrap(); // Use small amounts to avoid routing issues
+		let total_payment_amount =
+			payment_amount.saturating_add(payment_amount).saturating_add(payment_amount);
+
+		assert!(
+			initial_balance.available_balance
+				>= total_payment_amount.saturating_add(Amount::from_sats(1000).unwrap()), // Extra buffer for fees
+			"Insufficient balance for concurrent payments test: have {}, need {}",
+			initial_balance.available_balance.sats().unwrap_or(0),
+			total_payment_amount
+				.saturating_add(Amount::from_sats(1000).unwrap())
+				.sats()
+				.unwrap_or(0)
+		);
+
+		// Create multiple invoices from third party for us to pay
 		let desc = Bolt11InvoiceDescription::Direct(Description::empty());
 		let invoice1 =
 			third_party.bolt11_payment().receive(payment_amount.milli_sats(), &desc, 300).unwrap();
@@ -1103,38 +1125,126 @@ fn test_concurrent_payments() {
 		let invoice3 =
 			third_party.bolt11_payment().receive(payment_amount.milli_sats(), &desc, 300).unwrap();
 
-		// Parse payment instructions
-		let instr1 =
-			wallet.parse_payment_instructions(invoice1.to_string().as_str()).await.unwrap();
-		let instr2 =
-			wallet.parse_payment_instructions(invoice2.to_string().as_str()).await.unwrap();
-		let instr3 =
-			wallet.parse_payment_instructions(invoice3.to_string().as_str()).await.unwrap();
+		// Convert invoices to strings first to avoid borrowing issues
+		let invoice1_str = invoice1.to_string();
+		let invoice2_str = invoice2.to_string();
+		let invoice3_str = invoice3.to_string();
+
+		// Parse payment instructions concurrently
+		let (instr_result1, instr_result2, instr_result3) = tokio::join!(
+			wallet.parse_payment_instructions(&invoice1_str),
+			wallet.parse_payment_instructions(&invoice2_str),
+			wallet.parse_payment_instructions(&invoice3_str)
+		);
+
+		let instr1 = instr_result1.expect("First instruction parsing should succeed");
+		let instr2 = instr_result2.expect("Second instruction parsing should succeed");
+		let instr3 = instr_result3.expect("Third instruction parsing should succeed");
 
 		let info1 = PaymentInfo::build(instr1, payment_amount).unwrap();
 		let info2 = PaymentInfo::build(instr2, payment_amount).unwrap();
 		let info3 = PaymentInfo::build(instr3, payment_amount).unwrap();
 
-		// Test 1: Launch multiple payments concurrently
-		let wallet_ref = &wallet;
+		// Test: Launch multiple payments concurrently
 		let (result1, result2, result3) =
-			tokio::join!(wallet_ref.pay(&info1), wallet_ref.pay(&info2), wallet_ref.pay(&info3));
+			tokio::join!(wallet.pay(&info1), wallet.pay(&info2), wallet.pay(&info3));
 
-		// At least one should succeed (depending on available balance)
-		// Some might fail due to insufficient balance, which is expected
-		let successes = [&result1, &result2, &result3].iter().filter(|r| r.is_ok()).count();
-		assert!(successes >= 1, "At least one concurrent payment should succeed");
+		// Payment initiation should succeed since we verified sufficient balance
+		assert!(
+			result1.is_ok(),
+			"First concurrent payment initiation should succeed: {:?}",
+			result1
+		);
+		assert!(
+			result2.is_ok(),
+			"Second concurrent payment initiation should succeed: {:?}",
+			result2
+		);
+		assert!(
+			result3.is_ok(),
+			"Third concurrent payment initiation should succeed: {:?}",
+			result3
+		);
 
-		// Test 2: Concurrent balance queries during payments
+		// Now wait for all PaymentSuccessful events to confirm the payments actually completed
+		let mut payment_successes = 0;
+
+		while payment_successes < 3 {
+			let event = wait_next_event(&wallet).await;
+			match event {
+				Event::PaymentSuccessful { .. } => {
+					payment_successes += 1;
+				},
+				_ => {
+					panic!("Expected PaymentSuccessful event, got: {:?}", event);
+				},
+			}
+		}
+
+		assert_eq!(
+			payment_successes, 3,
+			"Should receive exactly 3 PaymentSuccessful events, got {}",
+			payment_successes
+		);
+
+		// Verify all payments were recorded in transaction history
+		let final_txs = wallet.list_transactions().await.unwrap();
+		let outgoing_txs: Vec<_> = final_txs.iter().filter(|tx| tx.outbound).collect();
+		assert!(outgoing_txs.len() >= 3, "Should have at least 3 outgoing transactions");
+
+		// Verify all payments reached the third party
+		test_utils::wait_for_condition(
+			Duration::from_secs(1),
+			10,
+			"third party to receive all payments",
+			|| async {
+				let current_payments = third_party.list_payments();
+				let successful_payments = current_payments
+					.iter()
+					.filter(|p| {
+						p.status == PaymentStatus::Succeeded
+							&& p.direction == PaymentDirection::Inbound
+							&& p.amount_msat == Some(payment_amount.milli_sats())
+					})
+					.count();
+				successful_payments >= 3
+			},
+		)
+		.await
+		.expect("Third party should receive all 3 payments");
+
+		// Verify final balance state (the main test is that concurrent payments succeeded)
+		let final_balance = wallet.get_balance().await;
+		let balance_decrease =
+			initial_balance.available_balance.saturating_sub(final_balance.available_balance);
+		println!(
+			"Balance change: Initial: {}, Final: {}, Decrease: {}",
+			initial_balance.available_balance.sats().unwrap_or(0),
+			final_balance.available_balance.sats().unwrap_or(0),
+			balance_decrease.sats().unwrap_or(0)
+		);
+
+		// The balance should have decreased by some amount (allowing for complex routing and trusted/LN combinations)
+		assert!(
+			balance_decrease > Amount::ZERO,
+			"Balance should decrease after successful payments"
+		);
+
+		// Test concurrent balance queries (should still work during/after payments)
 		let balance_queries =
 			tokio::join!(wallet.get_balance(), wallet.get_balance(), wallet.get_balance());
 
-		// All balance queries should succeed
-		assert!(balance_queries.0.available_balance >= Amount::ZERO);
-		assert!(balance_queries.1.available_balance >= Amount::ZERO);
-		assert!(balance_queries.2.available_balance >= Amount::ZERO);
+		// All balance queries should succeed and return consistent results
+		assert_eq!(
+			balance_queries.0.available_balance, balance_queries.1.available_balance,
+			"Concurrent balance queries should be consistent"
+		);
+		assert_eq!(
+			balance_queries.1.available_balance, balance_queries.2.available_balance,
+			"Concurrent balance queries should be consistent"
+		);
 
-		// Test 3: Concurrent transaction list queries
+		// Test concurrent transaction list queries
 		let tx_queries = tokio::join!(
 			wallet.list_transactions(),
 			wallet.list_transactions(),
@@ -1142,16 +1252,17 @@ fn test_concurrent_payments() {
 		);
 
 		// All should succeed and return consistent results
-		assert!(tx_queries.0.is_ok());
-		assert!(tx_queries.1.is_ok());
-		assert!(tx_queries.2.is_ok());
-
-		let tx_counts =
-			(tx_queries.0.unwrap().len(), tx_queries.1.unwrap().len(), tx_queries.2.unwrap().len());
-
-		// All queries should return the same number of transactions (consistency)
-		assert_eq!(tx_counts.0, tx_counts.1, "Concurrent transaction queries should be consistent");
-		assert_eq!(tx_counts.1, tx_counts.2, "Concurrent transaction queries should be consistent");
+		let tx_lists = (tx_queries.0.unwrap(), tx_queries.1.unwrap(), tx_queries.2.unwrap());
+		assert_eq!(
+			tx_lists.0.len(),
+			tx_lists.1.len(),
+			"Concurrent transaction queries should return same count"
+		);
+		assert_eq!(
+			tx_lists.1.len(),
+			tx_lists.2.len(),
+			"Concurrent transaction queries should return same count"
+		);
 	})
 }
 
