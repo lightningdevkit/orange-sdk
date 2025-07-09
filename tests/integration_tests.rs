@@ -3,13 +3,14 @@
 use crate::test_utils::{
 	TestParams, build_test_nodes, generate_blocks, open_channel_from_lsp, wait_next_event,
 };
-use bitcoin_payment_instructions::PaymentInstructions;
 use bitcoin_payment_instructions::amount::Amount;
 use bitcoin_payment_instructions::http_resolver::HTTPHrnResolver;
+use bitcoin_payment_instructions::{ParseError, PaymentInstructions};
+use ldk_node::NodeError;
 use ldk_node::bitcoin::Network;
 use ldk_node::lightning_invoice::{Bolt11InvoiceDescription, Description};
 use ldk_node::payment::{ConfirmationStatus, PaymentDirection, PaymentStatus};
-use orange_sdk::{Event, PaymentInfo, PaymentType, TxStatus};
+use orange_sdk::{Event, PaymentInfo, PaymentType, TxStatus, WalletError};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -947,7 +948,7 @@ fn test_threshold_combinations_and_edge_cases() {
 }
 
 #[test]
-fn test_payment_failures() {
+fn test_invalid_payment_instructions() {
 	let TestParams { wallet, lsp: _, bitcoind: _, third_party, rt } = build_test_nodes();
 
 	rt.block_on(async move {
@@ -962,17 +963,26 @@ fn test_payment_failures() {
 
 		// This should fail due to insufficient balance
 		let result = wallet.pay(&info).await;
-		assert!(result.is_err(), "Payment with insufficient balance should fail");
+		assert!(
+			matches!(result, Err(WalletError::LdkNodeFailure(NodeError::InsufficientFunds))),
+			"Payment with insufficient balance should fail with LDK error"
+		);
 
 		// Test 2: Invalid invoice parsing
 		let invalid_invoice = "lnbc1invalid_invoice_here";
 		let result = wallet.parse_payment_instructions(invalid_invoice).await;
-		assert!(result.is_err(), "Invalid invoice should fail to parse");
+		assert!(
+			matches!(result, Err(ParseError::UnknownPaymentInstructions)),
+			"Invalid invoice should fail with UnknownPaymentInstructions error"
+		);
 
 		// Test 3: Malformed Bitcoin address
 		let invalid_address = "not_a_bitcoin_address";
 		let result = wallet.parse_payment_instructions(invalid_address).await;
-		assert!(result.is_err(), "Invalid address should fail to parse");
+		assert!(
+			matches!(result, Err(ParseError::UnknownPaymentInstructions)),
+			"Invalid address should fail with UnknownPaymentInstructions error"
+		);
 
 		// Test 4: Zero amount payment (should be rejected)
 		let zero_amount = Amount::ZERO;
@@ -1032,17 +1042,7 @@ fn test_payment_with_expired_invoice() {
 
 		// Try to parse and pay the expired invoice - it should either fail to parse or fail to pay
 		let parse_result = wallet.parse_payment_instructions(invoice.to_string().as_str()).await;
-		if let Ok(instr) = parse_result {
-			if let Ok(info) = PaymentInfo::build(instr, payment_amount) {
-				// If parsing succeeded, payment should fail due to expiry
-				let result = wallet.pay(&info).await;
-				assert!(result.is_err(), "Payment with expired invoice should fail");
-			} else {
-				// Payment info building failed - acceptable for expired invoice
-			}
-		} else {
-			// Parsing failed - also acceptable for expired invoice
-		}
+		assert!(matches!(parse_result.unwrap_err(), ParseError::InstructionsExpired));
 	})
 }
 
@@ -1056,25 +1056,27 @@ fn test_payment_network_mismatch() {
 		// the validation logic with known invalid network addresses
 
 		// Test 2: Invalid network address format
-		let invalid_testnet_address = "tb1qd28npep0s8frcm3y7dxqajkcy2m40eysplyr9v"; // Valid testnet address
-		let result = wallet.parse_payment_instructions(invalid_testnet_address).await;
-		assert!(result.is_err(), "Invalid testnet address");
+		let wrong_network = "tb1qd28npep0s8frcm3y7dxqajkcy2m40eysplyr9v"; // Valid testnet address
+		let result = wallet.parse_payment_instructions(wrong_network).await;
+		assert!(
+			matches!(result, Err(ParseError::WrongNetwork)),
+			"Wrong network address should fail with WrongNetwork error"
+		);
 
 		// now force a correct parsing to ensure we fail when trying to pay
-		let instr = PaymentInstructions::parse(
-			invalid_testnet_address,
-			Network::Testnet,
-			&HTTPHrnResolver,
-			true,
-		)
-		.await
-		.unwrap();
+		let instr =
+			PaymentInstructions::parse(wrong_network, Network::Testnet, &HTTPHrnResolver, true)
+				.await
+				.unwrap();
 
 		// If it parsed, trying to pay should fail due to network mismatch
 		let amount = Amount::from_sats(1000).unwrap();
 		let info = PaymentInfo::build(instr, amount).unwrap();
 		let pay_result = wallet.pay(&info).await;
-		assert!(pay_result.is_err(), "Payment to wrong network address should fail");
+		assert!(
+			matches!(pay_result, Err(WalletError::LdkNodeFailure(_))),
+			"Payment to wrong network address should fail with LDK error"
+		);
 	})
 }
 
@@ -1509,16 +1511,25 @@ fn test_edge_case_payment_instruction_parsing() {
 	rt.block_on(async move {
 		// Test 1: Empty strings
 		let empty_result = wallet.parse_payment_instructions("").await;
-		assert!(empty_result.is_err(), "Empty string should fail to parse");
+		assert!(
+			matches!(empty_result, Err(ParseError::UnknownPaymentInstructions)),
+			"Empty string should fail with UnknownPaymentInstructions error"
+		);
 
 		// Test 2: Whitespace-only strings
 		let whitespace_result = wallet.parse_payment_instructions("   \t\n  ").await;
-		assert!(whitespace_result.is_err(), "Whitespace-only string should fail to parse");
+		assert!(
+			matches!(whitespace_result, Err(ParseError::UnknownPaymentInstructions)),
+			"Whitespace-only string should fail with UnknownPaymentInstructions error"
+		);
 
 		// Test 3: Very long invalid strings
 		let long_invalid = "a".repeat(1000);
 		let long_result = wallet.parse_payment_instructions(&long_invalid).await;
-		assert!(long_result.is_err(), "Very long invalid string should fail to parse");
+		assert!(
+			matches!(long_result, Err(ParseError::UnknownPaymentInstructions)),
+			"Very long invalid string should fail with UnknownPaymentInstructions error"
+		);
 
 		// Test 4: Mixed case handling
 		// Create a valid invoice first
