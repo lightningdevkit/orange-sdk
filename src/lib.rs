@@ -1374,6 +1374,18 @@ where
 			);
 		})
 	}
+
+	/// Stops the wallet, which will stop the underlying LDK node and any background tasks.
+	/// This will ensure that any critical tasks have completed before stopping.
+	pub async fn stop(&self) {
+		// wait for the balance mutex to ensure no other tasks are running
+		log_info!(self.inner.logger, "Stopping...");
+		log_debug!(self.inner.logger, "Waiting for balance mutex...");
+		let _ = self.inner.balance_mutex.lock().await;
+
+		log_debug!(self.inner.logger, "Stopping ln wallet...");
+		self.inner.ln_wallet.stop();
+	}
 }
 
 impl<T> Drop for Wallet<T>
