@@ -689,9 +689,7 @@ where
 						inner
 							.tx_metadata
 							.set_tx_caused_rebalance(&triggering_transaction_id)
-							.expect(
-								"TODO: This is race-y, we really need some kind of mutex on trusted rebalances happening",
-							);
+							.expect("Failed to write metadata for rebalance transaction");
 						let metadata = TxMetadata {
 							ty: TxType::TrustedToLightning {
 								trusted_payment: rebalance_id,
@@ -781,9 +779,10 @@ where
 			"Channel open succeeded. Assigned fees to onchain recv {triggering_txid} for channel open tx {chan_txid}"
 		);
 
-		inner.tx_metadata.set_tx_caused_rebalance(&trigger).expect(
-			"TODO: This is race-y, we really need some kind of mutex on trusted rebalances happening",
-		);
+		inner
+			.tx_metadata
+			.set_tx_caused_rebalance(&trigger)
+			.expect("Failed to write metadata for onchain rebalance transaction");
 		let metadata = TxMetadata {
 			ty: TxType::OnchainToLightning { channel_txid: chan_txid, triggering_txid },
 			time: SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap(),
