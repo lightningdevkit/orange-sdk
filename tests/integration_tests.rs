@@ -1048,9 +1048,27 @@ fn test_payment_with_expired_invoice() {
 
 #[test]
 fn test_payment_network_mismatch() {
-	let TestParams { wallet, lsp: _, bitcoind: _, third_party: _, rt } = build_test_nodes();
+	let TestParams { wallet, lsp: _, bitcoind, third_party: _, rt } = build_test_nodes();
 
 	rt.block_on(async move {
+		// disable rebalancing so we have on-chain funds
+		wallet.set_rebalance_enabled(false);
+
+		// fund wallet with on-chain
+		let recv_amount = Amount::from_sats(1_000_000).unwrap();
+		let uri = wallet.get_single_use_receive_uri(Some(recv_amount)).await.unwrap();
+		bitcoind
+			.client
+			.send_to_address(
+				&uri.address.unwrap(),
+				ldk_node::bitcoin::Amount::from_sat(recv_amount.sats().unwrap()),
+			)
+			.unwrap();
+
+		// confirm tx
+		generate_blocks(&bitcoind, 6);
+		tokio::time::sleep(Duration::from_secs(5)).await;
+
 		// Test 1: Mainnet invoice on regtest wallet (if we can construct one)
 		// This is tricky to test in practice since we're on regtest, but we can test
 		// the validation logic with known invalid network addresses
@@ -1074,8 +1092,8 @@ fn test_payment_network_mismatch() {
 		let info = PaymentInfo::build(instr, amount).unwrap();
 		let pay_result = wallet.pay(&info).await;
 		assert!(
-			matches!(pay_result, Err(WalletError::LdkNodeFailure(_))),
-			"Payment to wrong network address should fail with LDK error"
+			matches!(pay_result, Err(WalletError::LdkNodeFailure(NodeError::InvalidAddress))),
+			"Payment to wrong network address should fail with LDK error, got {pay_result:?}"
 		);
 	})
 }
