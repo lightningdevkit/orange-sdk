@@ -21,7 +21,7 @@ fn test_node_start() {
 	let TestParams { wallet, lsp: _, bitcoind: _, third_party: _, rt } = build_test_nodes();
 
 	rt.block_on(async move {
-		let bal = wallet.get_balance().await;
+		let bal = wallet.get_balance().await.unwrap();
 		assert_eq!(bal.available_balance, Amount::ZERO);
 		assert_eq!(bal.pending_balance, Amount::ZERO);
 	})
@@ -32,7 +32,7 @@ fn test_receive_to_trusted() {
 	let TestParams { wallet, lsp: _, bitcoind: _, third_party, rt } = build_test_nodes();
 
 	rt.block_on(async move {
-		let starting_bal = wallet.get_balance().await;
+		let starting_bal = wallet.get_balance().await.unwrap();
 		assert_eq!(starting_bal.available_balance, Amount::ZERO);
 		assert_eq!(starting_bal.pending_balance, Amount::ZERO);
 
@@ -58,7 +58,7 @@ fn test_receive_to_trusted() {
 			Duration::from_secs(1),
 			10,
 			"wallet balance update after receive",
-			|| async { wallet.get_balance().await.available_balance > Amount::ZERO },
+			|| async { wallet.get_balance().await.unwrap().available_balance > Amount::ZERO },
 		)
 		.await
 		.expect("Wallet balance did not update in time after receive");
@@ -90,7 +90,7 @@ fn test_sweep_to_ln() {
 	let TestParams { wallet, lsp, bitcoind: _, third_party, rt } = build_test_nodes();
 
 	rt.block_on(async move {
-		let starting_bal = wallet.get_balance().await;
+		let starting_bal = wallet.get_balance().await.unwrap();
 		assert_eq!(starting_bal.available_balance, Amount::ZERO);
 		assert_eq!(starting_bal.pending_balance, Amount::ZERO);
 
@@ -109,12 +109,12 @@ fn test_sweep_to_ln() {
 			Duration::from_secs(1),
 			10,
 			"wallet balance update after receive",
-			|| async { wallet.get_balance().await.available_balance > Amount::ZERO },
+			|| async { wallet.get_balance().await.unwrap().available_balance > Amount::ZERO },
 		)
 		.await
 		.expect("Wallet balance did not update in time after receive");
 
-		let intermediate_amt = wallet.get_balance().await.available_balance;
+		let intermediate_amt = wallet.get_balance().await.unwrap().available_balance;
 
 		// next receive the limit to trigger the rebalance
 		let recv_amt = Amount::from_milli_sats(limit.trusted_balance_limit.milli_sats()).unwrap();
@@ -127,7 +127,7 @@ fn test_sweep_to_ln() {
 			Duration::from_secs(1),
 			10,
 			"wallet balance update after receive",
-			|| async { wallet.get_balance().await.available_balance > intermediate_amt },
+			|| async { wallet.get_balance().await.unwrap().available_balance > intermediate_amt },
 		)
 		.await
 		.expect("Wallet balance did not update in time after receive");
@@ -215,7 +215,7 @@ fn test_receive_to_onchain() {
 	let TestParams { wallet, lsp, bitcoind, third_party, rt } = build_test_nodes();
 
 	rt.block_on(async move {
-		let starting_bal = wallet.get_balance().await;
+		let starting_bal = wallet.get_balance().await.unwrap();
 		assert_eq!(starting_bal.available_balance, Amount::ZERO);
 		assert_eq!(starting_bal.pending_balance, Amount::ZERO);
 
@@ -238,7 +238,7 @@ fn test_receive_to_onchain() {
 			"pending balance to update",
 			|| async {
 				// onchain balance is always listed as pending until we splice it into the channel.
-				wallet.get_balance().await.pending_balance == recv_amt
+				wallet.get_balance().await.unwrap().pending_balance == recv_amt
 			},
 		)
 		.await
@@ -334,7 +334,7 @@ fn test_pay_lightning_from_self_custody() {
 		generate_blocks(&bitcoind, 6);
 		tokio::time::sleep(Duration::from_secs(5)).await;
 
-		let starting_bal = wallet.get_balance().await;
+		let starting_bal = wallet.get_balance().await.unwrap();
 
 		let amount = Amount::from_sats(1_000).unwrap();
 
@@ -383,7 +383,7 @@ fn test_pay_lightning_from_self_custody() {
 		}
 
 		// check balance left our wallet
-		let bal = wallet.get_balance().await;
+		let bal = wallet.get_balance().await.unwrap();
 		assert_eq!(bal.pending_balance, Amount::ZERO);
 		assert!(bal.available_balance <= starting_bal.available_balance.saturating_sub(amount));
 
@@ -407,7 +407,7 @@ fn test_pay_bolt12_from_self_custody() {
 		generate_blocks(&bitcoind, 6);
 		tokio::time::sleep(Duration::from_secs(5)).await;
 
-		let starting_bal = wallet.get_balance().await;
+		let starting_bal = wallet.get_balance().await.unwrap();
 
 		let amount = Amount::from_sats(1_000).unwrap();
 
@@ -455,7 +455,7 @@ fn test_pay_bolt12_from_self_custody() {
 		}
 
 		// check balance left our wallet
-		let bal = wallet.get_balance().await;
+		let bal = wallet.get_balance().await.unwrap();
 		assert_eq!(bal.pending_balance, Amount::ZERO);
 		assert!(bal.available_balance <= starting_bal.available_balance.saturating_sub(amount));
 
@@ -475,7 +475,7 @@ fn test_pay_onchain_from_self_custody() {
 		// disable rebalancing so we have on-chain funds
 		wallet.set_rebalance_enabled(false);
 
-		let starting_bal = wallet.get_balance().await;
+		let starting_bal = wallet.get_balance().await.unwrap();
 		assert_eq!(starting_bal.available_balance, Amount::ZERO);
 		assert_eq!(starting_bal.pending_balance, Amount::ZERO);
 
@@ -498,7 +498,9 @@ fn test_pay_onchain_from_self_custody() {
 			Duration::from_secs(1),
 			10,
 			"wallet sync after on-chain receive",
-			|| async { wallet.get_balance().await.pending_balance > starting_bal.pending_balance },
+			|| async {
+				wallet.get_balance().await.unwrap().pending_balance > starting_bal.pending_balance
+			},
 		)
 		.await
 		.expect("Wallet did not sync balance in time");
@@ -563,7 +565,7 @@ fn test_pay_onchain_from_self_custody() {
 		}
 
 		// check balance left our wallet
-		let bal = wallet.get_balance().await;
+		let bal = wallet.get_balance().await.unwrap();
 		assert_eq!(
 			bal.pending_balance,
 			recv_amount.saturating_sub(send_amount).saturating_sub(payment.fee.unwrap())
@@ -593,7 +595,7 @@ fn test_force_close_handling() {
 	let TestParams { wallet, lsp, bitcoind, third_party, rt } = build_test_nodes();
 
 	rt.block_on(async move {
-		let starting_bal = wallet.get_balance().await;
+		let starting_bal = wallet.get_balance().await.unwrap();
 		assert_eq!(starting_bal.available_balance, Amount::ZERO);
 		assert_eq!(starting_bal.pending_balance, Amount::ZERO);
 
@@ -637,7 +639,7 @@ fn test_close_all_channels() {
 	let TestParams { wallet, lsp, bitcoind, third_party, rt } = build_test_nodes();
 
 	rt.block_on(async move {
-		let starting_bal = wallet.get_balance().await;
+		let starting_bal = wallet.get_balance().await.unwrap();
 		assert_eq!(starting_bal.available_balance, Amount::ZERO);
 		assert_eq!(starting_bal.pending_balance, Amount::ZERO);
 
@@ -684,7 +686,9 @@ fn test_threshold_boundary_trusted_balance_limit() {
 			Duration::from_secs(1),
 			10,
 			"exact limit payment",
-			|| async { wallet.get_balance().await.available_balance >= exact_limit_amount },
+			|| async {
+				wallet.get_balance().await.unwrap().available_balance >= exact_limit_amount
+			},
 		)
 		.await
 		.expect("Payment at exact limit failed");
@@ -710,7 +714,7 @@ fn test_threshold_boundary_trusted_balance_limit() {
 			15,
 			"above limit payment with channel",
 			|| async {
-				let balance = wallet.get_balance().await.available_balance;
+				let balance = wallet.get_balance().await.unwrap().available_balance;
 				balance
 					>= exact_limit_amount.saturating_add(
 						above_limit_amount.saturating_sub(Amount::from_sats(50000).unwrap()),
@@ -760,7 +764,7 @@ fn test_threshold_boundary_rebalance_min() {
 			Duration::from_secs(1),
 			10,
 			"below rebalance min payment",
-			|| async { wallet.get_balance().await.available_balance >= below_rebalance },
+			|| async { wallet.get_balance().await.unwrap().available_balance >= below_rebalance },
 		)
 		.await
 		.expect("Payment below rebalance min failed");
@@ -785,7 +789,7 @@ fn test_threshold_boundary_rebalance_min() {
 			10,
 			"exact rebalance min payment",
 			|| async {
-				let balance = wallet.get_balance().await.available_balance;
+				let balance = wallet.get_balance().await.unwrap().available_balance;
 				balance >= below_rebalance.saturating_add(exact_rebalance)
 			},
 		)
@@ -814,7 +818,7 @@ fn test_threshold_boundary_rebalance_min() {
 
 		// Test 3: Verify that the rebalance logic respects the minimum threshold
 		// The total balance should still be below what would trigger Lightning usage
-		let total_balance = wallet.get_balance().await.available_balance;
+		let total_balance = wallet.get_balance().await.unwrap().available_balance;
 		assert!(
 			total_balance < tunables.trusted_balance_limit,
 			"Total balance should still be below trusted_balance_limit"
@@ -1026,7 +1030,7 @@ fn test_payment_with_expired_invoice() {
 			Duration::from_secs(1),
 			10,
 			"wallet balance update",
-			|| async { wallet.get_balance().await.available_balance > Amount::ZERO },
+			|| async { wallet.get_balance().await.unwrap().available_balance > Amount::ZERO },
 		)
 		.await
 		.expect("Balance should update");
@@ -1118,7 +1122,7 @@ fn test_concurrent_payments() {
 		assert!(matches!(ev, Event::PaymentReceived { .. }), "Expected PaymentReceived event");
 
 		// Verify we have sufficient balance for multiple outgoing payments
-		let initial_balance = wallet.get_balance().await;
+		let initial_balance = wallet.get_balance().await.unwrap();
 		let payment_amount = Amount::from_sats(100).unwrap(); // Use small amounts to avoid routing issues
 		let total_payment_amount =
 			payment_amount.saturating_add(payment_amount).saturating_add(payment_amount);
@@ -1232,7 +1236,7 @@ fn test_concurrent_payments() {
 		.expect("Third party should receive all 3 payments");
 
 		// Verify final balance state (the main test is that concurrent payments succeeded)
-		let final_balance = wallet.get_balance().await;
+		let final_balance = wallet.get_balance().await.unwrap();
 		let balance_decrease =
 			initial_balance.available_balance.saturating_sub(final_balance.available_balance);
 		println!(
@@ -1254,11 +1258,13 @@ fn test_concurrent_payments() {
 
 		// All balance queries should succeed and return consistent results
 		assert_eq!(
-			balance_queries.0.available_balance, balance_queries.1.available_balance,
+			balance_queries.0.unwrap().available_balance,
+			balance_queries.1.as_ref().unwrap().available_balance,
 			"Concurrent balance queries should be consistent"
 		);
 		assert_eq!(
-			balance_queries.1.available_balance, balance_queries.2.available_balance,
+			balance_queries.1.unwrap().available_balance,
+			balance_queries.2.unwrap().available_balance,
 			"Concurrent balance queries should be consistent"
 		);
 
@@ -1346,7 +1352,7 @@ fn test_concurrent_receive_operations() {
 			10,
 			"wallet balance to update",
 			|| async {
-				let balance = wallet.get_balance().await.available_balance;
+				let balance = wallet.get_balance().await.unwrap().available_balance;
 				balance >= amount.saturating_add(amount)
 			},
 		)
@@ -1374,7 +1380,7 @@ fn test_balance_consistency_under_load() {
 		third_party.bolt11_payment().send(&uri.invoice, None).unwrap();
 
 		test_utils::wait_for_condition(Duration::from_secs(1), 10, "initial balance", || async {
-			wallet.get_balance().await.available_balance >= initial_amount
+			wallet.get_balance().await.unwrap().available_balance >= initial_amount
 		})
 		.await
 		.expect("Initial balance not received");
@@ -1394,14 +1400,16 @@ fn test_balance_consistency_under_load() {
 
 		// All queries should succeed
 		assert_eq!(balances.len(), 20);
-		for balance in &balances {
+		for b in &balances {
+			let balance = b.as_ref().unwrap();
 			assert!(balance.available_balance >= Amount::ZERO);
 			assert!(balance.pending_balance >= Amount::ZERO);
 		}
 
 		// All balances should be consistent (same values)
-		let first_balance = &balances[0];
-		for balance in &balances[1..] {
+		let first_balance = &balances[0].as_ref().unwrap();
+		for b in &balances[1..] {
+			let balance = b.as_ref().unwrap();
 			assert_eq!(
 				balance.available_balance, first_balance.available_balance,
 				"Concurrent balance queries should return consistent results"

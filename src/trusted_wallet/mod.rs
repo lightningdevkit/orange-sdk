@@ -11,7 +11,7 @@ use ldk_node::lightning_invoice::Bolt11Invoice;
 use bitcoin_payment_instructions::PaymentMethod;
 use bitcoin_payment_instructions::amount::Amount;
 
-use spark_rust::error::SparkSdkError;
+use spark_wallet::SparkWalletError;
 
 use std::fmt;
 use std::future::Future;
@@ -49,7 +49,7 @@ impl FromStr for TrustedPaymentId {
 }
 
 // todo generic error type
-pub(crate) type Error = SparkSdkError;
+pub(crate) type Error = SparkWalletError;
 
 /// Represents a payment with its associated details.
 ///
@@ -81,7 +81,7 @@ pub trait TrustedWalletInterface: Sized + Send + Sync + private::Sealed {
 	) -> impl Future<Output = Result<Self, InitFailure>> + Send;
 
 	/// Returns the current balance of the wallet.
-	fn get_balance(&self) -> Amount;
+	fn get_balance(&self) -> impl Future<Output = Result<Amount, Error>> + Send;
 
 	/// Generates a new reusable address for receiving payments.
 	/// Generally, this should be a BOLT 12 offer.
@@ -118,7 +118,7 @@ mod private {
 	pub trait Sealed {}
 
 	// Only implement Sealed for types you want to allow
-	impl Sealed for super::spark::SparkWallet {}
+	impl Sealed for super::spark::Spark {}
 	#[cfg(feature = "_test-utils")]
 	impl Sealed for super::dummy::DummyTrustedWallet {}
 }

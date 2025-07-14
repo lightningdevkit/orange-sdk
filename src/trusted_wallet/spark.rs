@@ -3,7 +3,6 @@ use crate::logging::Logger;
 use crate::trusted_wallet::{Error, Payment, TrustedPaymentId, TrustedWalletInterface};
 use crate::{InitFailure, Seed, TxStatus, WalletConfig};
 
-use ldk_node::bitcoin::Network;
 use ldk_node::bitcoin::hashes::Hash;
 use ldk_node::bitcoin::hashes::sha256::Hash as Sha256;
 use ldk_node::lightning::log_debug;
@@ -13,64 +12,59 @@ use ldk_node::lightning_invoice::Bolt11Invoice;
 use bitcoin_payment_instructions::PaymentMethod;
 use bitcoin_payment_instructions::amount::Amount;
 
-use spark_protos::spark::TransferStatus;
-use spark_rust::signer::default_signer::DefaultSigner;
-use spark_rust::signer::traits::SparkSigner;
-use spark_rust::{SparkNetwork, SparkSdk};
+use spark::services::TransferStatus;
+use spark_wallet::{DefaultSigner, SparkWallet, SparkWalletConfig};
 
 use std::future::Future;
+use std::str::FromStr;
 use std::sync::Arc;
 
-/// A wallet implementation using the Spark SDK.
-pub struct SparkWallet {
-	spark_wallet: Arc<SparkSdk>,
+/// A wallet implementation using the Breez Spark SDK.
+pub struct Spark {
+	spark_wallet: Arc<SparkWallet<DefaultSigner>>,
 	logger: Arc<Logger>,
 }
 
-impl TrustedWalletInterface for SparkWallet {
-	type ExtraConfig = ();
+impl TrustedWalletInterface for Spark {
+	type ExtraConfig = SparkWalletConfig;
 
 	fn init(
-		config: &WalletConfig<()>, logger: Arc<Logger>,
+		config: &WalletConfig<SparkWalletConfig>, logger: Arc<Logger>,
 	) -> impl Future<Output = Result<Self, InitFailure>> + Send {
 		async move {
-			let net = match config.network {
-				Network::Bitcoin => SparkNetwork::Mainnet,
-				Network::Regtest => SparkNetwork::Regtest,
-				_ => Err(Error::General("Unsupported network".to_owned()))?,
-			};
+			if config.network != config.extra_config.network.into() {
+				Err(Error::InvalidNetwork)?
+			}
 
 			let signer = match &config.seed {
 				Seed::Seed64(bytes) => {
 					// hash the seed to make sure it does not conflict with the lightning keys
 					let seed = Sha256::hash(bytes);
-					DefaultSigner::from_master_seed(&seed[..], net).await?
+					DefaultSigner::new(&seed[..], config.extra_config.network)
+						.expect("todo real error")
 				},
 				Seed::Mnemonic { mnemonic, passphrase } => {
 					// We don't hash the seed here, as mnemonics are meant to be easily recoverable
 					// and if we hashed them, then you could not recover your spark coins from the mnemonic
 					// in separate wallets.
 					let seed = mnemonic.to_seed(passphrase.as_deref().unwrap_or(""));
-					DefaultSigner::from_master_seed(&seed[..], net).await?
+					DefaultSigner::new(&seed[..], config.extra_config.network)
+						.expect("todo real error")
 				},
 			};
 
-			let spark_wallet = Arc::new(SparkSdk::new(net, signer).await?);
+			let spark_wallet =
+				Arc::new(SparkWallet::new(config.extra_config.clone(), signer).await?);
 
-			/*let spark_ref = Arc::clone(&spark_wallet);
-			tokio::spawn(async move {
-				loop {
-					let _ = spark_ref.sync_wallet().await;
-					tokio::time::sleep(Duration::from_secs(30)).await;
-				}
-			});*/
-
-			Ok(SparkWallet { spark_wallet, logger })
+			Ok(Spark { spark_wallet, logger })
 		}
 	}
 
-	fn get_balance(&self) -> Amount {
-		Amount::from_sats(self.spark_wallet.get_bitcoin_balance()).expect("get_balance failed")
+	fn get_balance(&self) -> impl Future<Output = Result<Amount, Error>> + Send {
+		async move {
+			let bal = self.spark_wallet.get_balance().await.unwrap();
+			Ok(Amount::from_sats(bal).expect("get_balance failed"))
+		}
 	}
 
 	fn get_reusable_receive_uri(&self) -> impl Future<Output = Result<String, Error>> + Send {
@@ -82,27 +76,27 @@ impl TrustedWalletInterface for SparkWallet {
 	) -> impl Future<Output = Result<Bolt11Invoice, Error>> + Send {
 		async move {
 			// TODO: get upstream to let us be amount-less
-			self.spark_wallet
-				.create_lightning_invoice(
-					amount.unwrap_or(Amount::ZERO).sats_rounding_up(),
-					None,
-					None,
-				)
-				.await
+			let res = self
+				.spark_wallet
+				.create_lightning_invoice(amount.unwrap_or(Amount::ZERO).sats_rounding_up(), None)
+				.await?;
+
+			Bolt11Invoice::from_str(&res.invoice)
+				.map_err(|e| Error::Generic(format!("Failed to parse invoice: {e}")))
 		}
 	}
 
 	fn list_payments(&self) -> impl Future<Output = Result<Vec<Payment>, Error>> + Send {
 		async move {
-			let our_pk = self.spark_wallet.get_spark_address()?;
-			let transfers = self.spark_wallet.get_all_transfers(None, None).await?.transfers;
+			let our_pk = self.spark_wallet.get_spark_address().await?;
+			let transfers = self.spark_wallet.list_transfers().await?;
 			let mut res = Vec::with_capacity(transfers.len());
 			for transfer in transfers {
 				res.push(Payment {
 					status: transfer.status.into(),
-					id: TrustedPaymentId(transfer.id),
-					amount: Amount::from_sats(transfer.total_value_sats).expect("invalid amount"),
-					outbound: transfer.sender_identity_public_key == our_pk,
+					id: TrustedPaymentId(uuid::Uuid::from_bytes(transfer.id.to_bytes())),
+					amount: Amount::from_sats(transfer.total_value_sat).expect("invalid amount"),
+					outbound: transfer.sender_id == our_pk.identity_public_key,
 					fee: Amount::ZERO, // Currently everything is free
 				});
 			}
@@ -117,11 +111,11 @@ impl TrustedWalletInterface for SparkWallet {
 			if let PaymentMethod::LightningBolt11(invoice) = method {
 				// todo doesn't handle amountless invoices
 				self.spark_wallet
-					.get_lightning_send_fee_estimate(invoice.to_string())
+					.fetch_lightning_send_fee_estimate(&invoice.to_string())
 					.await
-					.map(|fees| Amount::from_sats(fees.fees).expect("invalid amount"))
+					.map(|fees| Amount::from_sats(fees).expect("invalid amount"))
 			} else {
-				Err(Error::General("Only BOLT 11 is currently supported".to_owned()))
+				Err(Error::Generic("Only BOLT 11 is currently supported".to_owned()))
 			}
 		}
 	}
@@ -133,19 +127,19 @@ impl TrustedWalletInterface for SparkWallet {
 	) -> impl Future<Output = Result<TrustedPaymentId, Error>> + Send {
 		async move {
 			if let PaymentMethod::LightningBolt11(invoice) = method {
-				Ok(TrustedPaymentId(
-					self.spark_wallet.pay_lightning_invoice(&invoice.to_string()).await?,
-				))
+				let res =
+					self.spark_wallet.pay_lightning_invoice(&invoice.to_string(), None).await?;
+				Ok(TrustedPaymentId(uuid::Uuid::from_str(res.id.as_str()).expect("invalid id")))
 			} else {
-				Err(Error::General("Only BOLT 11 is currently supported".to_owned()))
+				Err(Error::Generic("Only BOLT 11 is currently supported".to_owned()))
 			}
 		}
 	}
 
 	fn sync(&self) -> impl Future<Output = ()> + Send {
 		async move {
-			log_debug!(&self.logger, "SparkWallet syncing...");
-			let _ = self.spark_wallet.sync_wallet().await;
+			log_debug!(&self.logger, "Spark syncing...");
+			let _ = self.spark_wallet.sync().await;
 		}
 	}
 }
@@ -154,13 +148,16 @@ impl From<TransferStatus> for TxStatus {
 	fn from(o: TransferStatus) -> TxStatus {
 		match o {
 			TransferStatus::SenderInitiated
+			| TransferStatus::SenderInitiatedCoordinator
 			| TransferStatus::SenderKeyTweakPending
 			| TransferStatus::SenderKeyTweaked
+			| TransferStatus::ReceiverKeyTweakLocked
+			| TransferStatus::ReceiverKeyTweakApplied
 			| TransferStatus::ReceiverKeyTweaked => TxStatus::Pending,
 			TransferStatus::Completed => TxStatus::Completed,
 			TransferStatus::Expired
 			| TransferStatus::Returned
-			| TransferStatus::TransferStatusrReceiverRefundSigned => TxStatus::Failed,
+			| TransferStatus::ReceiverRefundSigned => TxStatus::Failed,
 		}
 	}
 }

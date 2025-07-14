@@ -204,7 +204,7 @@ pub fn build_test_nodes() -> TestParams {
 
 	let rt = Arc::new(tokio::runtime::Builder::new_multi_thread().enable_all().build().unwrap());
 
-	let test_id = Uuid::new_v4();
+	let test_id = Uuid::now_v7();
 
 	let lsp = create_lsp(Arc::clone(&rt), test_id, &bitcoind);
 	fund_node(&lsp, &bitcoind);
@@ -269,7 +269,7 @@ pub fn build_test_nodes() -> TestParams {
 pub async fn open_channel_from_lsp(
 	wallet: &Wallet<DummyTrustedWallet>, payer: Arc<Node>,
 ) -> Amount {
-	let starting_bal = wallet.get_balance().await;
+	let starting_bal = wallet.get_balance().await.unwrap();
 
 	// recv 2x the trusted balance limit to trigger a lightning channel
 	let limit = wallet.get_tunables();
@@ -292,7 +292,9 @@ pub async fn open_channel_from_lsp(
 		Duration::from_secs(1),
 		10,
 		"wallet balance update after channel open",
-		|| async { wallet.get_balance().await.available_balance > starting_bal.available_balance },
+		|| async {
+			wallet.get_balance().await.unwrap().available_balance > starting_bal.available_balance
+		},
 	)
 	.await
 	.expect("Wallet balance did not update in time after channel open");

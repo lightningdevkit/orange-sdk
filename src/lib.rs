@@ -457,7 +457,7 @@ where
 						}
 					}
 
-					if rebalance_enabled && Self::get_rebalance_amt(&inner_ref).is_some() {
+					if rebalance_enabled && Self::get_rebalance_amt(&inner_ref).await.is_some() {
 						new_txn.sort_unstable();
 						let victim_id = new_txn.first().map(|(_, id)| *id).unwrap_or_else(|| {
 							// Should only happen due to races settling balance, pick the latest.
@@ -591,13 +591,13 @@ where
 		self.inner.ln_wallet.is_connected_to_lsp()
 	}
 
-	fn get_rebalance_amt(inner: &Arc<WalletImpl<T>>) -> Option<Amount> {
+	async fn get_rebalance_amt(inner: &Arc<WalletImpl<T>>) -> Option<Amount> {
 		// We always assume lighting balance is an overestimate by `rebalance_min`.
 		let lightning_receivable = inner
 			.ln_wallet
 			.estimate_receivable_balance()
 			.saturating_sub(inner.tunables.rebalance_min);
-		let trusted_balance = inner.trusted.get_balance();
+		let trusted_balance = inner.trusted.get_balance().await.ok()?;
 		let mut transfer_amt = cmp::min(lightning_receivable, trusted_balance);
 		if trusted_balance.saturating_sub(transfer_amt) > inner.tunables.trusted_balance_limit {
 			// We need to just get a new channel, there's too much that we need to get to lightning
@@ -616,7 +616,7 @@ where
 			triggering_transaction_id
 		);
 
-		if let Some(transfer_amt) = Self::get_rebalance_amt(inner) {
+		if let Some(transfer_amt) = Self::get_rebalance_amt(inner).await {
 			if let Ok(inv) = inner.ln_wallet.get_bolt11_invoice(Some(transfer_amt)).await {
 				log_debug!(
 					inner.logger,
@@ -991,8 +991,8 @@ where
 	}
 
 	/// Gets our current total balance
-	pub async fn get_balance(&self) -> Balances {
-		let trusted_balance = self.inner.trusted.get_balance();
+	pub async fn get_balance(&self) -> Result<Balances, WalletError> {
+		let trusted_balance = self.inner.trusted.get_balance().await?;
 		let ln_balance = self.inner.ln_wallet.get_balance();
 		log_debug!(
 			self.inner.logger,
@@ -1000,10 +1000,10 @@ where
 			ln_balance.lightning,
 			ln_balance.onchain
 		);
-		Balances {
+		Ok(Balances {
 			available_balance: ln_balance.lightning.saturating_add(trusted_balance),
 			pending_balance: ln_balance.onchain,
-		}
+		})
 	}
 
 	/// Fetches a unique reusable BIP 321 bitcoin: URI.
@@ -1121,7 +1121,7 @@ where
 	/// Returns true once the payment is pending, however, this does not mean that the
 	/// payment has been completed. The payment may still fail.
 	pub async fn pay(&self, instructions: &PaymentInfo) -> Result<(), WalletError> {
-		let trusted_balance = self.inner.trusted.get_balance();
+		let trusted_balance = self.inner.trusted.get_balance().await?;
 		let ln_balance = self.inner.ln_wallet.get_balance();
 
 		let mut last_trusted_err = None;

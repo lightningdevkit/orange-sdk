@@ -327,7 +327,7 @@ mod tests {
 		let parsed_ln_id = PaymentId::from_str(&ln_id_str).unwrap();
 		assert_eq!(ln_id, parsed_ln_id);
 
-		let trusted_uuid = uuid::Uuid::new_v4();
+		let trusted_uuid = uuid::Uuid::now_v7();
 		let trusted_id = PaymentId::Trusted(TrustedPaymentId(trusted_uuid));
 		let trusted_id_str = trusted_id.to_string();
 		assert_eq!(trusted_id_str, format!("TR-{trusted_uuid}"));

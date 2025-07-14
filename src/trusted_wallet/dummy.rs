@@ -181,9 +181,11 @@ impl TrustedWalletInterface for DummyTrustedWallet {
 		}
 	}
 
-	fn get_balance(&self) -> Amount {
-		let msats = self.current_bal_msats.load(Ordering::SeqCst);
-		Amount::from_milli_sats(msats).expect("valid msats")
+	fn get_balance(&self) -> impl Future<Output = Result<Amount, Error>> + Send {
+		async move {
+			let msats = self.current_bal_msats.load(Ordering::SeqCst);
+			Ok(Amount::from_milli_sats(msats).expect("valid msats"))
+		}
 	}
 
 	fn get_reusable_receive_uri(&self) -> impl Future<Output = Result<String, Error>> + Send {

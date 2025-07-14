@@ -11,8 +11,10 @@ ldk-node = { git = "https://github.com/benthecarman/ldk-node.git", branch = "on-
 bitcoin-payment-instructions = { version = "0.4.0", features = ["http"] }
 chrono = { version = "0.4", default-features = false }
 rand = "0.8.5"
-spark-rust = { version = "0.1.11" }
-spark-protos = { version = "=0.1.9", default-features = false }
+#spark-rust = { version = "0.1.11" }
+#spark-protos = { version = "=0.1.9", default-features = false }
+spark = { path = "../rust-spark/crates/spark" }
+spark-wallet = { path = "../rust-spark/crates/spark-wallet" }
 tokio = { version = "1.0", default-features = false, features = ["rt-multi-thread", "sync"] }
 uuid = { version = "1.0", default-features = false }
 
