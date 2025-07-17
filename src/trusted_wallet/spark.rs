@@ -12,8 +12,9 @@ use ldk_node::lightning_invoice::Bolt11Invoice;
 use bitcoin_payment_instructions::PaymentMethod;
 use bitcoin_payment_instructions::amount::Amount;
 
-use spark::services::TransferStatus;
-use spark_wallet::{DefaultSigner, SparkWallet, SparkWalletConfig};
+use spark_wallet::{
+	DefaultSigner, PayLightningInvoiceResult, SparkWallet, SparkWalletConfig, TransferStatus,
+};
 
 use std::future::Future;
 use std::str::FromStr;
@@ -105,13 +106,15 @@ impl TrustedWalletInterface for Spark {
 	}
 
 	fn estimate_fee(
-		&self, method: &PaymentMethod, _amount: Amount,
+		&self, method: &PaymentMethod, amount: Amount,
 	) -> impl Future<Output = Result<Amount, Error>> + Send {
 		async move {
 			if let PaymentMethod::LightningBolt11(invoice) = method {
-				// todo doesn't handle amountless invoices
 				self.spark_wallet
-					.fetch_lightning_send_fee_estimate(&invoice.to_string())
+					.fetch_lightning_send_fee_estimate(
+						&invoice.to_string(),
+						Some(amount.milli_sats()),
+					)
 					.await
 					.map(|fees| Amount::from_sats(fees).expect("invalid amount"))
 			} else {
@@ -121,15 +124,28 @@ impl TrustedWalletInterface for Spark {
 	}
 
 	fn pay(
-		&self,
-		method: &PaymentMethod,
-		_amount: Amount, // todo account for amountless invoices
+		&self, method: &PaymentMethod, amount: Amount,
 	) -> impl Future<Output = Result<TrustedPaymentId, Error>> + Send {
 		async move {
 			if let PaymentMethod::LightningBolt11(invoice) = method {
-				let res =
-					self.spark_wallet.pay_lightning_invoice(&invoice.to_string(), None).await?;
-				Ok(TrustedPaymentId(uuid::Uuid::from_str(res.id.as_str()).expect("invalid id")))
+				let res = self
+					.spark_wallet
+					.pay_lightning_invoice(
+						&invoice.to_string(),
+						Some(amount.milli_sats()),
+						None,
+						true, // prefer spark to make things cheaper
+					)
+					.await?;
+
+				match res {
+					PayLightningInvoiceResult::LightningPayment(pay) => Ok(TrustedPaymentId(
+						uuid::Uuid::from_str(pay.id.as_str()).expect("invalid id"),
+					)),
+					PayLightningInvoiceResult::Transfer(transfer) => Ok(TrustedPaymentId(
+						uuid::Uuid::from_str(transfer.id.to_string().as_str()).expect("invalid id"),
+					)),
+				}
 			} else {
 				Err(Error::Generic("Only BOLT 11 is currently supported".to_owned()))
 			}
