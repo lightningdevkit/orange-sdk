@@ -55,7 +55,7 @@ impl TrustedWalletInterface for Spark {
 			};
 
 			let spark_wallet =
-				Arc::new(SparkWallet::new(config.extra_config.clone(), signer).await?);
+				Arc::new(SparkWallet::connect(config.extra_config.clone(), signer).await?);
 
 			Ok(Spark { spark_wallet, logger })
 		}
