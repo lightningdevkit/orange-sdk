@@ -7,7 +7,7 @@ edition = "2024"
 _test-utils = ["corepc-node"]
 
 [dependencies]
-ldk-node = { git = "https://github.com/benthecarman/ldk-node.git", branch = "on-chain-fee-estimation" }
+ldk-node = { git = "https://github.com/benthecarman/ldk-node.git", branch = "esplora-auth" }
 bitcoin-payment-instructions = { version = "0.4.0", features = ["http"] }
 chrono = { version = "0.4", default-features = false }
 rand = "0.8.5"
