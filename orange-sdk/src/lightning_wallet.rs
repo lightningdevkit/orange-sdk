@@ -1,6 +1,7 @@
 use crate::event::{EventHandler, EventQueue};
 use crate::logging::Logger;
 use crate::{ChainSource, InitFailure, PaymentType, Seed, TxStatus, WalletConfig};
+use std::collections::HashMap;
 use std::fmt::Debug;
 
 use bitcoin_payment_instructions::PaymentMethod;
@@ -15,6 +16,8 @@ use ldk_node::lightning_invoice::{Bolt11Invoice, Bolt11InvoiceDescription, Descr
 use ldk_node::payment::{PaymentDetails, PaymentDirection, PaymentKind, PaymentStatus};
 use ldk_node::{NodeError, UserChannelId};
 
+use ldk_node::bitcoin::base64::Engine;
+use ldk_node::bitcoin::base64::prelude::BASE64_STANDARD;
 use ldk_node::bitcoin::secp256k1::PublicKey;
 use ldk_node::lightning::ln::msgs::SocketAddress;
 use std::sync::Arc;
@@ -130,7 +133,23 @@ impl LightningWallet {
 		let (lsp_socket_addr, lsp_node_id, lsp_token) = config.lsp;
 		builder.set_liquidity_source_lsps2(lsp_node_id, lsp_socket_addr.clone(), lsp_token);
 		match config.chain_source {
-			ChainSource::Esplora(url) => builder.set_chain_source_esplora(url, None),
+			ChainSource::Esplora { url, username, password } => match (&username, &password) {
+				(Some(username), Some(password)) => {
+					let mut headers = HashMap::with_capacity(1);
+					headers.insert(
+						"Authorization".to_string(),
+						format!(
+							"Basic {}",
+							BASE64_STANDARD.encode(format!("{}:{}", username, password))
+						),
+					);
+					builder.set_chain_source_esplora_with_headers(url, headers, None)
+				},
+				(None, None) => builder.set_chain_source_esplora(url, None),
+				_ => {
+					return Err(InitFailure::LdkNodeStartFailure(NodeError::WalletOperationFailed));
+				},
+			},
 			ChainSource::Electrum(url) => builder.set_chain_source_electrum(url, None),
 			ChainSource::BitcoindRPC { host, port, user, password } => {
 				builder.set_chain_source_bitcoind_rpc(host, port, user, password)

@@ -21,7 +21,6 @@ use bitcoin_payment_instructions::{
 pub use bitcoin_payment_instructions::PaymentMethod;
 use bitcoin_payment_instructions::amount::Amount;
 
-use ldk_node::bip39::Mnemonic;
 use ldk_node::bitcoin::hashes::Hash;
 use ldk_node::bitcoin::io;
 use ldk_node::bitcoin::secp256k1::PublicKey;
@@ -33,7 +32,8 @@ use ldk_node::lightning::util::persist::KVStore;
 use ldk_node::lightning::{log_debug, log_error, log_info, log_warn};
 use ldk_node::lightning_invoice::Bolt11Invoice;
 use ldk_node::payment::{PaymentDirection, PaymentKind, PaymentStatus};
-use ldk_node::{BuildError, NodeError, bitcoin};
+use ldk_node::{BuildError, NodeError};
+use store::{PaymentId, TxMetadata, TxMetadataStore, TxType};
 
 use tokio::runtime::Runtime;
 
@@ -56,9 +56,12 @@ use trusted_wallet::Error as TrustedError;
 use trusted_wallet::TrustedWalletInterface;
 
 use crate::event::EventHandler;
+pub use bitcoin_payment_instructions;
 pub use event::Event;
+pub use ldk_node::bip39::Mnemonic;
+pub use ldk_node::bitcoin;
 pub use ldk_node::payment::ConfirmationStatus;
-use store::{PaymentId, TxMetadata, TxMetadataStore, TxType};
+pub use spark_wallet::SparkWalletConfig;
 pub use store::{PaymentType, Transaction, TxStatus};
 
 /// Represents the balances of the wallet, including available and pending balances.
@@ -150,7 +153,14 @@ pub enum ChainSource {
 	/// Electrum server configuration.
 	Electrum(String),
 	/// Esplora server configuration.
-	Esplora(String),
+	Esplora {
+		/// Esplora url
+		url: String,
+		/// Optional for Basic authentication for the Esplora server.
+		username: Option<String>,
+		/// Optional for Basic authentication for the Esplora server.
+		password: Option<String>,
+	},
 	/// Bitcoind RPC configuration.
 	BitcoindRPC {
 		/// The host of the Bitcoind rpc server (e.g. 127.0.0.1).

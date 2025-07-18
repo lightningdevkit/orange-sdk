@@ -1,0 +1,19 @@
+[package]
+name = "orange-cli"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "orange-cli"
+path = "src/main.rs"
+
+[dependencies]
+orange-sdk = { path = "../../orange-sdk" }
+spark = { path = "../../../rust-spark/crates/spark" } # proper re-exports fixes this
+tokio = { version = "1.0", features = ["full"] }
+clap = { version = "4.0", features = ["derive"] }
+anyhow = "1.0"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+rustyline = "14.0"
+colored = "2.0"
