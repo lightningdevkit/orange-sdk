@@ -73,10 +73,10 @@ impl WalletState {
 		let seed = Seed::Mnemonic { mnemonic, passphrase: None };
 
 		// Hardcoded LSP config for demo
-		let lsp_address = "185.150.162.100:3552"
+		let lsp_address = "185.150.162.100:3551"
 			.parse()
 			.map_err(|_| anyhow::anyhow!("Failed to parse LSP address"))?;
-		let lsp_pubkey = "034200de55aeb3126b3b7a2cc7489b88496e9a84347196f563fdba29f79a6f8084"
+		let lsp_pubkey = "02a88abd44b3cfc9c0eb7cd93f232dc473de4f66bcea0ee518be70c3b804c90201"
 			.parse()
 			.context("Failed to parse LSP public key")?;
 
@@ -88,20 +88,20 @@ impl WalletState {
 				{
 					"id": 0,
 					"identifier": "0000000000000000000000000000000000000000000000000000000000000001",
-					"address": "https://0.spark.loadtest.dev.sparkinfra.net/",
-					"identity_public_key": "03d8d2d331e07f572636dfd371a30dfa139a8bdc99ea98f1f48e27dcc664589ecc"
+					"address": "https://0.spark.lightspark.com",
+					"identity_public_key": "03dfbdff4b6332c220f8fa2ba8ed496c698ceada563fa01b67d9983bfc5c95e763"
 				},
 				{
 					"id": 1,
 					"identifier": "0000000000000000000000000000000000000000000000000000000000000002",
-					"address": "https://1.spark.loadtest.dev.sparkinfra.net/",
-					"identity_public_key": "023b1f3e062137ffc541a8edeaab7a4648aafa506d0208956123507d66d3886ac6"
+					"address": "https://1.spark.lightspark.com",
+					"identity_public_key": "03e625e9768651c9be268e287245cc33f96a68ce9141b0b4769205db027ee8ed77"
 				},
 				{
 					"id": 2,
 					"identifier": "0000000000000000000000000000000000000000000000000000000000000003",
-					"address": "https://2.spark.loadtest.dev.sparkinfra.net/",
-					"identity_public_key": "02a2c62aa3230d9a51759b3d67399f57223455656369d28120fb39ef062b4469c8"
+					"address": "https://2.spark.flashnet.xyz",
+					"identity_public_key": "022eda13465a59205413086130a65dc0ed1b8f8e51937043161f8be0c369b1a410"
 				}
 			]
 		}"#;
@@ -111,7 +111,7 @@ impl WalletState {
 			storage_config: StorageConfig::LocalSQLite(storage_path.to_string()),
 			log_file: PathBuf::from(format!("{}/wallet.log", storage_path)),
 			chain_source: ChainSource::Esplora {
-				url: "https://regtest-mempool.loadtest.dev.sparkinfra.net/api".to_string(),
+				url: "https://regtest-mempool.us-west-2.sparkinfra.net/api".to_string(),
 				username: Some("spark-sdk".to_string()),
 				password: Some("mCMk1JqlBNtetUNy".to_string()),
 			},
@@ -124,10 +124,10 @@ impl WalletState {
 				operator_pool,
 				reconnect_interval_seconds: 1,
 				service_provider_config: ServiceProviderConfig {
-					base_url: "https://api.loadtest.dev.sparkinfra.net".to_string(),
+					base_url: "https://api.lightspark.com".to_string(),
 					schema_endpoint: Some("graphql/spark/rc".to_string()),
 					identity_public_key: bitcoin::secp256k1::PublicKey::from_str(
-						"03e23a4912c275d1ba8742cfdfc7e9befdc2243a74be2412b7b77d227643353a1f",
+						"022bf283544b16c0622daecb79422007d167eca6ce9f0c98c0c49833b1f7170bfe",
 					)?,
 				},
 				split_secret_threshold: 2,
