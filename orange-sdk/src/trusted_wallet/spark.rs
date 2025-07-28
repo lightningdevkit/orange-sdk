@@ -21,6 +21,7 @@ use std::str::FromStr;
 use std::sync::Arc;
 
 /// A wallet implementation using the Breez Spark SDK.
+#[derive(Clone)]
 pub struct Spark {
 	spark_wallet: Arc<SparkWallet<DefaultSigner>>,
 	logger: Arc<Logger>,

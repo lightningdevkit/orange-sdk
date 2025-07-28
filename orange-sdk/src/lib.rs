@@ -100,6 +100,7 @@ struct WalletImpl<T: TrustedWalletInterface> {
 // todo better doc, include examples, etc
 /// The primary entry point for orange-sdk. This is the main wallet struct that
 /// contains the trusted wallet and the lightning wallet.
+#[derive(Clone)]
 pub struct Wallet<T: TrustedWalletInterface> {
 	/// The internal wallet implementation.
 	inner: Arc<WalletImpl<T>>,

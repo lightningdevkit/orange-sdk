@@ -21,6 +21,7 @@ use uuid::Uuid;
 /// A dummy implementation of `TrustedWalletInterface` for testing purposes.
 /// This wallet uses a local LDK node to handle payments and simulates a custodial wallet
 /// by keeping track of the balance and payments in memory.
+#[derive(Clone)]
 pub struct DummyTrustedWallet {
 	current_bal_msats: Arc<AtomicU64>,
 	payments: Arc<RwLock<Vec<Payment>>>,

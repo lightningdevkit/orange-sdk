@@ -7,8 +7,8 @@ use rustyline::error::ReadlineError;
 use orange_sdk::bitcoin_payment_instructions::amount::Amount;
 use orange_sdk::trusted_wallet::spark::Spark;
 use orange_sdk::{
-	ChainSource, Mnemonic, PaymentInfo, Seed, SparkWalletConfig, StorageConfig, Tunables, Wallet,
-	WalletConfig, bitcoin, bitcoin::Network,
+	ChainSource, Event, Mnemonic, PaymentInfo, Seed, SparkWalletConfig, StorageConfig, Tunables,
+	Wallet, WalletConfig, bitcoin, bitcoin::Network,
 };
 use rand::RngCore;
 use spark::operator::OperatorPoolConfig;
@@ -47,8 +47,6 @@ enum Commands {
 	Status,
 	/// List recent transactions
 	Transactions,
-	/// Process wallet events
-	Events,
 	/// Clear the screen
 	Clear,
 	/// Exit the application
@@ -136,6 +134,64 @@ impl WalletState {
 				println!("{} Wallet initialized successfully!", "✅".bright_green());
 				println!("Network: {}", "regtest".bright_cyan());
 				println!("Storage: {}", storage_path.bright_cyan());
+
+				let w = wallet.clone();
+				runtime.spawn(async move {
+					let event = w.next_event_async().await;
+					match event {
+						Event::PaymentSuccessful { payment_id, .. } => {
+							println!("{} Payment successful: {}", "✅".bright_green(), payment_id);
+						},
+						Event::PaymentFailed { payment_id, .. } => {
+							println!("{} Payment failed: {}", "❌".bright_red(), payment_id);
+						},
+						Event::PaymentReceived { payment_id, amount_msat, .. } => {
+							println!(
+								"{} Payment received: {} ({} msat)",
+								"📥".bright_green(),
+								payment_id,
+								amount_msat
+							);
+						},
+						Event::OnchainPaymentReceived { txid, amount_sat, .. } => {
+							println!(
+								"{} On-chain payment received: {} ({} sats)",
+								"📥".bright_green(),
+								txid,
+								amount_sat
+							);
+						},
+						Event::ChannelOpened { .. } => {
+							println!("{} Channel opened", "🔓".bright_green());
+						},
+						Event::ChannelClosed { reason, .. } => {
+							println!(
+								"{} Channel closed: {}",
+								"🔒".bright_red(),
+								reason
+									.map(|r| r.to_string())
+									.unwrap_or_else(|| "Unknown reason".to_string())
+							);
+						},
+						Event::RebalanceInitiated { amount_msat, .. } => {
+							println!(
+								"{} Rebalance initiated: {} msat",
+								"🔄".bright_yellow(),
+								amount_msat
+							);
+						},
+						Event::RebalanceSuccessful { amount_msat, fee_msat, .. } => {
+							println!(
+								"{} Rebalance successful: {} msat (fee: {} msat)",
+								"✅".bright_green(),
+								amount_msat,
+								fee_msat
+							);
+						},
+					}
+
+					w.event_handled().unwrap();
+				});
 
 				Ok(WalletState { wallet, _runtime: runtime })
 			},
@@ -249,7 +305,6 @@ fn parse_command(input: &str) -> Result<Commands> {
 		},
 		"status" => Ok(Commands::Status),
 		"transactions" | "tx" => Ok(Commands::Transactions),
-		"events" => Ok(Commands::Events),
 		"clear" | "cls" => Ok(Commands::Clear),
 		"exit" | "quit" => Ok(Commands::Exit),
 		"help" => {
@@ -271,9 +326,12 @@ async fn execute_command(command: Commands, state: &mut WalletState) -> Result<(
 				Ok(balance) => {
 					println!(
 						"Available balance: {} sats",
-						format_amount(balance.available_balance)
+						balance.available_balance.sats().unwrap_or(0)
 					);
-					println!("Pending balance: {} sats", format_amount(balance.pending_balance));
+					println!(
+						"Pending balance: {} sats",
+						balance.pending_balance.sats().unwrap_or(0)
+					);
 				},
 				Err(e) => {
 					return Err(anyhow::anyhow!("Failed to get balance: {:?}", e));
@@ -295,7 +353,6 @@ async fn execute_command(command: Commands, state: &mut WalletState) -> Result<(
 					Ok(payment_info) => match wallet.pay(&payment_info).await {
 						Ok(()) => {
 							println!("{} Payment initiated successfully!", "✅".bright_green());
-							println!("{} Check events for payment status", "💡".bright_yellow());
 						},
 						Err(e) => {
 							return Err(anyhow::anyhow!("Failed to send payment: {:?}", e));
@@ -326,7 +383,7 @@ async fn execute_command(command: Commands, state: &mut WalletState) -> Result<(
 				Ok(uri) => {
 					match amount {
 						Some(amt) => {
-							println!("Invoice for {} sats:", format_amount(amt));
+							println!("Invoice for {} sats:", amt.sats().unwrap_or(0));
 						},
 						None => {
 							println!("Invoice for any amount:");
@@ -366,12 +423,12 @@ async fn execute_command(command: Commands, state: &mut WalletState) -> Result<(
 			println!("Tunables:");
 			println!(
 				"  Trusted balance limit: {} sats",
-				format_amount(tunables.trusted_balance_limit)
+				tunables.trusted_balance_limit.sats().unwrap_or(0)
 			);
-			println!("  Rebalance minimum: {} sats", format_amount(tunables.rebalance_min));
+			println!("  Rebalance minimum: {} sats", tunables.rebalance_min.sats().unwrap_or(0));
 			println!(
 				"  On-chain receive threshold: {} sats",
-				format_amount(tunables.onchain_receive_threshold)
+				tunables.onchain_receive_threshold.sats().unwrap_or(0)
 			);
 		},
 		Commands::Transactions => {
@@ -400,7 +457,7 @@ async fn execute_command(command: Commands, state: &mut WalletState) -> Result<(
 								direction_icon,
 								format!("{:?}", tx.payment_type).bright_cyan(),
 								tx.amount
-									.map(|a| format_amount(a))
+									.map(|a| a.sats().unwrap_or(0).to_string())
 									.unwrap_or_else(|| "?".to_string())
 									.bright_green()
 							);
@@ -410,30 +467,6 @@ async fn execute_command(command: Commands, state: &mut WalletState) -> Result<(
 				Err(e) => {
 					return Err(anyhow::anyhow!("Failed to list transactions: {:?}", e));
 				},
-			}
-		},
-		Commands::Events => {
-			let wallet = state.wallet();
-
-			println!("{} Processing events...", "🔔".bright_yellow());
-
-			let mut event_count = 0;
-			while let Some(event) = wallet.next_event() {
-				event_count += 1;
-				println!("{} Event {}: {:?}", "📧".bright_blue(), event_count, event);
-
-				match wallet.event_handled() {
-					Ok(()) => {},
-					Err(_) => {
-						println!("{} Failed to mark event as handled", "⚠️".bright_yellow());
-					},
-				}
-			}
-
-			if event_count == 0 {
-				println!("No pending events.");
-			} else {
-				println!("Processed {} events.", event_count);
 			}
 		},
 		Commands::Clear => {
@@ -448,10 +481,6 @@ async fn execute_command(command: Commands, state: &mut WalletState) -> Result<(
 		},
 	}
 	Ok(())
-}
-
-fn format_amount(amount: Amount) -> String {
-	amount.sats().map(|s| s.to_string()).unwrap_or_else(|_| "?".to_string())
 }
 
 fn print_help() {
