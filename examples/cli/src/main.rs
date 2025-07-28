@@ -109,12 +109,8 @@ impl WalletState {
 
 		let config = WalletConfig {
 			storage_config: StorageConfig::LocalSQLite(storage_path.to_string()),
-			log_file: PathBuf::from(format!("{}/wallet.log", storage_path)),
-			chain_source: ChainSource::Esplora {
-				url: "https://regtest-mempool.us-west-2.sparkinfra.net/api".to_string(),
-				username: Some("spark-sdk".to_string()),
-				password: Some("mCMk1JqlBNtetUNy".to_string()),
-			},
+			log_file: PathBuf::from(format!("{storage_path}/wallet.log")),
+			chain_source: ChainSource::Electrum("tcp://spark-regtest.benthecarman.com:50001".to_string()),
 			lsp: (lsp_address, lsp_pubkey, None),
 			network,
 			seed,
