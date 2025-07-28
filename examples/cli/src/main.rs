@@ -10,8 +10,10 @@ use orange_sdk::{
 	ChainSource, Mnemonic, PaymentInfo, Seed, SparkWalletConfig, StorageConfig, Tunables, Wallet,
 	WalletConfig, bitcoin, bitcoin::Network,
 };
+use rand::RngCore;
 use spark::operator::OperatorPoolConfig;
 use spark::ssp::ServiceProviderConfig;
+use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::str::FromStr;
@@ -64,13 +66,8 @@ impl WalletState {
 		let network = Network::Regtest;
 		let storage_path = "./wallet_data";
 
-		// Use a test mnemonic for demo
-		let mnemonic = Mnemonic::from_str(
-			"abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about",
-		)
-		.context("Failed to parse mnemonic")?;
-		println!("{} Using test seed: {}", "🔑".bright_yellow(), mnemonic);
-		let seed = Seed::Mnemonic { mnemonic, passphrase: None };
+		// Generate or load seed
+		let seed = generate_or_load_seed(storage_path)?;
 
 		// Hardcoded LSP config for demo
 		let lsp_address = "185.150.162.100:3551"
@@ -110,7 +107,9 @@ impl WalletState {
 		let config = WalletConfig {
 			storage_config: StorageConfig::LocalSQLite(storage_path.to_string()),
 			log_file: PathBuf::from(format!("{storage_path}/wallet.log")),
-			chain_source: ChainSource::Electrum("tcp://spark-regtest.benthecarman.com:50001".to_string()),
+			chain_source: ChainSource::Electrum(
+				"tcp://spark-regtest.benthecarman.com:50001".to_string(),
+			),
 			lsp: (lsp_address, lsp_pubkey, None),
 			network,
 			seed,
@@ -493,4 +492,49 @@ fn print_help() {
 	println!("  - Network: regtest");
 	println!("  - Storage: ./wallet_data");
 	println!("  - Generated seed phrase (displayed on init)");
+}
+
+fn generate_or_load_seed(storage_path: &str) -> Result<Seed> {
+	let seed_file_path = format!("{}/seed.txt", storage_path);
+
+	// Try to load existing seed
+	if let Ok(seed_content) = fs::read_to_string(&seed_file_path) {
+		let mnemonic_str = seed_content.trim();
+		match Mnemonic::from_str(mnemonic_str) {
+			Ok(mnemonic) => {
+				println!("{} Loaded existing seed from {}", "🔑".bright_green(), seed_file_path);
+				return Ok(Seed::Mnemonic { mnemonic, passphrase: None });
+			},
+			Err(e) => {
+				println!(
+					"{} Warning: Failed to parse existing seed file: {}",
+					"⚠️".bright_yellow(),
+					e
+				);
+				println!("{} Generating new seed...", "🔄".bright_yellow());
+			},
+		}
+	}
+
+	// Generate new seed
+	let mut entropy = [0u8; 16]; // 128 bits for 12-word mnemonic
+	rand::thread_rng().fill_bytes(&mut entropy);
+	let mnemonic = Mnemonic::from_entropy(&entropy)?;
+	println!("{} Generated new seed: {}", "🔑".bright_yellow(), mnemonic);
+
+	// Create storage directory if it doesn't exist
+	fs::create_dir_all(storage_path)
+		.with_context(|| format!("Failed to create storage directory: {}", storage_path))?;
+
+	// Save seed to file
+	fs::write(&seed_file_path, mnemonic.to_string())
+		.with_context(|| format!("Failed to write seed to file: {}", seed_file_path))?;
+
+	println!("{seed_file_path} Seed saved to {}", "💾".bright_green());
+	println!(
+		"{} Keep this seed phrase safe - it's needed to recover your wallet!",
+		"⚠️".bright_red().bold()
+	);
+
+	Ok(Seed::Mnemonic { mnemonic, passphrase: None })
 }
