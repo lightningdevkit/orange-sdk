@@ -1,5 +1,6 @@
 //! This module defines the `TrustedWalletInterface` trait and its associated types.
 
+use crate::event::EventQueue;
 use crate::logging::Logger;
 use crate::{InitFailure, TxStatus, WalletConfig};
 
@@ -77,7 +78,7 @@ pub trait TrustedWalletInterface: Sized + Send + Sync + private::Sealed {
 
 	/// Initializes the wallet with the given configuration and logger.
 	fn init(
-		config: &WalletConfig<Self::ExtraConfig>, logger: Arc<Logger>,
+		config: &WalletConfig<Self::ExtraConfig>, event_queue: Arc<EventQueue>, logger: Arc<Logger>,
 	) -> impl Future<Output = Result<Self, InitFailure>> + Send;
 
 	/// Returns the current balance of the wallet.

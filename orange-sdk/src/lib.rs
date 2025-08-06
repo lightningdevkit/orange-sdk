@@ -55,9 +55,8 @@ use logging::Logger;
 use trusted_wallet::Error as TrustedError;
 use trusted_wallet::TrustedWalletInterface;
 
-use crate::event::EventHandler;
 pub use bitcoin_payment_instructions;
-pub use event::Event;
+pub use event::{Event, EventQueue};
 pub use ldk_node::bip39::Mnemonic;
 pub use ldk_node::bitcoin;
 pub use ldk_node::payment::ConfirmationStatus;
@@ -82,7 +81,7 @@ struct WalletImpl<T: TrustedWalletInterface> {
 	/// The trusted wallet interface for managing small balances.
 	trusted: Arc<T>,
 	/// The event handler for processing wallet events.
-	event_handler: Arc<EventHandler>,
+	event_queue: Arc<EventQueue>,
 	/// Configuration parameters for when the wallet decides to use the lightning or trusted wallet.
 	tunables: Tunables,
 	/// The Bitcoin network the wallet operates on (e.g., Mainnet, Testnet).
@@ -394,20 +393,23 @@ where
 				Arc::new(SqliteStore::new(path.into(), Some("orange.sqlite".to_owned()), None)?)
 			},
 		};
-		let trusted = Arc::new(T::init(&config, Arc::clone(&logger)).await?);
+
+		let event_queue = Arc::new(EventQueue::new(Arc::clone(&store), Arc::clone(&logger)));
+
+		let trusted =
+			Arc::new(T::init(&config, Arc::clone(&event_queue), Arc::clone(&logger)).await?);
 		let ln_wallet = LightningWallet::init(
 			Arc::clone(&runtime),
 			config,
 			Arc::clone(&store),
+			Arc::clone(&event_queue),
 			Arc::clone(&logger),
 		)?;
-
-		let event_handler = Arc::clone(&ln_wallet.inner.event_handler);
 
 		let inner = Arc::new(WalletImpl::<T> {
 			trusted,
 			ln_wallet,
-			event_handler,
+			event_queue,
 			network,
 			tunables,
 			tx_metadata: TxMetadataStore::new(Arc::clone(&store)),
@@ -514,14 +516,13 @@ where
 							PaymentKind::Onchain { txid, status } => (txid, status),
 							_ => continue,
 						};
-						if let Err(e) = inner_ref.event_handler.event_queue.add_event(
-							Event::OnchainPaymentReceived {
+						if let Err(e) =
+							inner_ref.event_queue.add_event(Event::OnchainPaymentReceived {
 								payment_id,
 								txid,
 								amount_sat: payment.amount_msat.unwrap() / 1_000,
 								status,
-							},
-						) {
+							}) {
 							log_error!(
 								inner_ref.logger,
 								"Failed to add OnchainPaymentReceived event: {e:?}"
@@ -640,12 +641,11 @@ where
 							inner.logger,
 							"Rebalance trusted transaction initiated, id {rebalance_id}. Waiting for LN payment."
 						);
-						if let Err(e) =
-							inner.event_handler.event_queue.add_event(Event::RebalanceInitiated {
-								trigger_payment_id: triggering_transaction_id.clone(),
-								trusted_rebalance_payment_id: rebalance_id,
-								amount_msat: transfer_amt.milli_sats(),
-							}) {
+						if let Err(e) = inner.event_queue.add_event(Event::RebalanceInitiated {
+							trigger_payment_id: triggering_transaction_id.clone(),
+							trusted_rebalance_payment_id: rebalance_id,
+							amount_msat: transfer_amt.milli_sats(),
+						}) {
 							log_error!(
 								inner.logger,
 								"Failed to add RebalanceInitiated event: {e:?}"
@@ -714,14 +714,13 @@ where
 							.insert(PaymentId::Trusted(rebalance_id), metadata.clone());
 						inner.tx_metadata.insert(PaymentId::Lightning(lightning_id), metadata);
 
-						if let Err(e) =
-							inner.event_handler.event_queue.add_event(Event::RebalanceSuccessful {
-								trigger_payment_id: triggering_transaction_id,
-								trusted_rebalance_payment_id: rebalance_id,
-								ln_rebalance_payment_id: lightning_id,
-								amount_msat: transfer_amt.milli_sats(),
-								fee_msat,
-							}) {
+						if let Err(e) = inner.event_queue.add_event(Event::RebalanceSuccessful {
+							trigger_payment_id: triggering_transaction_id,
+							trusted_rebalance_payment_id: rebalance_id,
+							ln_rebalance_payment_id: lightning_id,
+							amount_msat: transfer_amt.milli_sats(),
+							fee_msat,
+						}) {
 							log_error!(
 								inner.logger,
 								"Failed to add RebalanceSuccessful event: {e:?}"
@@ -1347,7 +1346,7 @@ where
 	/// **Caution:** Users must handle events as quickly as possible to prevent a large event backlog,
 	/// which can increase the memory footprint of [`Wallet`].
 	pub fn next_event(&self) -> Option<Event> {
-		self.inner.event_handler.event_queue.next_event()
+		self.inner.event_queue.next_event()
 	}
 
 	/// Returns the next event in the event queue.
@@ -1359,7 +1358,7 @@ where
 	/// **Caution:** Users must handle events as quickly as possible to prevent a large event backlog,
 	/// which can increase the memory footprint of [`Wallet`].
 	pub async fn next_event_async(&self) -> Event {
-		self.inner.event_handler.event_queue.next_event_async().await
+		self.inner.event_queue.next_event_async().await
 	}
 
 	/// Returns the next event in the event queue.
@@ -1371,14 +1370,14 @@ where
 	/// **Caution:** Users must handle events as quickly as possible to prevent a large event backlog,
 	/// which can increase the memory footprint of [`Wallet`].
 	pub fn wait_next_event(&self) -> Event {
-		self.inner.event_handler.event_queue.wait_next_event()
+		self.inner.event_queue.wait_next_event()
 	}
 
 	/// Confirm the last retrieved event handled.
 	///
 	/// **Note:** This **MUST** be called after each event has been handled.
 	pub fn event_handled(&self) -> Result<(), ()> {
-		self.inner.event_handler.event_queue.event_handled().map_err(|e| {
+		self.inner.event_queue.event_handled().map_err(|e| {
 			log_error!(
 				self.inner.logger,
 				"Couldn't mark event handled due to persistence failure: {e}"

@@ -186,6 +186,7 @@ impl_writeable_tlv_based_enum!(Event,
 	},
 );
 
+/// A queue for events emitted by the [`Wallet`].
 pub struct EventQueue {
 	queue: Arc<Mutex<VecDeque<Event>>>,
 	waker: Arc<Mutex<Option<Waker>>>,
@@ -305,7 +306,7 @@ impl Future for EventFuture {
 }
 
 #[derive(Clone)]
-pub(crate) struct EventHandler {
+pub(crate) struct LdkEventHandler {
 	pub(crate) event_queue: Arc<EventQueue>,
 	pub(crate) ldk_node: Arc<ldk_node::Node>,
 	pub(crate) payment_receipt_sender: watch::Sender<()>,
@@ -313,7 +314,7 @@ pub(crate) struct EventHandler {
 	pub(crate) logger: Arc<Logger>,
 }
 
-impl EventHandler {
+impl LdkEventHandler {
 	pub(crate) fn handle_ldk_node_event(&self, event: ldk_node::Event) {
 		match event {
 			ldk_node::Event::PaymentSuccessful {

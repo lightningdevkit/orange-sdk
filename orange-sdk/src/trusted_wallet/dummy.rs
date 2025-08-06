@@ -1,6 +1,7 @@
 #![cfg(feature = "_test-utils")]
 //! A dummy implementation of `TrustedWalletInterface` for testing purposes.
 
+use crate::event::EventQueue;
 use crate::trusted_wallet::{Error, Payment, TrustedPaymentId, TrustedWalletInterface};
 use crate::{InitFailure, TxStatus, WalletConfig};
 use bitcoin_payment_instructions::PaymentMethod;
@@ -169,7 +170,8 @@ impl TrustedWalletInterface for DummyTrustedWallet {
 	type ExtraConfig = DummyTrustedWalletExtraConfig;
 
 	fn init(
-		config: &WalletConfig<Self::ExtraConfig>, _logger: Arc<crate::logging::Logger>,
+		config: &WalletConfig<Self::ExtraConfig>, _eq: Arc<EventQueue>,
+		_logger: Arc<crate::logging::Logger>,
 	) -> impl Future<Output = Result<Self, InitFailure>> + Send {
 		async move {
 			Ok(Self::new(

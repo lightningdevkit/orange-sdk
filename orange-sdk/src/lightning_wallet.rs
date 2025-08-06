@@ -1,4 +1,4 @@
-use crate::event::{EventHandler, EventQueue};
+use crate::event::{EventQueue, LdkEventHandler};
 use crate::logging::Logger;
 use crate::{ChainSource, InitFailure, PaymentType, Seed, TxStatus, WalletConfig};
 use std::collections::HashMap;
@@ -78,8 +78,6 @@ pub(crate) struct LightningWalletImpl {
 	pub(crate) ldk_node: Arc<ldk_node::Node>,
 	payment_receipt_flag: watch::Receiver<()>,
 	channel_pending_receipt_flag: watch::Receiver<()>,
-	pub(crate) event_handler: Arc<EventHandler>,
-
 	lsp_node_id: PublicKey,
 	lsp_socket_addr: SocketAddress,
 }
@@ -91,7 +89,7 @@ pub(crate) struct LightningWallet {
 impl LightningWallet {
 	pub(super) fn init<E>(
 		runtime: Arc<Runtime>, config: WalletConfig<E>, store: Arc<dyn KVStore + Sync + Send>,
-		logger: Arc<Logger>,
+		event_queue: Arc<EventQueue>, logger: Arc<Logger>,
 	) -> Result<Self, InitFailure> {
 		let anchor_channels_config = ldk_node::config::AnchorChannelsConfig {
 			trusted_peers_no_reserve: vec![config.lsp.1],
@@ -161,8 +159,8 @@ impl LightningWallet {
 		let ldk_node = Arc::new(builder.build_with_store(Arc::clone(&store))?);
 		let (payment_receipt_sender, payment_receipt_flag) = watch::channel(());
 		let (channel_pending_sender, channel_pending_receipt_flag) = watch::channel(());
-		let ev_handler = Arc::new(EventHandler {
-			event_queue: Arc::new(EventQueue::new(store, Arc::clone(&logger))),
+		let ev_handler = Arc::new(LdkEventHandler {
+			event_queue,
 			ldk_node: Arc::clone(&ldk_node),
 			payment_receipt_sender,
 			channel_pending_sender,
@@ -172,7 +170,6 @@ impl LightningWallet {
 			ldk_node,
 			payment_receipt_flag,
 			channel_pending_receipt_flag,
-			event_handler: Arc::clone(&ev_handler),
 			lsp_node_id,
 			lsp_socket_addr,
 		});

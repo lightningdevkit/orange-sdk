@@ -1,7 +1,7 @@
 //! A implementation of `TrustedWalletInterface` using the Spark SDK.
 use crate::logging::Logger;
 use crate::trusted_wallet::{Error, Payment, TrustedPaymentId, TrustedWalletInterface};
-use crate::{InitFailure, Seed, TxStatus, WalletConfig};
+use crate::{Event, EventQueue, InitFailure, Seed, TxStatus, WalletConfig};
 
 use ldk_node::bitcoin::hashes::Hash;
 use ldk_node::bitcoin::hashes::sha256::Hash as Sha256;
@@ -14,11 +14,16 @@ use bitcoin_payment_instructions::amount::Amount;
 
 use spark_wallet::{
 	DefaultSigner, PayLightningInvoiceResult, SparkWallet, SparkWalletConfig, TransferStatus,
+	WalletEvent,
 };
 
+use crate::store::PaymentId;
+use ldk_node::lightning_types::payment::PaymentHash;
+use ldk_node::payment::ConfirmationStatus;
 use std::future::Future;
 use std::str::FromStr;
 use std::sync::Arc;
+use uuid::Uuid;
 
 /// A wallet implementation using the Breez Spark SDK.
 #[derive(Clone)]
@@ -31,7 +36,7 @@ impl TrustedWalletInterface for Spark {
 	type ExtraConfig = SparkWalletConfig;
 
 	fn init(
-		config: &WalletConfig<SparkWalletConfig>, logger: Arc<Logger>,
+		config: &WalletConfig<SparkWalletConfig>, event_queue: Arc<EventQueue>, logger: Arc<Logger>,
 	) -> impl Future<Output = Result<Self, InitFailure>> + Send {
 		async move {
 			if config.network != config.extra_config.network.into() {
@@ -57,6 +62,69 @@ impl TrustedWalletInterface for Spark {
 
 			let spark_wallet =
 				Arc::new(SparkWallet::connect(config.extra_config.clone(), signer).await?);
+
+			let mut events = spark_wallet.subscribe_events();
+			let l = Arc::clone(&logger);
+			let w = Arc::clone(&spark_wallet);
+			tokio::spawn(async move {
+				match events.recv().await {
+					Ok(event) => {
+						log_debug!(&l, "Spark event: {event:?}");
+						match event {
+							WalletEvent::DepositConfirmed(node_id) => {
+								let transfers = w.list_transfers(None).await.unwrap();
+								if let Some(transfer) = transfers
+									.into_iter()
+									.find(|t| t.leaves.iter().any(|l| l.leaf.id == node_id))
+								{
+									event_queue
+										.add_event(Event::OnchainPaymentReceived {
+											payment_id: PaymentId::Trusted(TrustedPaymentId(
+												Uuid::from_bytes(transfer.id.to_bytes()),
+											)),
+											// todo this is kinda hacky, maybe we should make this optional
+											txid: transfer
+												.leaves
+												.iter()
+												.find(|t| t.leaf.id == node_id)
+												.unwrap()
+												.leaf
+												.node_tx
+												.compute_txid(),
+											amount_sat: transfer.total_value_sat,
+											status: ConfirmationStatus::Unconfirmed, // fixme dont have block height
+										})
+										.unwrap();
+								}
+							},
+							WalletEvent::StreamConnected => {},
+							WalletEvent::StreamDisconnected => {},
+							WalletEvent::Synced => {},
+							WalletEvent::TransferClaimed(transfer_id) => {
+								let transfers = w.list_transfers(None).await.unwrap();
+								if let Some(transfer) =
+									transfers.into_iter().find(|t| t.id == transfer_id)
+								{
+									event_queue
+										.add_event(Event::PaymentReceived {
+											payment_id: PaymentId::Trusted(TrustedPaymentId(
+												Uuid::from_bytes(transfer.id.to_bytes()),
+											)),
+											payment_hash: PaymentHash([0; 32]), // fixme, spark does not give us the payment hash
+											amount_msat: transfer.total_value_sat * 1000,
+											custom_records: vec![],
+											lsp_fee_msats: None,
+										})
+										.unwrap();
+								}
+							},
+						}
+					},
+					Err(e) => {
+						log_debug!(l, "Spark event error: {e:?}");
+					},
+				}
+			});
 
 			Ok(Spark { spark_wallet, logger })
 		}
@@ -96,7 +164,7 @@ impl TrustedWalletInterface for Spark {
 			for transfer in transfers {
 				res.push(Payment {
 					status: transfer.status.into(),
-					id: TrustedPaymentId(uuid::Uuid::from_bytes(transfer.id.to_bytes())),
+					id: TrustedPaymentId(Uuid::from_bytes(transfer.id.to_bytes())),
 					amount: Amount::from_sats(transfer.total_value_sat).expect("invalid amount"),
 					outbound: transfer.sender_id == our_pk.identity_public_key,
 					fee: Amount::ZERO, // Currently everything is free
@@ -140,11 +208,11 @@ impl TrustedWalletInterface for Spark {
 					.await?;
 
 				match res {
-					PayLightningInvoiceResult::LightningPayment(pay) => Ok(TrustedPaymentId(
-						uuid::Uuid::from_str(pay.id.as_str()).expect("invalid id"),
-					)),
+					PayLightningInvoiceResult::LightningPayment(pay) => {
+						Ok(TrustedPaymentId(Uuid::from_str(pay.id.as_str()).expect("invalid id")))
+					},
 					PayLightningInvoiceResult::Transfer(transfer) => Ok(TrustedPaymentId(
-						uuid::Uuid::from_str(transfer.id.to_string().as_str()).expect("invalid id"),
+						Uuid::from_str(transfer.id.to_string().as_str()).expect("invalid id"),
 					)),
 				}
 			} else {
