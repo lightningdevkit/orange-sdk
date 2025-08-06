@@ -91,7 +91,7 @@ impl TrustedWalletInterface for Spark {
 	fn list_payments(&self) -> impl Future<Output = Result<Vec<Payment>, Error>> + Send {
 		async move {
 			let our_pk = self.spark_wallet.get_spark_address().await?;
-			let transfers = self.spark_wallet.list_transfers().await?;
+			let transfers = self.spark_wallet.list_transfers(None).await?;
 			let mut res = Vec::with_capacity(transfers.len());
 			for transfer in transfers {
 				res.push(Payment {
