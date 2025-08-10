@@ -752,6 +752,7 @@ fn test_threshold_boundary_rebalance_min() {
 	let TestParams { wallet, lsp: _, bitcoind: _, third_party, rt } = build_test_nodes();
 
 	rt.block_on(async move {
+		let starting_bal = wallet.get_balance().await.unwrap();
 		let tunables = wallet.get_tunables();
 		let rebalance_min = tunables.rebalance_min;
 
@@ -764,10 +765,22 @@ fn test_threshold_boundary_rebalance_min() {
 			Duration::from_secs(1),
 			10,
 			"below rebalance min payment",
-			|| async { wallet.get_balance().await.unwrap().available_balance >= below_rebalance },
+			|| async {
+				wallet.get_balance().await.unwrap().available_balance
+					>= starting_bal.available_balance
+			},
 		)
 		.await
 		.expect("Payment below rebalance min failed");
+
+		test_utils::wait_for_condition(
+			Duration::from_secs(1),
+			10,
+			"wait for transaction",
+			|| async { wallet.list_transactions().await.unwrap().len() >= 1 },
+		)
+		.await
+		.expect("Transaction did not appear in time");
 
 		let txs = wallet.list_transactions().await.unwrap();
 		assert_eq!(txs.len(), 1);
