@@ -237,7 +237,7 @@ impl TxMetadataStore {
 		TxMetadataStore { store, tx_metadata: Arc::new(RwLock::new(tx_metadata)) }
 	}
 
-	pub fn read(&self) -> RwLockReadGuard<HashMap<PaymentId, TxMetadata>> {
+	pub fn read(&self) -> RwLockReadGuard<'_, HashMap<PaymentId, TxMetadata>> {
 		self.tx_metadata.read().unwrap()
 	}
 

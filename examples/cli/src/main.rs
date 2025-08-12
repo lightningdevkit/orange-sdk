@@ -124,6 +124,7 @@ impl WalletState {
 					)?,
 				},
 				split_secret_threshold: 2,
+				tokens_config: SparkWalletConfig::default_tokens_config(),
 			},
 		};
 

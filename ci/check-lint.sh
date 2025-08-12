@@ -14,6 +14,7 @@ RUSTFLAGS='-D warnings' cargo clippy -- \
 	-A clippy::drop-non-drop \
 	-A clippy::manual-async-fn \
 	-A clippy::needless-lifetimes \
+	-A clippy::collapsible_if \
 	`# This doesn't actually work sometimes` \
 	-A clippy::option-as-ref-deref \
 	`# TODO eventually remove this` \
