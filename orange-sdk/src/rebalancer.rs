@@ -261,8 +261,6 @@ pub(crate) struct OrangeRebalanceEventHandler {
 	tx_metadata: TxMetadataStore,
 	/// The event handler for processing wallet events.
 	event_queue: Arc<EventQueue>,
-	/// Key-value store for persistent storage.
-	store: Arc<dyn KVStore + Send + Sync>,
 	/// Logger for logging events and errors.
 	logger: Arc<Logger>,
 }
@@ -270,10 +268,9 @@ pub(crate) struct OrangeRebalanceEventHandler {
 impl OrangeRebalanceEventHandler {
 	/// Creates a new `OrangeRebalanceEventHandler` instance.
 	pub(crate) fn new(
-		tx_metadata: TxMetadataStore, event_queue: Arc<EventQueue>,
-		store: Arc<dyn KVStore + Send + Sync>, logger: Arc<Logger>,
+		tx_metadata: TxMetadataStore, event_queue: Arc<EventQueue>, logger: Arc<Logger>,
 	) -> Self {
-		Self { tx_metadata, event_queue, store, logger }
+		Self { tx_metadata, event_queue, logger }
 	}
 }
 

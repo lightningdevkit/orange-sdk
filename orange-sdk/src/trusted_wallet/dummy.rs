@@ -1,4 +1,3 @@
-#![cfg(feature = "_test-utils")]
 //! A dummy implementation of `TrustedWalletInterface` for testing purposes.
 
 use crate::bitcoin::hashes::Hash;

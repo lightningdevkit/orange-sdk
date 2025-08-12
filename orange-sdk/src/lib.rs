@@ -141,6 +141,7 @@ pub enum VssAuth {
 
 /// Configuration for a Versioned Storage Service (VSS).
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct VssConfig {
 	/// The URL of the VSS.
 	vss_url: String,
@@ -434,7 +435,6 @@ where
 		let rebalance_events = OrangeRebalanceEventHandler::new(
 			tx_metadata.clone(),
 			Arc::clone(&event_queue),
-			Arc::clone(&store),
 			Arc::clone(&logger),
 		);
 
