@@ -12,7 +12,7 @@ channels managed by LDK Node when balances exceed configurable thresholds.
 
 ### Build and Test
 
-- `cargo build` - Build the project
+- `cargo check` - Build the project
 - `just test` - Run tests (equivalent to `cargo test --features _test-utils`)
 - `just` - List available commands
 
@@ -68,6 +68,6 @@ Integration tests in `tests/integration_tests.rs` use:
 ## Key Dependencies
 
 - `ldk-node` - Lightning Development Kit node implementation
-- `spark-rust` - Spark trusted wallet backend
+- `spark-wallet` - Spark trusted wallet backend
 - `bitcoin-payment-instructions` - Payment instruction parsing
 - `tokio` - Async runtime
