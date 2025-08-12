@@ -1,14 +1,18 @@
+use crate::bitcoin::OutPoint;
 use crate::event::{EventQueue, LdkEventHandler};
 use crate::logging::Logger;
-use crate::{ChainSource, InitFailure, PaymentType, Seed, TxStatus, WalletConfig};
-use std::collections::HashMap;
-use std::fmt::Debug;
+use crate::store::TxStatus;
+use crate::{ChainSource, InitFailure, PaymentType, Seed, WalletConfig};
 
 use bitcoin_payment_instructions::PaymentMethod;
 use bitcoin_payment_instructions::amount::Amount;
 
+use ldk_node::bitcoin::base64::Engine;
+use ldk_node::bitcoin::base64::prelude::BASE64_STANDARD;
+use ldk_node::bitcoin::secp256k1::PublicKey;
 use ldk_node::bitcoin::{Address, Network, Script};
 use ldk_node::lightning::ln::channelmanager::PaymentId;
+use ldk_node::lightning::ln::msgs::SocketAddress;
 use ldk_node::lightning::log_debug;
 use ldk_node::lightning::util::logger::Logger as _;
 use ldk_node::lightning::util::persist::KVStore;
@@ -16,11 +20,12 @@ use ldk_node::lightning_invoice::{Bolt11Invoice, Bolt11InvoiceDescription, Descr
 use ldk_node::payment::{PaymentDetails, PaymentDirection, PaymentKind, PaymentStatus};
 use ldk_node::{NodeError, UserChannelId};
 
-use ldk_node::bitcoin::base64::Engine;
-use ldk_node::bitcoin::base64::prelude::BASE64_STANDARD;
-use ldk_node::bitcoin::secp256k1::PublicKey;
-use ldk_node::lightning::ln::msgs::SocketAddress;
+use graduated_rebalancer::{LightningBalance, ReceivedLightningPayment};
+
+use std::collections::HashMap;
+use std::fmt::Debug;
 use std::sync::Arc;
+
 use tokio::runtime::Runtime;
 use tokio::sync::watch;
 
@@ -77,7 +82,7 @@ pub(crate) struct LightningWalletBalance {
 pub(crate) struct LightningWalletImpl {
 	pub(crate) ldk_node: Arc<ldk_node::Node>,
 	payment_receipt_flag: watch::Receiver<()>,
-	channel_pending_receipt_flag: watch::Receiver<()>,
+	channel_pending_receipt_flag: watch::Receiver<u128>,
 	lsp_node_id: PublicKey,
 	lsp_socket_addr: SocketAddress,
 }
@@ -158,7 +163,7 @@ impl LightningWallet {
 
 		let ldk_node = Arc::new(builder.build_with_store(Arc::clone(&store))?);
 		let (payment_receipt_sender, payment_receipt_flag) = watch::channel(());
-		let (channel_pending_sender, channel_pending_receipt_flag) = watch::channel(());
+		let (channel_pending_sender, channel_pending_receipt_flag) = watch::channel(0);
 		let ev_handler = Arc::new(LdkEventHandler {
 			event_queue,
 			ldk_node: Arc::clone(&ldk_node),
@@ -193,10 +198,10 @@ impl LightningWallet {
 		let _ = flag.changed().await;
 	}
 
-	pub(crate) async fn await_channel_pending(&self) {
+	pub(crate) async fn await_channel_pending(&self, channel_id: u128) {
 		let mut flag = self.inner.channel_pending_receipt_flag.clone();
 		flag.mark_unchanged();
-		let _ = flag.changed().await;
+		flag.wait_for(|t| t == &channel_id).await.expect("channel pending not received");
 	}
 
 	pub(crate) fn get_on_chain_address(&self) -> Result<Address, NodeError> {
@@ -335,5 +340,87 @@ impl LightningWallet {
 
 	pub(crate) fn stop(&self) {
 		let _ = self.inner.ldk_node.stop();
+	}
+}
+
+impl graduated_rebalancer::LightningWallet for LightningWallet {
+	type Error = NodeError;
+
+	fn get_balance(&self) -> LightningBalance {
+		let bal = self.get_balance();
+		LightningBalance { lightning: bal.lightning, onchain: bal.onchain }
+	}
+
+	fn get_bolt11_invoice(
+		&self, amount: Option<Amount>,
+	) -> impl Future<Output = Result<Bolt11Invoice, Self::Error>> + Send {
+		async move { self.get_bolt11_invoice(amount).await }
+	}
+
+	fn pay(
+		&self, method: &PaymentMethod, amount: Amount,
+	) -> impl Future<Output = Result<[u8; 32], Self::Error>> + Send {
+		async move { self.pay(method, amount).await.map(|p| p.0) }
+	}
+
+	fn await_payment_receipt(
+		&self, payment_hash: [u8; 32],
+	) -> impl Future<Output = Option<ReceivedLightningPayment>> + Send {
+		async move {
+			let id = PaymentId(payment_hash);
+			loop {
+				if let Some(payment) = self.inner.ldk_node.payment(&id) {
+					let counterparty_skimmed_fee_msat = match payment.kind {
+						PaymentKind::Bolt11 { hash, .. } => {
+							debug_assert!(hash.0 == payment_hash, "Payment Hash mismatch");
+							None
+						},
+						PaymentKind::Bolt11Jit { hash, counterparty_skimmed_fee_msat, .. } => {
+							debug_assert!(hash.0 == payment_hash, "Payment Hash mismatch");
+							counterparty_skimmed_fee_msat
+						},
+						_ => return None, // Ignore other payment kinds, we only care about the one we just sent.
+					};
+					match payment.status {
+						PaymentStatus::Succeeded => {
+							return Some(ReceivedLightningPayment {
+								id: payment.id.0,
+								fee_paid_msat: counterparty_skimmed_fee_msat,
+							});
+						},
+						PaymentStatus::Pending => {},
+						PaymentStatus::Failed => return None,
+					}
+				}
+				self.await_payment_receipt().await;
+			}
+		}
+	}
+
+	fn open_channel_with_lsp(
+		&self, _amt: Amount,
+	) -> impl Future<Output = Result<u128, Self::Error>> + Send {
+		async move {
+			// we don't use the amount and just use our full spendable balance in open_channel_with_lsp
+			self.open_channel_with_lsp().await.map(|c| c.0)
+		}
+	}
+
+	fn await_channel_pending(&self, channel_id: u128) -> impl Future<Output = OutPoint> + Send {
+		async move {
+			loop {
+				let channels = self.inner.ldk_node.list_channels();
+				let chan = channels
+					.into_iter()
+					.find(|c| c.user_channel_id.0 == channel_id && c.funding_txo.is_some());
+				match chan {
+					Some(c) => return c.funding_txo.expect("channel has no funding txo"),
+					None => {
+						self.await_channel_pending(channel_id).await;
+						// Wait for the next channel pending event
+					},
+				}
+			}
+		}
 	}
 }

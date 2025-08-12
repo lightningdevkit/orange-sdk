@@ -50,8 +50,7 @@ fn test_receive_to_trusted() {
 			let res = p.payment(&payment_id).is_some_and(|p| p.status == PaymentStatus::Succeeded);
 			async move { res }
 		})
-		.await
-		.expect("Payer payment did not succeed in time");
+		.await;
 
 		// wait for balance update on wallet side
 		test_utils::wait_for_condition(
@@ -60,8 +59,7 @@ fn test_receive_to_trusted() {
 			"wallet balance update after receive",
 			|| async { wallet.get_balance().await.unwrap().available_balance > Amount::ZERO },
 		)
-		.await
-		.expect("Wallet balance did not update in time after receive");
+		.await;
 
 		let txs = wallet.list_transactions().await.unwrap();
 		assert_eq!(txs.len(), 1);
@@ -111,8 +109,7 @@ fn test_sweep_to_ln() {
 			"wallet balance update after receive",
 			|| async { wallet.get_balance().await.unwrap().available_balance > Amount::ZERO },
 		)
-		.await
-		.expect("Wallet balance did not update in time after receive");
+		.await;
 
 		let intermediate_amt = wallet.get_balance().await.unwrap().available_balance;
 
@@ -129,8 +126,7 @@ fn test_sweep_to_ln() {
 			"wallet balance update after receive",
 			|| async { wallet.get_balance().await.unwrap().available_balance > intermediate_amt },
 		)
-		.await
-		.expect("Wallet balance did not update in time after receive");
+		.await;
 
 		let event = wait_next_event(&wallet).await;
 		assert!(matches!(event, Event::RebalanceInitiated { .. }));
@@ -142,8 +138,7 @@ fn test_sweep_to_ln() {
 			"wait for new channel to be opened",
 			|| async { starting_lsp_channels.len() < lsp.list_channels().len() },
 		)
-		.await
-		.expect("Wallet did not receive new channel");
+		.await;
 
 		// wait for payment received
 		let event = wait_next_event(&wallet).await;
@@ -241,8 +236,7 @@ fn test_receive_to_onchain() {
 				wallet.get_balance().await.unwrap().pending_balance == recv_amt
 			},
 		)
-		.await
-		.expect("Pending balance did not update in time");
+		.await;
 
 		let event = wait_next_event(&wallet).await;
 
@@ -502,8 +496,7 @@ fn test_pay_onchain_from_self_custody() {
 				wallet.get_balance().await.unwrap().pending_balance > starting_bal.pending_balance
 			},
 		)
-		.await
-		.expect("Wallet did not sync balance in time");
+		.await;
 
 		// get address from third party node
 		let addr = third_party.onchain_payment().new_address().unwrap();
@@ -530,8 +523,7 @@ fn test_pay_onchain_from_self_custody() {
 				payment.is_some_and(|p| p.status == TxStatus::Completed)
 			},
 		)
-		.await
-		.expect("Payment did not complete in time");
+		.await;
 
 		// check the payment is correct
 		let payments = wallet.list_transactions().await.unwrap();
@@ -585,8 +577,7 @@ fn test_pay_onchain_from_self_custody() {
 				})
 			},
 		)
-		.await
-		.expect("Payment did not complete in time");
+		.await;
 	})
 }
 
@@ -690,8 +681,7 @@ fn test_threshold_boundary_trusted_balance_limit() {
 				wallet.get_balance().await.unwrap().available_balance >= exact_limit_amount
 			},
 		)
-		.await
-		.expect("Payment at exact limit failed");
+		.await;
 
 		let txs = wallet.list_transactions().await.unwrap();
 		assert_eq!(txs.len(), 1);
@@ -721,8 +711,7 @@ fn test_threshold_boundary_trusted_balance_limit() {
 					)
 			},
 		)
-		.await
-		.expect("Payment above limit failed");
+		.await;
 
 		// Should have received a ChannelOpened event
 		let event = test_utils::wait_next_event(&wallet).await;
@@ -770,8 +759,7 @@ fn test_threshold_boundary_rebalance_min() {
 					>= starting_bal.available_balance
 			},
 		)
-		.await
-		.expect("Payment below rebalance min failed");
+		.await;
 
 		test_utils::wait_for_condition(
 			Duration::from_secs(1),
@@ -779,8 +767,7 @@ fn test_threshold_boundary_rebalance_min() {
 			"wait for transaction",
 			|| async { wallet.list_transactions().await.unwrap().len() >= 1 },
 		)
-		.await
-		.expect("Transaction did not appear in time");
+		.await;
 
 		let txs = wallet.list_transactions().await.unwrap();
 		assert_eq!(txs.len(), 1);
@@ -806,8 +793,7 @@ fn test_threshold_boundary_rebalance_min() {
 				balance >= below_rebalance.saturating_add(exact_rebalance)
 			},
 		)
-		.await
-		.expect("Payment at exact rebalance min failed");
+		.await;
 
 		let txs = wallet.list_transactions().await.unwrap();
 		assert!(txs.len() >= 2, "Should have at least 2 transactions (may include rebalance)");
@@ -1045,8 +1031,7 @@ fn test_payment_with_expired_invoice() {
 			"wallet balance update",
 			|| async { wallet.get_balance().await.unwrap().available_balance > Amount::ZERO },
 		)
-		.await
-		.expect("Balance should update");
+		.await;
 
 		// Create an invoice with very short expiry
 		let payment_amount = Amount::from_sats(1000).unwrap();
@@ -1245,8 +1230,7 @@ fn test_concurrent_payments() {
 				successful_payments >= 3
 			},
 		)
-		.await
-		.expect("Third party should receive all 3 payments");
+		.await;
 
 		// Verify final balance state (the main test is that concurrent payments succeeded)
 		let final_balance = wallet.get_balance().await.unwrap();
@@ -1339,8 +1323,7 @@ fn test_concurrent_receive_operations() {
 					.map_or(false, |p| p.status == PaymentStatus::Succeeded)
 			},
 		)
-		.await
-		.expect("First payment did not succeed");
+		.await;
 
 		// Send second payment
 		let payment_id_2 = third_party.bolt11_payment().send(&uris.1.invoice, None).unwrap();
@@ -1356,8 +1339,7 @@ fn test_concurrent_receive_operations() {
 					.map_or(false, |p| p.status == PaymentStatus::Succeeded)
 			},
 		)
-		.await
-		.expect("Second payment did not succeed");
+		.await;
 
 		// Wait for wallet balance to reflect both payments
 		test_utils::wait_for_condition(
@@ -1369,8 +1351,7 @@ fn test_concurrent_receive_operations() {
 				balance >= amount.saturating_add(amount)
 			},
 		)
-		.await
-		.expect("Wallet balance did not reflect both payments");
+		.await;
 
 		// Verify transactions were recorded
 		let txs = wallet.list_transactions().await.unwrap();
@@ -1395,8 +1376,7 @@ fn test_balance_consistency_under_load() {
 		test_utils::wait_for_condition(Duration::from_secs(1), 10, "initial balance", || async {
 			wallet.get_balance().await.unwrap().available_balance >= initial_amount
 		})
-		.await
-		.expect("Initial balance not received");
+		.await;
 
 		// Test: Many concurrent balance queries
 		let mut balance_tasks = Vec::new();

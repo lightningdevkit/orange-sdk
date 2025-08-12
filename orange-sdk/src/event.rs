@@ -1,7 +1,5 @@
 use crate::logging::Logger;
-use crate::store;
-use crate::store::PaymentId;
-use crate::trusted_wallet::TrustedPaymentId;
+use crate::store::{self, PaymentId};
 
 use ldk_node::bitcoin::secp256k1::PublicKey;
 use ldk_node::bitcoin::{OutPoint, Txid};
@@ -116,7 +114,7 @@ pub enum Event {
 		/// The `payment_id` of the transaction that triggered the rebalance.
 		trigger_payment_id: PaymentId,
 		/// The `payment_id` of the rebalance payment sent from the trusted wallet.
-		trusted_rebalance_payment_id: TrustedPaymentId,
+		trusted_rebalance_payment_id: [u8; 32],
 		/// The amount, in msats, of the rebalance payment.
 		amount_msat: u64,
 	},
@@ -125,7 +123,7 @@ pub enum Event {
 		/// The `payment_id` of the transaction that triggered the rebalance.
 		trigger_payment_id: PaymentId,
 		/// The `payment_id` of the rebalance payment sent from the trusted wallet.
-		trusted_rebalance_payment_id: TrustedPaymentId,
+		trusted_rebalance_payment_id: [u8; 32],
 		/// The `payment_id` of the rebalance payment sent to the LN wallet.
 		ln_rebalance_payment_id: [u8; 32],
 		/// The amount, in msats, of the rebalance payment.
@@ -310,7 +308,7 @@ pub(crate) struct LdkEventHandler {
 	pub(crate) event_queue: Arc<EventQueue>,
 	pub(crate) ldk_node: Arc<ldk_node::Node>,
 	pub(crate) payment_receipt_sender: watch::Sender<()>,
-	pub(crate) channel_pending_sender: watch::Sender<()>,
+	pub(crate) channel_pending_sender: watch::Sender<u128>,
 	pub(crate) logger: Arc<Logger>,
 }
 
@@ -397,7 +395,7 @@ impl LdkEventHandler {
 					log_error!(self.logger, "Failed to add ChannelOpened event: {e:?}");
 					return;
 				}
-				let _ = self.channel_pending_sender.send(());
+				let _ = self.channel_pending_sender.send(user_channel_id.0);
 			},
 			ldk_node::Event::ChannelClosed {
 				channel_id,

@@ -21,23 +21,25 @@ use bitcoin_payment_instructions::{
 pub use bitcoin_payment_instructions::PaymentMethod;
 use bitcoin_payment_instructions::amount::Amount;
 
+use crate::rebalancer::{OrangeRebalanceEventHandler, OrangeTrigger};
+use crate::store::{PaymentId, TxMetadata, TxMetadataStore, TxType};
+use crate::trusted_wallet::WalletTrusted;
+use graduated_rebalancer::GraduatedRebalancer;
+use ldk_node::bitcoin::Network;
 use ldk_node::bitcoin::hashes::Hash;
 use ldk_node::bitcoin::io;
 use ldk_node::bitcoin::secp256k1::PublicKey;
-use ldk_node::bitcoin::{Network, Txid};
 use ldk_node::io::sqlite_store::SqliteStore;
 use ldk_node::lightning::ln::msgs::SocketAddress;
 use ldk_node::lightning::util::logger::Logger as _;
 use ldk_node::lightning::util::persist::KVStore;
 use ldk_node::lightning::{log_debug, log_error, log_info, log_warn};
 use ldk_node::lightning_invoice::Bolt11Invoice;
-use ldk_node::payment::{PaymentDirection, PaymentKind, PaymentStatus};
+use ldk_node::payment::PaymentKind;
 use ldk_node::{BuildError, NodeError};
-use store::{PaymentId, TxMetadata, TxMetadataStore, TxType};
 
 use tokio::runtime::Runtime;
 
-use std::cmp;
 use std::collections::HashMap;
 use std::fmt::{self, Debug, Write};
 use std::path::PathBuf;
@@ -47,6 +49,7 @@ use std::time::{Duration, SystemTime};
 mod event;
 mod lightning_wallet;
 pub(crate) mod logging;
+mod rebalancer;
 mod store;
 pub mod trusted_wallet;
 
@@ -63,6 +66,14 @@ pub use ldk_node::payment::ConfirmationStatus;
 pub use spark_wallet::SparkWalletConfig;
 pub use store::{PaymentType, Transaction, TxStatus};
 
+type Rebalancer<T> = GraduatedRebalancer<
+	WalletTrusted<T>,
+	LightningWallet,
+	OrangeTrigger<T>,
+	OrangeRebalanceEventHandler,
+	Logger,
+>;
+
 /// Represents the balances of the wallet, including available and pending balances.
 #[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Balances {
@@ -77,19 +88,19 @@ pub struct Balances {
 /// The main implementation of the wallet, containing both trusted and lightning wallet components.
 struct WalletImpl<T: TrustedWalletInterface> {
 	/// The main implementation of the wallet, containing both trusted and lightning wallet components.
-	ln_wallet: LightningWallet,
+	ln_wallet: Arc<LightningWallet>,
 	/// The trusted wallet interface for managing small balances.
 	trusted: Arc<T>,
 	/// The event handler for processing wallet events.
 	event_queue: Arc<EventQueue>,
 	/// Configuration parameters for when the wallet decides to use the lightning or trusted wallet.
 	tunables: Tunables,
+	/// The rebalancer for managing the transfer of funds between the trusted and lightning wallets.
+	rebalancer: Arc<Rebalancer<T>>,
 	/// The Bitcoin network the wallet operates on (e.g., Mainnet, Testnet).
 	network: Network,
 	/// Metadata store for tracking transactions.
 	tx_metadata: TxMetadataStore,
-	/// Mutex to ensure thread-safe balance operations.
-	balance_mutex: tokio::sync::Mutex<()>,
 	/// Key-value store for persistent storage.
 	store: Arc<dyn KVStore + Send + Sync>,
 	/// Logger for logging wallet operations.
@@ -398,13 +409,42 @@ where
 
 		let trusted =
 			Arc::new(T::init(&config, Arc::clone(&event_queue), Arc::clone(&logger)).await?);
-		let ln_wallet = LightningWallet::init(
+		let ln_wallet = Arc::new(LightningWallet::init(
 			Arc::clone(&runtime),
 			config,
 			Arc::clone(&store),
 			Arc::clone(&event_queue),
 			Arc::clone(&logger),
-		)?;
+		)?);
+
+		let tx_metadata = TxMetadataStore::new(Arc::clone(&store));
+
+		let wt = Arc::new(WalletTrusted(Arc::clone(&trusted)));
+
+		let trigger = OrangeTrigger::new(
+			Arc::clone(&ln_wallet),
+			Arc::clone(&trusted),
+			tunables,
+			tx_metadata.clone(),
+			Arc::clone(&event_queue),
+			Arc::clone(&store),
+			Arc::clone(&logger),
+		);
+
+		let rebalance_events = OrangeRebalanceEventHandler::new(
+			tx_metadata.clone(),
+			Arc::clone(&event_queue),
+			Arc::clone(&store),
+			Arc::clone(&logger),
+		);
+
+		let rebalancer = Arc::new(GraduatedRebalancer::new(
+			wt,
+			Arc::clone(&ln_wallet),
+			Arc::new(trigger),
+			Arc::new(rebalance_events),
+			Arc::clone(&logger),
+		));
 
 		let inner = Arc::new(WalletImpl::<T> {
 			trusted,
@@ -412,167 +452,18 @@ where
 			event_queue,
 			network,
 			tunables,
-			tx_metadata: TxMetadataStore::new(Arc::clone(&store)),
+			rebalancer: Arc::clone(&rebalancer),
+			tx_metadata,
 			store,
 			logger,
-			balance_mutex: tokio::sync::Mutex::new(()),
 		});
 
 		// Spawn a background thread that every second, we see if we should initiate a rebalance
 		// This will withdraw from the trusted balance to our LN balance, possibly opening a channel.
 		let inner_ref = Arc::clone(&inner);
 		runtime.spawn(async move {
-			let mut onchain_sync_time =
-				inner_ref.ln_wallet.inner.ldk_node.status().latest_onchain_wallet_sync_timestamp;
 			loop {
-				// check if rebalance is enabled
-				let rebalance_enabled = store::get_rebalance_enabled(inner_ref.store.as_ref());
-
-				if let Ok(trusted_payments) = inner_ref.trusted.list_payments().await {
-					let mut new_txn = Vec::new();
-					let mut latest_tx: Option<(Duration, _)> = None;
-					for payment in trusted_payments.iter() {
-						if payment.outbound {
-							// Assume it'll be tracked by the sending task.
-							// TODO: Maybe use this to backfill stuff we lost on crash?
-							continue;
-						}
-						let payment_id = PaymentId::Trusted(payment.id);
-						let have_metadata =
-							if let Some(metadata) = inner_ref.tx_metadata.read().get(&payment_id) {
-								if let TxType::Payment { .. } = &metadata.ty {
-									if latest_tx.is_none()
-										|| latest_tx.as_ref().unwrap().0 < metadata.time
-									{
-										latest_tx = Some((metadata.time, &payment.id));
-									}
-								}
-								true
-							} else {
-								false
-							};
-						if !have_metadata {
-							log_info!(
-								inner_ref.logger,
-								"Received new trusted payment with id {}",
-								payment.id
-							);
-							new_txn.push((payment.amount, &payment.id));
-							inner_ref.tx_metadata.insert(
-								payment_id,
-								TxMetadata {
-									ty: TxType::Payment { ty: PaymentType::IncomingLightning {} },
-									time: SystemTime::now()
-										.duration_since(SystemTime::UNIX_EPOCH)
-										.unwrap(),
-								},
-							);
-						}
-					}
-
-					if rebalance_enabled && Self::get_rebalance_amt(&inner_ref).await.is_some() {
-						new_txn.sort_unstable();
-						let victim_id = new_txn.first().map(|(_, id)| *id).unwrap_or_else(|| {
-							// Should only happen due to races settling balance, pick the latest.
-							latest_tx
-								.expect("We cannot have a balance if we have no transactions")
-								.1
-						});
-						Self::do_trusted_rebalance(&inner_ref, PaymentId::Trusted(*victim_id))
-							.await;
-					}
-				}
-
-				// detect if onchain was synced, if so, check if we need to rebalance
-				let new_onchain_sync_time = inner_ref
-					.ln_wallet
-					.inner
-					.ldk_node
-					.status()
-					.latest_onchain_wallet_sync_timestamp;
-				if new_onchain_sync_time.is_some() && onchain_sync_time != new_onchain_sync_time {
-					// find all new confirmed inbound onchain payments since last sync
-					let new_recvs =
-						inner_ref.ln_wallet.inner.ldk_node.list_payments_with_filter(|p| {
-							p.direction == PaymentDirection::Inbound
-								&& p.status == PaymentStatus::Succeeded
-								&& p.latest_update_timestamp > onchain_sync_time.unwrap_or(0)
-								&& matches!(
-									p.kind,
-									PaymentKind::Onchain {
-										status: ConfirmationStatus::Confirmed { .. },
-										..
-									}
-								)
-						});
-
-					let prev_onchain_sync_time = onchain_sync_time;
-					onchain_sync_time = new_onchain_sync_time;
-
-					// now create events for these payments
-					for payment in new_recvs {
-						let payment_id = PaymentId::Lightning(payment.id.0);
-						let (txid, status) = match payment.kind {
-							PaymentKind::Onchain { txid, status } => (txid, status),
-							_ => continue,
-						};
-						if let Err(e) =
-							inner_ref.event_queue.add_event(Event::OnchainPaymentReceived {
-								payment_id,
-								txid,
-								amount_sat: payment.amount_msat.unwrap() / 1_000,
-								status,
-							}) {
-							log_error!(
-								inner_ref.logger,
-								"Failed to add OnchainPaymentReceived event: {e:?}"
-							);
-						}
-					}
-
-					// check if we have funds that aren't anchor reserve && > rebalance_min
-					let spendable = inner_ref
-						.ln_wallet
-						.inner
-						.ldk_node
-						.list_balances()
-						.spendable_onchain_balance_sats;
-
-					if rebalance_enabled
-						&& spendable > inner_ref.tunables.rebalance_min.sats_rounding_up()
-					{
-						// find the new onchain receives since last sync
-						// if we have multiple, select the largest one as the one to mark as triggering the rebalance
-						let txs = inner_ref.ln_wallet.list_payments();
-						let new = txs
-							.into_iter()
-							.filter(|t| {
-								t.status == PaymentStatus::Succeeded
-									&& t.direction == PaymentDirection::Inbound
-									&& matches!(t.kind, PaymentKind::Onchain { .. })
-									&& t.latest_update_timestamp
-										>= prev_onchain_sync_time.unwrap_or(0)
-							})
-							.max_by_key(|t| t.amount_msat);
-						match new {
-							Some(new) => {
-								if let PaymentKind::Onchain { txid, .. } = new.kind {
-									Self::onchain_rebalance(&inner_ref, txid).await;
-								} else {
-									unreachable!(
-										"PaymentKind::Onchain should always be present for onchain payments"
-									);
-								}
-							},
-							None => {
-								log_error!(
-									inner_ref.logger,
-									"Detected onchain sync with balance updates, but no new onchain payments found"
-								);
-							},
-						}
-					}
-				}
+				rebalancer.do_rebalance_if_needed().await;
 
 				tokio::time::sleep(Duration::from_secs(1)).await;
 
@@ -601,203 +492,6 @@ where
 	/// Check if the lightning wallet is currently connected to the LSP.
 	pub fn is_connected_to_lsp(&self) -> bool {
 		self.inner.ln_wallet.is_connected_to_lsp()
-	}
-
-	async fn get_rebalance_amt(inner: &Arc<WalletImpl<T>>) -> Option<Amount> {
-		// We always assume lighting balance is an overestimate by `rebalance_min`.
-		let lightning_receivable = inner
-			.ln_wallet
-			.estimate_receivable_balance()
-			.saturating_sub(inner.tunables.rebalance_min);
-		let trusted_balance = inner.trusted.get_balance().await.ok()?;
-		let mut transfer_amt = cmp::min(lightning_receivable, trusted_balance);
-		if trusted_balance.saturating_sub(transfer_amt) > inner.tunables.trusted_balance_limit {
-			// We need to just get a new channel, there's too much that we need to get to lightning
-			transfer_amt = trusted_balance;
-		}
-		if transfer_amt > inner.tunables.rebalance_min { Some(transfer_amt) } else { None }
-	}
-
-	async fn do_trusted_rebalance(
-		inner: &Arc<WalletImpl<T>>, triggering_transaction_id: PaymentId,
-	) {
-		let _lock = inner.balance_mutex.lock().await;
-		log_info!(
-			inner.logger,
-			"Initiating rebalance, assigning fees to {}",
-			triggering_transaction_id
-		);
-
-		if let Some(transfer_amt) = Self::get_rebalance_amt(inner).await {
-			if let Ok(inv) = inner.ln_wallet.get_bolt11_invoice(Some(transfer_amt)).await {
-				log_debug!(
-					inner.logger,
-					"Attempting to pay invoice {inv} to rebalance for {transfer_amt:?}",
-				);
-				let expected_hash = *inv.payment_hash();
-				match inner.trusted.pay(&PaymentMethod::LightningBolt11(inv), transfer_amt).await {
-					Ok(rebalance_id) => {
-						log_debug!(
-							inner.logger,
-							"Rebalance trusted transaction initiated, id {rebalance_id}. Waiting for LN payment."
-						);
-						if let Err(e) = inner.event_queue.add_event(Event::RebalanceInitiated {
-							trigger_payment_id: triggering_transaction_id.clone(),
-							trusted_rebalance_payment_id: rebalance_id,
-							amount_msat: transfer_amt.milli_sats(),
-						}) {
-							log_error!(
-								inner.logger,
-								"Failed to add RebalanceInitiated event: {e:?}"
-							);
-						}
-
-						// get the fee of the rebalance transaction
-						let trusted_txs = inner.trusted.list_payments().await.unwrap_or_default();
-						let rebalance_tx_fee = trusted_txs
-							.iter()
-							.find(|p| p.id == rebalance_id)
-							.map(|p| p.fee)
-							.unwrap_or(Amount::ZERO);
-
-						let mut received_payment_id = None;
-						let mut fee_msat: u64 = rebalance_tx_fee.milli_sats();
-						while received_payment_id.is_none() {
-							for payment in inner.ln_wallet.list_payments() {
-								let (hash, counterparty_skimmed_fee_msat) = match payment.kind {
-									PaymentKind::Bolt11 { hash, .. } => (hash, None),
-									PaymentKind::Bolt11Jit {
-										hash,
-										counterparty_skimmed_fee_msat,
-										..
-									} => (hash, counterparty_skimmed_fee_msat),
-									_ => continue, // Ignore other payment kinds, we only care about the one we just sent.
-								};
-								if hash.0[..] == expected_hash[..] {
-									match payment.status.into() {
-										TxStatus::Completed => {
-											received_payment_id = Some(payment.id);
-											fee_msat += counterparty_skimmed_fee_msat.unwrap_or(0);
-										},
-										TxStatus::Pending => {},
-										TxStatus::Failed => return,
-									}
-									break;
-								}
-							}
-							if received_payment_id.is_none() {
-								inner.ln_wallet.await_payment_receipt().await;
-							}
-						}
-						let lightning_id = received_payment_id.map(|id| id.0).unwrap_or([0; 32]);
-						log_info!(
-							inner.logger,
-							"Rebalance succeeded. Assigned fees to {} for trusted tx {} and lightning tx {}",
-							triggering_transaction_id,
-							rebalance_id,
-							PaymentId::Lightning(lightning_id)
-						);
-						inner
-							.tx_metadata
-							.set_tx_caused_rebalance(&triggering_transaction_id)
-							.expect("Failed to write metadata for rebalance transaction");
-						let metadata = TxMetadata {
-							ty: TxType::TrustedToLightning {
-								trusted_payment: rebalance_id,
-								lightning_payment: lightning_id,
-								payment_triggering_transfer: triggering_transaction_id.clone(),
-							},
-							time: SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap(),
-						};
-						inner
-							.tx_metadata
-							.insert(PaymentId::Trusted(rebalance_id), metadata.clone());
-						inner.tx_metadata.insert(PaymentId::Lightning(lightning_id), metadata);
-
-						if let Err(e) = inner.event_queue.add_event(Event::RebalanceSuccessful {
-							trigger_payment_id: triggering_transaction_id,
-							trusted_rebalance_payment_id: rebalance_id,
-							ln_rebalance_payment_id: lightning_id,
-							amount_msat: transfer_amt.milli_sats(),
-							fee_msat,
-						}) {
-							log_error!(
-								inner.logger,
-								"Failed to add RebalanceSuccessful event: {e:?}"
-							);
-						}
-					},
-					Err(e) => {
-						log_info!(inner.logger, "Rebalance trusted transaction failed with {e:?}",);
-					},
-				}
-			}
-		}
-	}
-
-	async fn onchain_rebalance(inner: &Arc<WalletImpl<T>>, triggering_txid: Txid) {
-		let _ = inner.balance_mutex.lock().await;
-
-		// make sure we have a metadata entry for the triggering transaction
-		let trigger = PaymentId::Lightning(triggering_txid.to_byte_array());
-		if inner.tx_metadata.read().get(&trigger).is_none() {
-			inner.tx_metadata.insert(
-				trigger.clone(),
-				TxMetadata {
-					ty: TxType::Payment {
-						ty: PaymentType::IncomingOnChain { txid: Some(triggering_txid) },
-					},
-					time: SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap(),
-				},
-			);
-		}
-
-		log_info!(inner.logger, "Opening channel with LSP with on-chain funds");
-
-		// todo for now we can only open a channel, eventually move to splicing
-		let user_chan_id = match inner.ln_wallet.open_channel_with_lsp().await {
-			Ok(chan_id) => chan_id,
-			Err(e) => {
-				log_error!(inner.logger, "Failed to open channel with LSP: {e:?}");
-				return;
-			},
-		};
-
-		log_info!(inner.logger, "Initiated channel opened with LSP");
-
-		// wait for channel to be opened
-		let mut channel_txid: Option<Txid> = None;
-		while channel_txid.is_none() {
-			channel_txid = inner
-				.ln_wallet
-				.inner
-				.ldk_node
-				.list_channels()
-				.iter()
-				.find(|c| c.user_channel_id == user_chan_id)
-				.and_then(|c| c.funding_txo.map(|t| t.txid));
-			if channel_txid.is_none() {
-				inner.ln_wallet.await_channel_pending().await;
-			}
-		}
-
-		let chan_txid =
-			channel_txid.expect("channel_txid must be set after waiting for channel to open");
-
-		log_info!(
-			inner.logger,
-			"Channel open succeeded. Assigned fees to onchain recv {triggering_txid} for channel open tx {chan_txid}"
-		);
-
-		inner
-			.tx_metadata
-			.set_tx_caused_rebalance(&trigger)
-			.expect("Failed to write metadata for onchain rebalance transaction");
-		let metadata = TxMetadata {
-			ty: TxType::OnchainToLightning { channel_txid: chan_txid, triggering_txid },
-			time: SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap(),
-		};
-		inner.tx_metadata.insert(PaymentId::Lightning(chan_txid.to_byte_array()), metadata);
 	}
 
 	/// Lists the transactions which have been made.
@@ -1201,11 +895,7 @@ where
 								);
 								let inner_ref = Arc::clone(&self.inner);
 								tokio::spawn(async move {
-									Self::do_trusted_rebalance(
-										&inner_ref,
-										PaymentId::Lightning(id.0),
-									)
-									.await
+									inner_ref.rebalancer.do_rebalance_if_needed().await;
 								});
 								return Ok(());
 							},
@@ -1390,8 +1080,8 @@ where
 	pub async fn stop(&self) {
 		// wait for the balance mutex to ensure no other tasks are running
 		log_info!(self.inner.logger, "Stopping...");
-		log_debug!(self.inner.logger, "Waiting for balance mutex...");
-		let _ = self.inner.balance_mutex.lock().await;
+		log_info!(self.inner.logger, "Stopping rebalancer...");
+		let _ = self.inner.rebalancer.stop().await;
 
 		log_debug!(self.inner.logger, "Stopping ln wallet...");
 		self.inner.ln_wallet.stop();

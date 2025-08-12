@@ -1,6 +1,7 @@
 [workspace]
 members = [
     "orange-sdk",
+    "graduated-rebalancer",
     "examples/cli",
 ]
 default-members = ["orange-sdk"]

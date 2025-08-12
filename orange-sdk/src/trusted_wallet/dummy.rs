@@ -1,9 +1,11 @@
 #![cfg(feature = "_test-utils")]
 //! A dummy implementation of `TrustedWalletInterface` for testing purposes.
 
+use crate::bitcoin::hashes::Hash;
 use crate::event::EventQueue;
-use crate::trusted_wallet::{Error, Payment, TrustedPaymentId, TrustedWalletInterface};
-use crate::{InitFailure, TxStatus, WalletConfig};
+use crate::store::TxStatus;
+use crate::trusted_wallet::{Error, Payment, TrustedWalletInterface};
+use crate::{InitFailure, WalletConfig};
 use bitcoin_payment_instructions::PaymentMethod;
 use bitcoin_payment_instructions::amount::Amount;
 use corepc_node::client::bitcoin::Network;
@@ -82,9 +84,7 @@ impl DummyTrustedWallet {
 				match event {
 					Event::PaymentSuccessful { payment_id, fee_paid_msat, .. } => {
 						// convert id
-						let payment_id = payment_id.unwrap();
-						let short: [u8; 16] = payment_id.0[..16].try_into().unwrap();
-						let id = TrustedPaymentId(Uuid::from_bytes(short));
+						let id = payment_id.unwrap().0;
 
 						let mut payments = pays.write().unwrap();
 						let item = payments.iter_mut().find(|p| p.id == id);
@@ -97,9 +97,7 @@ impl DummyTrustedWallet {
 					},
 					Event::PaymentFailed { payment_id, .. } => {
 						// convert id
-						let payment_id = payment_id.unwrap();
-						let short: [u8; 16] = payment_id.0[..16].try_into().unwrap();
-						let id = TrustedPaymentId(Uuid::from_bytes(short));
+						let id = payment_id.unwrap().0;
 
 						let mut payments = pays.write().unwrap();
 						let item = payments.iter().cloned().enumerate().find(|(_, p)| p.id == id);
@@ -110,9 +108,7 @@ impl DummyTrustedWallet {
 					},
 					Event::PaymentReceived { payment_id, amount_msat, .. } => {
 						// convert id
-						let payment_id = payment_id.unwrap();
-						let short: [u8; 16] = payment_id.0[..16].try_into().unwrap();
-						let id = TrustedPaymentId(Uuid::from_bytes(short));
+						let id = payment_id.unwrap().0;
 
 						let mut payments = pays.write().unwrap();
 						// We create invoices on the fly without adding the payment to our list
@@ -230,26 +226,22 @@ impl TrustedWalletInterface for DummyTrustedWallet {
 
 	fn pay(
 		&self, method: &PaymentMethod, amount: Amount,
-	) -> impl Future<Output = Result<TrustedPaymentId, Error>> + Send {
+	) -> impl Future<Output = Result<[u8; 32], Error>> + Send {
 		async move {
 			let id = match method {
 				PaymentMethod::LightningBolt11(inv) => {
-					let id = self
-						.ldk_node
+					self.ldk_node
 						.bolt11_payment()
 						.send_using_amount(inv, amount.milli_sats(), None)
-						.unwrap();
-					let short: [u8; 16] = id.0[..16].try_into().unwrap();
-					TrustedPaymentId(Uuid::from_bytes(short))
+						.unwrap()
+						.0
 				},
 				PaymentMethod::LightningBolt12(offer) => {
-					let id = self
-						.ldk_node
+					self.ldk_node
 						.bolt12_payment()
 						.send_using_amount(offer, amount.milli_sats(), None, None)
-						.unwrap();
-					let short: [u8; 16] = id.0[..16].try_into().unwrap();
-					TrustedPaymentId(Uuid::from_bytes(short))
+						.unwrap()
+						.0
 				},
 				PaymentMethod::OnChain(address) => {
 					let txid = self
@@ -257,8 +249,7 @@ impl TrustedWalletInterface for DummyTrustedWallet {
 						.onchain_payment()
 						.send_to_address(address, amount.sats_rounding_up(), None)
 						.unwrap();
-					let short: [u8; 16] = txid[..16].try_into().unwrap();
-					TrustedPaymentId(Uuid::from_bytes(short))
+					txid.to_byte_array()
 				},
 			};
 

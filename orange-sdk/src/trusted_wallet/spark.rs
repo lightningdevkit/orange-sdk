@@ -1,13 +1,16 @@
 //! A implementation of `TrustedWalletInterface` using the Spark SDK.
 use crate::logging::Logger;
-use crate::trusted_wallet::{Error, Payment, TrustedPaymentId, TrustedWalletInterface};
-use crate::{Event, EventQueue, InitFailure, Seed, TxStatus, WalletConfig};
+use crate::store::{PaymentId, TxStatus};
+use crate::trusted_wallet::{Error, Payment, TrustedWalletInterface};
+use crate::{Event, EventQueue, InitFailure, Seed, WalletConfig};
 
 use ldk_node::bitcoin::hashes::Hash;
 use ldk_node::bitcoin::hashes::sha256::Hash as Sha256;
 use ldk_node::lightning::log_debug;
 use ldk_node::lightning::util::logger::Logger as _;
 use ldk_node::lightning_invoice::Bolt11Invoice;
+use ldk_node::lightning_types::payment::PaymentHash;
+use ldk_node::payment::ConfirmationStatus;
 
 use bitcoin_payment_instructions::PaymentMethod;
 use bitcoin_payment_instructions::amount::Amount;
@@ -17,9 +20,6 @@ use spark_wallet::{
 	WalletEvent,
 };
 
-use crate::store::PaymentId;
-use ldk_node::lightning_types::payment::PaymentHash;
-use ldk_node::payment::ConfirmationStatus;
 use std::future::Future;
 use std::str::FromStr;
 use std::sync::Arc;
@@ -79,9 +79,9 @@ impl TrustedWalletInterface for Spark {
 								{
 									event_queue
 										.add_event(Event::OnchainPaymentReceived {
-											payment_id: PaymentId::Trusted(TrustedPaymentId(
-												Uuid::from_bytes(transfer.id.to_bytes()),
-											)),
+											payment_id: PaymentId::Trusted(
+												convert_from_transfer_id(transfer.id.to_bytes()),
+											),
 											// todo this is kinda hacky, maybe we should make this optional
 											txid: transfer
 												.leaves
@@ -107,9 +107,9 @@ impl TrustedWalletInterface for Spark {
 								{
 									event_queue
 										.add_event(Event::PaymentReceived {
-											payment_id: PaymentId::Trusted(TrustedPaymentId(
-												Uuid::from_bytes(transfer.id.to_bytes()),
-											)),
+											payment_id: PaymentId::Trusted(
+												convert_from_transfer_id(transfer.id.to_bytes()),
+											),
 											payment_hash: PaymentHash([0; 32]), // fixme, spark does not give us the payment hash
 											amount_msat: transfer.total_value_sat * 1000,
 											custom_records: vec![],
@@ -164,7 +164,7 @@ impl TrustedWalletInterface for Spark {
 			for transfer in transfers {
 				res.push(Payment {
 					status: transfer.status.into(),
-					id: TrustedPaymentId(Uuid::from_bytes(transfer.id.to_bytes())),
+					id: convert_from_transfer_id(transfer.id.to_bytes()),
 					amount: Amount::from_sats(transfer.total_value_sat).expect("invalid amount"),
 					outbound: transfer.sender_id == our_pk.identity_public_key,
 					fee: Amount::ZERO, // Currently everything is free
@@ -194,7 +194,7 @@ impl TrustedWalletInterface for Spark {
 
 	fn pay(
 		&self, method: &PaymentMethod, amount: Amount,
-	) -> impl Future<Output = Result<TrustedPaymentId, Error>> + Send {
+	) -> impl Future<Output = Result<[u8; 32], Error>> + Send {
 		async move {
 			if let PaymentMethod::LightningBolt11(invoice) = method {
 				let res = self
@@ -209,11 +209,12 @@ impl TrustedWalletInterface for Spark {
 
 				match res {
 					PayLightningInvoiceResult::LightningPayment(pay) => {
-						Ok(TrustedPaymentId(Uuid::from_str(pay.id.as_str()).expect("invalid id")))
+						let uuid = Uuid::from_str(pay.id.as_str()).expect("invalid id");
+						Ok(convert_from_transfer_id(uuid.into_bytes()))
 					},
-					PayLightningInvoiceResult::Transfer(transfer) => Ok(TrustedPaymentId(
-						Uuid::from_str(transfer.id.to_string().as_str()).expect("invalid id"),
-					)),
+					PayLightningInvoiceResult::Transfer(transfer) => {
+						Ok(convert_from_transfer_id(transfer.id.to_bytes()))
+					},
 				}
 			} else {
 				Err(Error::Generic("Only BOLT 11 is currently supported".to_owned()))
@@ -245,4 +246,11 @@ impl From<TransferStatus> for TxStatus {
 			| TransferStatus::ReceiverRefundSigned => TxStatus::Failed,
 		}
 	}
+}
+
+// spark uses uuid which are only 16 bytes, just pad 0 bytes to the back for ease
+fn convert_from_transfer_id(uuid: [u8; 16]) -> [u8; 32] {
+	let mut bytes = [0; 32];
+	bytes[..16].copy_from_slice(&uuid);
+	bytes
 }

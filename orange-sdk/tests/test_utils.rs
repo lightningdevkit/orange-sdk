@@ -22,18 +22,17 @@ use uuid::Uuid;
 /// Waits for an async condition to be true, polling at a specified interval until a timeout.
 pub async fn wait_for_condition<F, Fut>(
 	interval: Duration, iterations: usize, condition_name: &str, mut condition: F,
-) -> Result<(), String>
-where
+) where
 	F: FnMut() -> Fut,
 	Fut: Future<Output = bool>,
 {
 	for _ in 0..iterations {
 		if condition().await {
-			return Ok(());
+			return;
 		}
 		tokio::time::sleep(interval).await;
 	}
-	Err(format!("Timeout waiting for condition: {condition_name}"))
+	panic!("Timeout waiting for condition: {condition_name}");
 }
 
 /// Waits for the next event from the wallet, polling every second for up to 10 seconds.
@@ -224,8 +223,7 @@ pub fn build_test_nodes() -> TestParams {
 				async move { res }
 			},
 		)
-		.await
-		.expect("Third party node did not sync balance in time");
+		.await;
 	});
 
 	let lsp_listen = lsp.listening_addresses().unwrap().first().unwrap().clone();
@@ -243,8 +241,7 @@ pub fn build_test_nodes() -> TestParams {
 			let res = third_party_clone.list_channels().first().is_some_and(|c| c.is_usable);
 			async move { res }
 		})
-		.await
-		.expect("Channel did not become usable in time");
+		.await;
 	});
 
 	// make sure it actually became usable
@@ -284,8 +281,7 @@ pub async fn open_channel_from_lsp(
 		let res = p.payment(&payment_id).is_some_and(|p| p.status == PaymentStatus::Succeeded);
 		async move { res }
 	})
-	.await
-	.expect("Payer payment did not succeed in time");
+	.await;
 
 	// check we received with a channel, wait for balance update on wallet side
 	wait_for_condition(
@@ -296,8 +292,7 @@ pub async fn open_channel_from_lsp(
 			wallet.get_balance().await.unwrap().available_balance > starting_bal.available_balance
 		},
 	)
-	.await
-	.expect("Wallet balance did not update in time after channel open");
+	.await;
 
 	let event = wait_next_event(&wallet).await;
 	assert!(matches!(event, orange_sdk::Event::ChannelOpened { .. }));

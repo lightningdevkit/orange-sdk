@@ -21,8 +21,6 @@ use ldk_node::lightning::util::persist::KVStore;
 use ldk_node::lightning::util::ser::{Readable, Writeable};
 use ldk_node::lightning::{impl_writeable_tlv_based, impl_writeable_tlv_based_enum};
 
-use crate::trusted_wallet::TrustedPaymentId;
-
 use std::collections::HashMap;
 use std::fmt;
 use std::str::FromStr;
@@ -69,14 +67,14 @@ pub struct Transaction {
 #[derive(Debug, Clone, Hash, PartialEq, Eq)]
 pub enum PaymentId {
 	Lightning([u8; 32]),
-	Trusted(TrustedPaymentId),
+	Trusted([u8; 32]),
 }
 
 impl fmt::Display for PaymentId {
 	fn fmt(&self, fmt: &mut fmt::Formatter) -> Result<(), fmt::Error> {
 		match self {
 			PaymentId::Lightning(bytes) => write!(fmt, "LN-{}", bytes.as_hex()),
-			PaymentId::Trusted(s) => write!(fmt, "TR-{}", s),
+			PaymentId::Trusted(s) => write!(fmt, "TR-{}", s.as_hex()),
 		}
 	}
 }
@@ -93,7 +91,7 @@ impl FromStr for PaymentId {
 				Ok(PaymentId::Lightning(id))
 			},
 			"TR-" => {
-				let id = TrustedPaymentId::from_str(&s[3..]).map_err(|_| ())?;
+				let id = FromHex::from_hex(&s[3..]).map_err(|_| ())?;
 				Ok(PaymentId::Trusted(id))
 			},
 			_ => Err(()),
@@ -171,7 +169,7 @@ impl_writeable_tlv_based_enum!(PaymentType,
 #[derive(Debug, Clone)]
 pub(crate) enum TxType {
 	TrustedToLightning {
-		trusted_payment: TrustedPaymentId,
+		trusted_payment: [u8; 32],
 		lightning_payment: [u8; 32],
 		payment_triggering_transfer: PaymentId,
 	},
@@ -214,8 +212,9 @@ pub(crate) struct TxMetadata {
 
 impl_writeable_tlv_based!(TxMetadata, { (0, ty, required), (2, time, required) });
 
+#[derive(Clone)]
 pub(crate) struct TxMetadataStore {
-	tx_metadata: RwLock<HashMap<PaymentId, TxMetadata>>,
+	tx_metadata: Arc<RwLock<HashMap<PaymentId, TxMetadata>>>,
 	store: Arc<dyn KVStore + Send + Sync>,
 }
 
@@ -235,7 +234,7 @@ impl TxMetadataStore {
 				.expect("Invalid data in transaction metadata storage");
 			tx_metadata.insert(key, data);
 		}
-		TxMetadataStore { store, tx_metadata: RwLock::new(tx_metadata) }
+		TxMetadataStore { store, tx_metadata: Arc::new(RwLock::new(tx_metadata)) }
 	}
 
 	pub fn read(&self) -> RwLockReadGuard<HashMap<PaymentId, TxMetadata>> {
@@ -274,9 +273,11 @@ impl TxMetadataStore {
 					.expect("We do not allow writes to fail");
 				Ok(())
 			} else {
+				eprintln!("payment_id {payment_id} is not a payment, cannot set rebalance");
 				Err(())
 			}
 		} else {
+			eprintln!("doesn't exist in metadata store: {payment_id}");
 			Err(())
 		}
 	}
@@ -310,6 +311,7 @@ pub(crate) fn set_rebalance_enabled(store: &dyn KVStore, enabled: bool) {
 #[cfg(test)]
 mod tests {
 	use super::*;
+	use ldk_node::bitcoin::hex::DisplayHex;
 	use std::str::FromStr;
 
 	#[test]
@@ -327,17 +329,17 @@ mod tests {
 		let parsed_ln_id = PaymentId::from_str(&ln_id_str).unwrap();
 		assert_eq!(ln_id, parsed_ln_id);
 
-		let trusted_uuid = uuid::Uuid::now_v7();
-		let trusted_id = PaymentId::Trusted(TrustedPaymentId(trusted_uuid));
+		let trusted_id_bytes = [0; 32];
+		let trusted_id = PaymentId::Trusted(trusted_id_bytes);
 		let trusted_id_str = trusted_id.to_string();
-		assert_eq!(trusted_id_str, format!("TR-{trusted_uuid}"));
+		assert_eq!(trusted_id_str, format!("TR-{}", trusted_id_bytes.as_hex()));
 		let parsed_trusted_id = PaymentId::from_str(&trusted_id_str).unwrap();
 		assert_eq!(trusted_id, parsed_trusted_id);
 
 		// Test invalid formats
 		assert!(PaymentId::from_str("INVALID").is_err());
 		assert!(PaymentId::from_str("LN-invalidhex").is_err());
-		assert!(PaymentId::from_str("TR-invaliduuid").is_err());
+		assert!(PaymentId::from_str("TR-invalidhex").is_err());
 		assert!(PaymentId::from_str("XX-something").is_err());
 	}
 }

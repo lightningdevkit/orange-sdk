@@ -2,11 +2,9 @@
 
 use crate::event::EventQueue;
 use crate::logging::Logger;
-use crate::{InitFailure, TxStatus, WalletConfig};
+use crate::store::TxStatus;
+use crate::{InitFailure, WalletConfig};
 
-use ldk_node::bitcoin::io;
-use ldk_node::lightning::ln::msgs::DecodeError;
-use ldk_node::lightning::util::ser::{Readable, Writeable, Writer};
 use ldk_node::lightning_invoice::Bolt11Invoice;
 
 use bitcoin_payment_instructions::PaymentMethod;
@@ -14,40 +12,12 @@ use bitcoin_payment_instructions::amount::Amount;
 
 use spark_wallet::SparkWalletError;
 
-use std::fmt;
 use std::future::Future;
-use std::str::FromStr;
 use std::sync::Arc;
 
 #[cfg(feature = "_test-utils")]
 pub mod dummy;
 pub mod spark;
-
-/// Payment ID from a trusted wallet.
-// todo spark uses uuids, should we force every other option to also use this?
-#[derive(Debug, Clone, Copy, Hash, PartialEq, Eq, PartialOrd, Ord)]
-pub struct TrustedPaymentId(pub(crate) uuid::Uuid);
-impl Readable for TrustedPaymentId {
-	fn read<R: io::Read>(r: &mut R) -> Result<Self, DecodeError> {
-		Ok(TrustedPaymentId(uuid::Uuid::from_bytes(Readable::read(r)?)))
-	}
-}
-impl Writeable for TrustedPaymentId {
-	fn write<W: Writer>(&self, w: &mut W) -> Result<(), io::Error> {
-		self.0.as_bytes().write(w)
-	}
-}
-impl fmt::Display for TrustedPaymentId {
-	fn fmt(&self, f: &mut fmt::Formatter) -> Result<(), fmt::Error> {
-		self.0.fmt(f)
-	}
-}
-impl FromStr for TrustedPaymentId {
-	type Err = <uuid::Uuid as FromStr>::Err;
-	fn from_str(s: &str) -> Result<Self, <uuid::Uuid as FromStr>::Err> {
-		Ok(TrustedPaymentId(uuid::Uuid::from_str(s)?))
-	}
-}
 
 // todo generic error type
 pub(crate) type Error = SparkWalletError;
@@ -59,7 +29,7 @@ pub(crate) type Error = SparkWalletError;
 #[derive(Debug, Clone)]
 pub struct Payment {
 	/// The unique identifier for the payment.
-	pub id: TrustedPaymentId,
+	pub id: [u8; 32],
 	/// The amount of the payment.
 	pub amount: Amount,
 	/// The fee associated with the payment.
@@ -104,11 +74,40 @@ pub trait TrustedWalletInterface: Sized + Send + Sync + private::Sealed {
 	/// Pays to the given payment method with the specified amount.
 	fn pay(
 		&self, method: &PaymentMethod, amount: Amount,
-	) -> impl Future<Output = Result<TrustedPaymentId, Error>> + Send;
+	) -> impl Future<Output = Result<[u8; 32], Error>> + Send;
 
 	/// Sync the wallet.
 	// todo this can be removed once we don't need it for spark, the wallet should handle this itself
 	fn sync(&self) -> impl Future<Output = ()> + Send;
+}
+
+pub(crate) struct WalletTrusted<T: TrustedWalletInterface>(pub(crate) Arc<T>);
+
+impl<T: TrustedWalletInterface> graduated_rebalancer::TrustedWallet for WalletTrusted<T> {
+	type Error = crate::trusted_wallet::Error;
+
+	fn get_balance(&self) -> impl Future<Output = Result<Amount, Self::Error>> + Send {
+		async move { self.0.get_balance().await }
+	}
+
+	fn get_bolt11_invoice(
+		&self, amount: Option<Amount>,
+	) -> impl Future<Output = Result<Bolt11Invoice, Self::Error>> + Send {
+		async move { self.0.get_bolt11_invoice(amount).await }
+	}
+
+	fn pay(
+		&self, method: &PaymentMethod, amount: Amount,
+	) -> impl Future<Output = Result<[u8; 32], Self::Error>> + Send {
+		async move { self.0.pay(method, amount).await }
+	}
+
+	fn get_tx_fee(&self, id: [u8; 32]) -> impl Future<Output = Option<Amount>> + Send {
+		async move {
+			let trusted_txs = self.0.list_payments().await.unwrap_or_default();
+			trusted_txs.iter().find(|p| p.id == id).map(|p| p.fee)
+		}
+	}
 }
 
 /// Private module with a marker trait. This is to get around `private_bounds` errors while also
