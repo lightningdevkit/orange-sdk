@@ -290,7 +290,8 @@ pub async fn open_channel_from_lsp(
 		10,
 		"wallet balance update after channel open",
 		|| async {
-			wallet.get_balance().await.unwrap().available_balance > starting_bal.available_balance
+			wallet.get_balance().await.unwrap().available_balance()
+				> starting_bal.available_balance()
 		},
 	)
 	.await;

@@ -402,13 +402,11 @@ async fn execute_command(command: Commands, state: &mut WalletState) -> Result<(
 
 			match wallet.get_balance().await {
 				Ok(balance) => {
-					println!(
-						"Available balance: {} sats",
-						balance.available_balance.sats().unwrap_or(0)
-					);
+					println!("Trusted balance: {} sats", balance.trusted.sats_rounding_up());
+					println!("LN balance: {} sats", balance.lightning.sats_rounding_up());
 					println!(
 						"Pending balance: {} sats",
-						balance.pending_balance.sats().unwrap_or(0)
+						balance.pending_balance.sats_rounding_up()
 					);
 				},
 				Err(e) => {

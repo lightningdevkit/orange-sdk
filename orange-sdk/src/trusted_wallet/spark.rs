@@ -6,8 +6,8 @@ use crate::{Event, EventQueue, InitFailure, Seed, WalletConfig};
 
 use ldk_node::bitcoin::hashes::Hash;
 use ldk_node::bitcoin::hashes::sha256::Hash as Sha256;
-use ldk_node::lightning::log_debug;
 use ldk_node::lightning::util::logger::Logger as _;
+use ldk_node::lightning::{log_debug, log_error};
 use ldk_node::lightning_invoice::Bolt11Invoice;
 use ldk_node::lightning_types::payment::PaymentHash;
 use ldk_node::payment::ConfirmationStatus;
@@ -187,6 +187,7 @@ impl TrustedWalletInterface for Spark {
 					.await
 					.map(|fees| Amount::from_sats(fees).expect("invalid amount"))
 			} else {
+				log_error!(self.logger, "Only BOLT 11 is currently supported for fee estimation");
 				Err(Error::Generic("Only BOLT 11 is currently supported".to_owned()))
 			}
 		}
@@ -224,7 +225,6 @@ impl TrustedWalletInterface for Spark {
 
 	fn sync(&self) -> impl Future<Output = ()> + Send {
 		async move {
-			log_debug!(&self.logger, "Spark syncing...");
 			let _ = self.spark_wallet.sync().await;
 		}
 	}

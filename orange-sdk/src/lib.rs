@@ -77,12 +77,21 @@ type Rebalancer<T> = GraduatedRebalancer<
 /// Represents the balances of the wallet, including available and pending balances.
 #[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Balances {
-	/// The balance that is immediately available for spending.
-	pub available_balance: Amount,
+	/// The balance in trusted wallet
+	pub trusted: Amount,
+	/// The balance in lightning wallet available for spending.
+	pub lightning: Amount,
 	/// The balance that is pending and not yet spendable.
 	/// This includes all on-chain balances. The on-chain balance will become
 	/// available after it has been spliced into a lightning channel.
 	pub pending_balance: Amount,
+}
+
+impl Balances {
+	/// Returns the total available balance, which is the sum of the lightning and trusted balances.
+	pub fn available_balance(&self) -> Amount {
+		self.lightning.saturating_add(self.trusted)
+	}
 }
 
 /// The main implementation of the wallet, containing both trusted and lightning wallet components.
@@ -717,7 +726,8 @@ where
 			ln_balance.onchain
 		);
 		Ok(Balances {
-			available_balance: ln_balance.lightning.saturating_add(trusted_balance),
+			trusted: trusted_balance,
+			lightning: ln_balance.lightning,
 			pending_balance: ln_balance.onchain,
 		})
 	}
