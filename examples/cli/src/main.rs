@@ -18,7 +18,9 @@ use std::io::Write;
 use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::runtime::Runtime;
+use tokio::signal;
 
 const NETWORK: Network = Network::Bitcoin; // Supports Bitcoin and Regtest
 
@@ -60,6 +62,7 @@ enum Commands {
 struct WalletState {
 	wallet: Wallet<Spark>,
 	_runtime: Arc<Runtime>, // Keep runtime alive
+	shutdown: Arc<AtomicBool>,
 }
 
 fn get_config(network: Network) -> Result<WalletConfig<SparkWalletConfig>> {
@@ -202,6 +205,7 @@ fn get_config(network: Network) -> Result<WalletConfig<SparkWalletConfig>> {
 
 impl WalletState {
 	async fn new(runtime: Arc<Runtime>) -> Result<Self> {
+		let shutdown = Arc::new(AtomicBool::new(false));
 		let config = get_config(NETWORK)
 			.with_context(|| format!("Failed to get wallet config for network: {NETWORK:?}"))?;
 
@@ -270,7 +274,7 @@ impl WalletState {
 					w.event_handled().unwrap();
 				});
 
-				Ok(WalletState { wallet, _runtime: runtime })
+				Ok(WalletState { wallet, _runtime: runtime, shutdown })
 			},
 			Err(e) => Err(anyhow::anyhow!("Failed to initialize wallet: {:?}", e)),
 		}
@@ -278,6 +282,10 @@ impl WalletState {
 
 	fn wallet(&self) -> &Wallet<Spark> {
 		&self.wallet
+	}
+
+	fn is_shutdown_requested(&self) -> bool {
+		self.shutdown.load(Ordering::Relaxed)
 	}
 }
 
@@ -294,6 +302,19 @@ fn main() -> Result<()> {
 	// Initialize wallet once at startup
 	let mut state = runtime.block_on(WalletState::new(runtime.clone()))?;
 
+	// Set up signal handling for graceful shutdown
+	let shutdown_state = state.shutdown.clone();
+	let shutdown_wallet = state.wallet.clone();
+	runtime.spawn(async move {
+		if let Ok(()) = signal::ctrl_c().await {
+			println!("\n{} Shutdown signal received, stopping wallet...", "⏹️".bright_yellow());
+			shutdown_state.store(true, Ordering::Relaxed);
+			shutdown_wallet.stop().await;
+			println!("{} Goodbye!", "👋".bright_green());
+			std::process::exit(0);
+		}
+	});
+
 	// If a command was provided via command line, execute it and start interactive mode
 	if let Some(command) = cli.command {
 		runtime.block_on(execute_command(command, &mut state))?;
@@ -308,6 +329,11 @@ async fn start_interactive_mode(mut state: WalletState) -> Result<()> {
 	let mut rl = DefaultEditor::new().context("Failed to create readline editor")?;
 
 	loop {
+		// Check if shutdown was requested by signal handler
+		if state.is_shutdown_requested() {
+			break;
+		}
+
 		let prompt = format!("{} ", "orange>".bright_green().bold());
 
 		let readline = rl.readline(&prompt);
@@ -339,11 +365,15 @@ async fn start_interactive_mode(mut state: WalletState) -> Result<()> {
 				}
 			},
 			Err(ReadlineError::Interrupted) => {
-				println!("{}", "Use 'exit' to quit".bright_yellow());
-				continue;
+				println!("\n{} Stopping wallet...", "⏹️".bright_yellow());
+				state.wallet().stop().await;
+				println!("{} Goodbye!", "👋".bright_green());
+				break;
 			},
 			Err(ReadlineError::Eof) => {
-				println!("{}", "Goodbye!".bright_green());
+				println!("\n{} Stopping wallet...", "⏹️".bright_yellow());
+				state.wallet().stop().await;
+				println!("{} Goodbye!", "👋".bright_green());
 				break;
 			},
 			Err(err) => {
