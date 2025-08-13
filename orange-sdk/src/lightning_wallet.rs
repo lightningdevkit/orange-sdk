@@ -13,12 +13,12 @@ use ldk_node::bitcoin::secp256k1::PublicKey;
 use ldk_node::bitcoin::{Address, Network, Script};
 use ldk_node::lightning::ln::channelmanager::PaymentId;
 use ldk_node::lightning::ln::msgs::SocketAddress;
-use ldk_node::lightning::log_debug;
 use ldk_node::lightning::util::logger::Logger as _;
 use ldk_node::lightning::util::persist::KVStore;
+use ldk_node::lightning::{log_debug, log_error};
 use ldk_node::lightning_invoice::{Bolt11Invoice, Bolt11InvoiceDescription, Description};
 use ldk_node::payment::{PaymentDetails, PaymentDirection, PaymentKind, PaymentStatus};
-use ldk_node::{NodeError, UserChannelId};
+use ldk_node::{NodeError, UserChannelId, lightning};
 
 use graduated_rebalancer::{LightningBalance, ReceivedLightningPayment};
 
@@ -92,7 +92,7 @@ pub(crate) struct LightningWallet {
 }
 
 impl LightningWallet {
-	pub(super) fn init<E>(
+	pub(super) async fn init<E>(
 		runtime: Arc<Runtime>, config: WalletConfig<E>, store: Arc<dyn KVStore + Sync + Send>,
 		event_queue: Arc<EventQueue>, logger: Arc<Logger>,
 	) -> Result<Self, InitFailure> {
@@ -160,6 +160,33 @@ impl LightningWallet {
 		};
 
 		builder.set_custom_logger(Arc::clone(&logger) as Arc<dyn ldk_node::logger::LogWriter>);
+
+		// download scorer and write to storage
+		// todo switch to https://github.com/lightningdevkit/ldk-node/pull/449 once available
+		if let Some(url) = config.scorer_url {
+			let fetch = tokio::time::timeout(std::time::Duration::from_secs(10), reqwest::get(url));
+			let res = fetch.await.map_err(|e| {
+				log_error!(logger, "Timed out downloading scorer: {e}");
+				InitFailure::LdkNodeStartFailure(NodeError::InvalidUri)
+			})?;
+
+			let req = res.map_err(|e| {
+				log_error!(logger, "Failed to download scorer: {e}");
+				InitFailure::LdkNodeStartFailure(NodeError::InvalidUri)
+			})?;
+
+			let bytes = req.bytes().await.map_err(|e| {
+				log_debug!(logger, "Failed to read scorer bytes: {e}");
+				InitFailure::LdkNodeStartFailure(NodeError::InvalidUri)
+			})?;
+
+			store.write(
+				lightning::util::persist::SCORER_PERSISTENCE_PRIMARY_NAMESPACE,
+				lightning::util::persist::SCORER_PERSISTENCE_SECONDARY_NAMESPACE,
+				lightning::util::persist::SCORER_PERSISTENCE_KEY,
+				bytes.as_ref(),
+			)?;
+		}
 
 		let ldk_node = Arc::new(builder.build_with_store(Arc::clone(&store))?);
 		let (payment_receipt_sender, payment_receipt_flag) = watch::channel(());

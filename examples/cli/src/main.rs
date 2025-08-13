@@ -109,6 +109,7 @@ impl WalletState {
 				"tcp://spark-regtest.benthecarman.com:50001".to_string(),
 			),
 			lsp: (lsp_address, lsp_pubkey, None),
+			scorer_url: None,
 			network,
 			seed,
 			tunables: Tunables::default(),

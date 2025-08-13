@@ -197,6 +197,10 @@ pub struct WalletConfig<E> {
 	/// Lightning Service Provider (LSP) configuration.
 	/// The address to connect to the LSP, the LSP node id, and an optional auth token.
 	pub lsp: (SocketAddress, PublicKey, Option<String>),
+	/// URL to download a scorer from. This is for the lightning node to get its route
+	/// scorer from a remote server instead of having to probe and find optimal routes
+	/// locally.
+	pub scorer_url: Option<String>,
 	/// The Bitcoin network the wallet operates on.
 	pub network: Network,
 	/// The seed used for wallet generation.
@@ -410,13 +414,16 @@ where
 
 		let trusted =
 			Arc::new(T::init(&config, Arc::clone(&event_queue), Arc::clone(&logger)).await?);
-		let ln_wallet = Arc::new(LightningWallet::init(
-			Arc::clone(&runtime),
-			config,
-			Arc::clone(&store),
-			Arc::clone(&event_queue),
-			Arc::clone(&logger),
-		)?);
+		let ln_wallet = Arc::new(
+			LightningWallet::init(
+				Arc::clone(&runtime),
+				config,
+				Arc::clone(&store),
+				Arc::clone(&event_queue),
+				Arc::clone(&logger),
+			)
+			.await?,
+		);
 
 		let tx_metadata = TxMetadataStore::new(Arc::clone(&store));
 

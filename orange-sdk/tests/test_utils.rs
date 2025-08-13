@@ -182,6 +182,7 @@ fn build_wallet_config<E>(
 			password: cookie.password,
 		},
 		lsp: (socket_addr, lsp_pk, None),
+		scorer_url: None,
 		network: Network::Regtest,
 		seed: Seed::Seed64(seed),
 		tunables: Default::default(),
