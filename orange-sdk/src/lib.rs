@@ -413,6 +413,9 @@ where
 		let tunables = config.tunables;
 		let network = config.network;
 		let logger = Arc::new(Logger::new(&config.log_file).expect("Failed to open log file"));
+
+		log_info!(logger, "Initializing orange on network: {network}");
+
 		let store: Arc<dyn KVStore + Send + Sync> = match &config.storage_config {
 			StorageConfig::LocalSQLite(path) => {
 				Arc::new(SqliteStore::new(path.into(), Some("orange.sqlite".to_owned()), None)?)
