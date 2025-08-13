@@ -20,6 +20,8 @@ use std::str::FromStr;
 use std::sync::Arc;
 use tokio::runtime::Runtime;
 
+const NETWORK: Network = Network::Bitcoin; // Supports Bitcoin and Regtest
+
 #[derive(Parser)]
 #[command(author, version, about, long_about = None)]
 struct Cli {
@@ -58,25 +60,23 @@ struct WalletState {
 	_runtime: Arc<Runtime>, // Keep runtime alive
 }
 
-impl WalletState {
-	async fn new(runtime: Arc<Runtime>) -> Result<Self> {
-		// Hardcoded configuration
-		let network = Network::Regtest;
-		let storage_path = "./wallet_data";
+fn get_config(network: Network) -> Result<WalletConfig<SparkWalletConfig>> {
+	let storage_path = format!("./wallet_data/{network}");
 
-		// Generate or load seed
-		let seed = generate_or_load_seed(storage_path)?;
+	// Generate or load seed
+	let seed = generate_or_load_seed(&storage_path)?;
 
-		// Hardcoded LSP config for demo
-		let lsp_address = "185.150.162.100:3551"
-			.parse()
-			.map_err(|_| anyhow::anyhow!("Failed to parse LSP address"))?;
-		let lsp_pubkey = "02a88abd44b3cfc9c0eb7cd93f232dc473de4f66bcea0ee518be70c3b804c90201"
-			.parse()
-			.context("Failed to parse LSP public key")?;
+	match network {
+		Network::Regtest => {
+			let lsp_address = "185.150.162.100:3551"
+				.parse()
+				.map_err(|_| anyhow::anyhow!("Failed to parse LSP address"))?;
+			let lsp_pubkey = "02a88abd44b3cfc9c0eb7cd93f232dc473de4f66bcea0ee518be70c3b804c90201"
+				.parse()
+				.context("Failed to parse LSP public key")?;
 
-		// pool config json
-		let pool_config = r#"
+			// pool config json
+			let pool_config = r#"
 		{
 			"coordinator_index": 0,
 			"operators": [
@@ -100,42 +100,115 @@ impl WalletState {
 				}
 			]
 		}"#;
-		let operator_pool: OperatorPoolConfig = serde_json::from_str(pool_config)?;
+			let operator_pool: OperatorPoolConfig = serde_json::from_str(pool_config)?;
 
-		let config = WalletConfig {
-			storage_config: StorageConfig::LocalSQLite(storage_path.to_string()),
-			log_file: PathBuf::from(format!("{storage_path}/wallet.log")),
-			chain_source: ChainSource::Electrum(
-				"tcp://spark-regtest.benthecarman.com:50001".to_string(),
-			),
-			lsp: (lsp_address, lsp_pubkey, None),
-			scorer_url: None,
-			network,
-			seed,
-			tunables: Tunables::default(),
-			extra_config: SparkWalletConfig {
-				network: Network::Regtest.try_into().unwrap(),
-				operator_pool,
-				reconnect_interval_seconds: 1,
-				service_provider_config: ServiceProviderConfig {
-					base_url: "https://api.lightspark.com".to_string(),
-					schema_endpoint: Some("graphql/spark/rc".to_string()),
-					identity_public_key: bitcoin::secp256k1::PublicKey::from_str(
-						"022bf283544b16c0622daecb79422007d167eca6ce9f0c98c0c49833b1f7170bfe",
-					)?,
+			Ok(WalletConfig {
+				storage_config: StorageConfig::LocalSQLite(storage_path.to_string()),
+				log_file: PathBuf::from(format!("{storage_path}/wallet.log")),
+				chain_source: ChainSource::Electrum(
+					"tcp://spark-regtest.benthecarman.com:50001".to_string(),
+				),
+				lsp: (lsp_address, lsp_pubkey, None),
+				scorer_url: None,
+				network,
+				seed,
+				tunables: Tunables::default(),
+				extra_config: SparkWalletConfig {
+					network: network.try_into().unwrap(),
+					operator_pool,
+					reconnect_interval_seconds: 1,
+					service_provider_config: ServiceProviderConfig {
+						base_url: "https://api.lightspark.com".to_string(),
+						schema_endpoint: Some("graphql/spark/rc".to_string()),
+						identity_public_key: bitcoin::secp256k1::PublicKey::from_str(
+							"022bf283544b16c0622daecb79422007d167eca6ce9f0c98c0c49833b1f7170bfe",
+						)?,
+					},
+					split_secret_threshold: 2,
+					tokens_config: SparkWalletConfig::default_tokens_config(),
 				},
-				split_secret_threshold: 2,
-				tokens_config: SparkWalletConfig::default_tokens_config(),
-			},
-		};
+			})
+		},
+		Network::Bitcoin => {
+			// Matt's LSP config for demo
+			let lsp_address = "69.59.18.144:9735"
+				.parse()
+				.map_err(|_| anyhow::anyhow!("Failed to parse LSP address"))?;
+			let lsp_pubkey = "021deaa26ce6bb7cc63bd30e83a2bba1c0368269fa3bb9b616a24f40d941ac7d32"
+				.parse()
+				.context("Failed to parse LSP public key")?;
+
+			// pool config json
+			let pool_config = r#"
+		{
+			"coordinator_index": 0,
+			"operators": [
+				{
+					"id": 0,
+					"identifier": "0000000000000000000000000000000000000000000000000000000000000001",
+					"address": "https://0.spark.lightspark.com",
+					"identity_public_key": "03dfbdff4b6332c220f8fa2ba8ed496c698ceada563fa01b67d9983bfc5c95e763"
+				},
+				{
+					"id": 1,
+					"identifier": "0000000000000000000000000000000000000000000000000000000000000002",
+					"address": "https://1.spark.lightspark.com",
+					"identity_public_key": "03e625e9768651c9be268e287245cc33f96a68ce9141b0b4769205db027ee8ed77"
+				},
+				{
+					"id": 2,
+					"identifier": "0000000000000000000000000000000000000000000000000000000000000003",
+					"address": "https://2.spark.flashnet.xyz",
+					"identity_public_key": "022eda13465a59205413086130a65dc0ed1b8f8e51937043161f8be0c369b1a410"
+				}
+			]
+		}"#;
+			let operator_pool: OperatorPoolConfig = serde_json::from_str(pool_config)?;
+
+			Ok(WalletConfig {
+				storage_config: StorageConfig::LocalSQLite(storage_path.to_string()),
+				log_file: PathBuf::from(format!("{storage_path}/wallet.log")),
+				chain_source: ChainSource::Esplora {
+					url: "https://blockstream.info/api".to_string(),
+					username: None,
+					password: None,
+				},
+				lsp: (lsp_address, lsp_pubkey, None),
+				scorer_url: None,
+				network,
+				seed,
+				tunables: Tunables::default(),
+				extra_config: SparkWalletConfig {
+					network: network.try_into().unwrap(),
+					operator_pool,
+					reconnect_interval_seconds: 1,
+					service_provider_config: ServiceProviderConfig {
+						base_url: "https://api.lightspark.com".to_string(),
+						schema_endpoint: Some("graphql/spark/rc".to_string()),
+						identity_public_key: bitcoin::secp256k1::PublicKey::from_str(
+							"023e33e2920326f64ea31058d44777442d97d7d5cbfcf54e3060bc1695e5261c93",
+						)?,
+					},
+					split_secret_threshold: 2,
+					tokens_config: SparkWalletConfig::default_tokens_config(),
+				},
+			})
+		},
+		_ => Err(anyhow::anyhow!("Unsupported network: {network:?}")),
+	}
+}
+
+impl WalletState {
+	async fn new(runtime: Arc<Runtime>) -> Result<Self> {
+		let config = get_config(NETWORK)
+			.with_context(|| format!("Failed to get wallet config for network: {NETWORK:?}"))?;
 
 		println!("{} Initializing wallet...", "⚡".bright_yellow());
 
 		match Wallet::new(runtime.clone(), config).await {
 			Ok(wallet) => {
 				println!("{} Wallet initialized successfully!", "✅".bright_green());
-				println!("Network: {}", "regtest".bright_cyan());
-				println!("Storage: {}", storage_path.bright_cyan());
+				println!("Network: {}", NETWORK.to_string().bright_cyan());
 
 				let w = wallet.clone();
 				runtime.spawn(async move {
@@ -406,7 +479,6 @@ async fn execute_command(command: Commands, state: &mut WalletState) -> Result<(
 			let wallet = state.wallet();
 
 			println!("{} Wallet Status", "📊".bright_blue().bold());
-			println!("Status: {}", "Initialized".bright_green());
 			println!("Node ID: {}", wallet.node_id().to_string().bright_cyan());
 			println!(
 				"LSP Connected: {}",
@@ -520,8 +592,8 @@ fn print_help() {
 	println!();
 	println!("{}", "Note:".bright_yellow().bold());
 	println!("  The wallet will be auto-initialized on first use with:");
-	println!("  - Network: regtest");
-	println!("  - Storage: ./wallet_data");
+	println!("  - Network: {NETWORK}");
+	println!("  - Storage: ./wallet_data/{NETWORK}");
 	println!("  - Generated seed phrase (displayed on init)");
 }
 
