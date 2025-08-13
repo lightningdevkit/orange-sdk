@@ -49,6 +49,8 @@ enum Commands {
 	Status,
 	/// List recent transactions
 	Transactions,
+	/// List our lightning Channels
+	Channels,
 	/// Clear the screen
 	Clear,
 	/// Exit the application
@@ -236,8 +238,8 @@ impl WalletState {
 								amount_sat
 							);
 						},
-						Event::ChannelOpened { .. } => {
-							println!("{} Channel opened", "🔓".bright_green());
+						Event::ChannelOpened { funding_txo, .. } => {
+							println!("{} Channel opened: {funding_txo}", "🔓".bright_green());
 						},
 						Event::ChannelClosed { reason, .. } => {
 							println!(
@@ -379,7 +381,8 @@ fn parse_command(input: &str) -> Result<Commands> {
 			Ok(Commands::Receive { amount })
 		},
 		"status" => Ok(Commands::Status),
-		"transactions" | "tx" => Ok(Commands::Transactions),
+		"transactions" | "txs" | "tx" => Ok(Commands::Transactions),
+		"channels" | "chan" => Ok(Commands::Channels),
 		"clear" | "cls" => Ok(Commands::Clear),
 		"exit" | "quit" => Ok(Commands::Exit),
 		"help" => {
@@ -543,6 +546,38 @@ async fn execute_command(command: Commands, state: &mut WalletState) -> Result<(
 				},
 			}
 		},
+		Commands::Channels => {
+			let wallet = state.wallet();
+
+			let channels = wallet.channels();
+
+			if channels.is_empty() {
+				println!("{} No channels found.", "🔒".bright_yellow());
+			} else {
+				println!("{} Found {} channels:", "🔒".bright_green(), channels.len());
+				for channel in channels {
+					let status = if channel.is_usable {
+						"Usable".bright_green()
+					} else if channel.is_channel_ready {
+						"Ready".bright_yellow()
+					} else {
+						"Inactive".bright_red()
+					};
+					println!(
+						"{} Channel TXO: {}, Status: {}, Inbound Capacity: {} sats, Outbound Capacity: {} sats",
+						"🔗".bright_cyan(),
+						channel
+							.funding_txo
+							.map(|t| t.to_string())
+							.unwrap_or("Unknown".to_string())
+							.bright_cyan(),
+						status.bright_yellow(),
+						(channel.inbound_capacity_msat / 1_000).to_string().bright_green(),
+						(channel.outbound_capacity_msat / 1_000).to_string().bright_green(),
+					);
+				}
+			}
+		},
 		Commands::Clear => {
 			print!("\x1B[2J\x1B[1;1H");
 			std::io::stdout().flush().unwrap();
@@ -575,8 +610,8 @@ fn print_help() {
 	println!("  {}", "transactions".bright_green().bold());
 	println!("    List recent transactions");
 	println!();
-	println!("  {}", "events".bright_green().bold());
-	println!("    Process pending wallet events");
+	println!("  {}", "channels".bright_green().bold());
+	println!("    List channels");
 	println!();
 	println!("  {}", "clear".bright_green().bold());
 	println!("    Clear the terminal screen");

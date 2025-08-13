@@ -36,7 +36,7 @@ use ldk_node::lightning::util::persist::KVStore;
 use ldk_node::lightning::{log_debug, log_error, log_info, log_warn};
 use ldk_node::lightning_invoice::Bolt11Invoice;
 use ldk_node::payment::PaymentKind;
-use ldk_node::{BuildError, NodeError};
+use ldk_node::{BuildError, ChannelDetails, NodeError};
 
 use tokio::runtime::Runtime;
 
@@ -499,6 +499,11 @@ where
 	/// Check if the lightning wallet is currently connected to the LSP.
 	pub fn is_connected_to_lsp(&self) -> bool {
 		self.inner.ln_wallet.is_connected_to_lsp()
+	}
+
+	/// List our current channels
+	pub fn channels(&self) -> Vec<ChannelDetails> {
+		self.inner.ln_wallet.inner.ldk_node.list_channels()
 	}
 
 	/// Lists the transactions which have been made.
