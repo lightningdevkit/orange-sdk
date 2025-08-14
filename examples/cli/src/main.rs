@@ -7,12 +7,10 @@ use rustyline::error::ReadlineError;
 use orange_sdk::bitcoin_payment_instructions::amount::Amount;
 use orange_sdk::trusted_wallet::spark::Spark;
 use orange_sdk::{
-	ChainSource, Event, Mnemonic, PaymentInfo, Seed, SparkWalletConfig, StorageConfig, Tunables,
-	Wallet, WalletConfig, bitcoin, bitcoin::Network,
+	ChainSource, Event, Mnemonic, OperatorPoolConfig, PaymentInfo, Seed, ServiceProviderConfig,
+	SparkWalletConfig, StorageConfig, Tunables, Wallet, WalletConfig, bitcoin, bitcoin::Network,
 };
 use rand::RngCore;
-use spark::operator::OperatorPoolConfig;
-use spark::ssp::ServiceProviderConfig;
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;

@@ -61,7 +61,7 @@ pub use event::{Event, EventQueue};
 pub use ldk_node::bip39::Mnemonic;
 pub use ldk_node::bitcoin;
 pub use ldk_node::payment::ConfirmationStatus;
-pub use spark_wallet::SparkWalletConfig;
+pub use spark_wallet::{OperatorPoolConfig, ServiceProviderConfig, SparkWalletConfig};
 pub use store::{PaymentType, Transaction, TxStatus};
 
 type Rebalancer<T> = GraduatedRebalancer<
