@@ -316,8 +316,7 @@ fn test_receive_to_onchain() {
 	})
 }
 
-#[test]
-fn test_pay_lightning_from_self_custody() {
+fn run_test_pay_lightning_from_self_custody(amountless: bool) {
 	let TestParams { wallet, lsp: _, bitcoind, third_party, rt } = build_test_nodes();
 
 	rt.block_on(async move {
@@ -334,8 +333,11 @@ fn test_pay_lightning_from_self_custody() {
 
 		// get invoice from third party node
 		let desc = Bolt11InvoiceDescription::Direct(Description::empty());
-		let invoice =
-			third_party.bolt11_payment().receive(amount.milli_sats(), &desc, 300).unwrap();
+		let invoice = if amountless {
+			third_party.bolt11_payment().receive_variable_amount(&desc, 300).unwrap()
+		} else {
+			third_party.bolt11_payment().receive(amount.milli_sats(), &desc, 300).unwrap()
+		};
 
 		let instr = wallet.parse_payment_instructions(invoice.to_string().as_str()).await.unwrap();
 		let info = PaymentInfo::build(instr, amount).unwrap();
@@ -390,7 +392,12 @@ fn test_pay_lightning_from_self_custody() {
 }
 
 #[test]
-fn test_pay_bolt12_from_self_custody() {
+fn test_pay_lightning_from_self_custody() {
+	run_test_pay_lightning_from_self_custody(false);
+	run_test_pay_lightning_from_self_custody(true);
+}
+
+fn run_test_pay_bolt12_from_self_custody(amountless: bool) {
 	let TestParams { wallet, lsp: _, bitcoind, third_party, rt } = build_test_nodes();
 
 	rt.block_on(async move {
@@ -406,8 +413,11 @@ fn test_pay_bolt12_from_self_custody() {
 		let amount = Amount::from_sats(1_000).unwrap();
 
 		// get offer from third party node
-		let offer =
-			third_party.bolt12_payment().receive(amount.milli_sats(), "test", None, None).unwrap();
+		let offer = if amountless {
+			third_party.bolt12_payment().receive_variable_amount("test", None).unwrap()
+		} else {
+			third_party.bolt12_payment().receive(amount.milli_sats(), "test", None, None).unwrap()
+		};
 
 		let instr = wallet.parse_payment_instructions(offer.to_string().as_str()).await.unwrap();
 		let info = PaymentInfo::build(instr, amount).unwrap();
@@ -459,6 +469,12 @@ fn test_pay_bolt12_from_self_custody() {
 			&& p.direction == PaymentDirection::Inbound
 			&& p.amount_msat == Some(amount.milli_sats())));
 	})
+}
+
+#[test]
+fn test_pay_bolt12_from_self_custody() {
+	run_test_pay_bolt12_from_self_custody(false);
+	run_test_pay_bolt12_from_self_custody(true);
 }
 
 #[test]
