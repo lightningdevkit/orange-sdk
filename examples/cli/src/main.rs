@@ -142,6 +142,7 @@ fn get_config(network: Network) -> Result<WalletConfig<SparkWalletConfig>> {
 			let lsp_pubkey = "021deaa26ce6bb7cc63bd30e83a2bba1c0368269fa3bb9b616a24f40d941ac7d32"
 				.parse()
 				.context("Failed to parse LSP public key")?;
+			let lsp_token = Some("DeveloperTestingOnly".to_string());
 
 			// pool config json
 			let pool_config = r#"
@@ -178,7 +179,7 @@ fn get_config(network: Network) -> Result<WalletConfig<SparkWalletConfig>> {
 					username: None,
 					password: None,
 				},
-				lsp: (lsp_address, lsp_pubkey, None),
+				lsp: (lsp_address, lsp_pubkey, lsp_token),
 				scorer_url: None,
 				network,
 				seed,
