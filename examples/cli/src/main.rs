@@ -480,7 +480,7 @@ async fn execute_command(command: Commands, state: &mut WalletState) -> Result<(
 			println!("{} Generating payment request...", "📥".bright_yellow());
 
 			let amount = amount
-				.map(|amt| Amount::from_sats(amt))
+				.map(Amount::from_sats)
 				.transpose()
 				.map_err(|_| anyhow::anyhow!("Invalid amount"))?;
 
