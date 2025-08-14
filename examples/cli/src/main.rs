@@ -488,7 +488,7 @@ async fn execute_command(command: Commands, state: &mut WalletState) -> Result<(
 				Ok(uri) => {
 					match amount {
 						Some(amt) => {
-							println!("Invoice for {} sats:", amt.sats().unwrap_or(0));
+							println!("Invoice for {} sats:", amt.sats_rounding_up());
 						},
 						None => {
 							println!("Invoice for any amount:");
@@ -527,12 +527,12 @@ async fn execute_command(command: Commands, state: &mut WalletState) -> Result<(
 			println!("Tunables:");
 			println!(
 				"  Trusted balance limit: {} sats",
-				tunables.trusted_balance_limit.sats().unwrap_or(0)
+				tunables.trusted_balance_limit.sats_rounding_up()
 			);
-			println!("  Rebalance minimum: {} sats", tunables.rebalance_min.sats().unwrap_or(0));
+			println!("  Rebalance minimum: {} sats", tunables.rebalance_min.sats_rounding_up());
 			println!(
 				"  On-chain receive threshold: {} sats",
-				tunables.onchain_receive_threshold.sats().unwrap_or(0)
+				tunables.onchain_receive_threshold.sats_rounding_up()
 			);
 		},
 		Commands::Transactions => {
@@ -561,7 +561,7 @@ async fn execute_command(command: Commands, state: &mut WalletState) -> Result<(
 								direction_icon,
 								format!("{:?}", tx.payment_type).bright_cyan(),
 								tx.amount
-									.map(|a| a.sats().unwrap_or(0).to_string())
+									.map(|a| a.sats_rounding_up().to_string())
 									.unwrap_or_else(|| "?".to_string())
 									.bright_green()
 							);
