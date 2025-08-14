@@ -131,7 +131,6 @@ impl LightningWallet {
 				// We don't want to run an RGS server in tests so just enable p2p gossip
 				builder.set_gossip_source_p2p();
 			},
-			_ => unreachable!("Unknown network"),
 		}
 		let (lsp_socket_addr, lsp_node_id, lsp_token) = config.lsp;
 		builder.set_liquidity_source_lsps2(lsp_node_id, lsp_socket_addr.clone(), lsp_token);
