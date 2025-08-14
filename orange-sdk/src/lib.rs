@@ -14,9 +14,7 @@
 //! shifted to minimize fees and ensure maximal security.
 
 use bitcoin_payment_instructions as instructions;
-use bitcoin_payment_instructions::{
-	PaymentInstructions, PossiblyResolvedPaymentMethod, http_resolver::HTTPHrnResolver,
-};
+use bitcoin_payment_instructions::{PaymentInstructions, http_resolver::HTTPHrnResolver};
 
 pub use bitcoin_payment_instructions::PaymentMethod;
 use bitcoin_payment_instructions::amount::Amount;
@@ -937,15 +935,18 @@ where
 		};
 
 		let methods = match &instructions.instructions {
-			PaymentInstructions::ConfigurableAmount(conf) => conf
-				.methods()
-				.map(|m| match m {
-					PossiblyResolvedPaymentMethod::LNURLPay { .. } => {
-						todo!("resolve lnurl to invoice")
-					},
-					PossiblyResolvedPaymentMethod::Resolved(resolved) => resolved.to_owned(),
-				})
-				.collect(),
+			PaymentInstructions::ConfigurableAmount(conf) => {
+				let res = conf.clone().set_amount(instructions.amount, &HTTPHrnResolver).await;
+				let fixed_instr = res.map_err(|e| {
+					log_error!(
+						self.inner.logger,
+						"Failed to set amount on payment instructions: {e}"
+					);
+					WalletError::LdkNodeFailure(NodeError::InvalidUri)
+				})?;
+
+				fixed_instr.methods().to_vec()
+			},
 			PaymentInstructions::FixedAmount(fixed) => fixed.methods().to_vec(),
 		};
 
