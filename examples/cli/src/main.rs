@@ -7,8 +7,8 @@ use rustyline::error::ReadlineError;
 use orange_sdk::bitcoin_payment_instructions::amount::Amount;
 use orange_sdk::trusted_wallet::spark::Spark;
 use orange_sdk::{
-	ChainSource, Event, Mnemonic, OperatorPoolConfig, PaymentInfo, Seed, ServiceProviderConfig,
-	SparkWalletConfig, StorageConfig, Tunables, Wallet, WalletConfig, bitcoin, bitcoin::Network,
+	ChainSource, Event, Mnemonic, PaymentInfo, Seed, SparkWalletConfig, StorageConfig, Tunables,
+	Wallet, WalletConfig, bitcoin::Network,
 };
 use rand::RngCore;
 use std::fs;
@@ -78,33 +78,6 @@ fn get_config(network: Network) -> Result<WalletConfig<SparkWalletConfig>> {
 				.parse()
 				.context("Failed to parse LSP public key")?;
 
-			// pool config json
-			let pool_config = r#"
-		{
-			"coordinator_index": 0,
-			"operators": [
-				{
-					"id": 0,
-					"identifier": "0000000000000000000000000000000000000000000000000000000000000001",
-					"address": "https://0.spark.lightspark.com",
-					"identity_public_key": "03dfbdff4b6332c220f8fa2ba8ed496c698ceada563fa01b67d9983bfc5c95e763"
-				},
-				{
-					"id": 1,
-					"identifier": "0000000000000000000000000000000000000000000000000000000000000002",
-					"address": "https://1.spark.lightspark.com",
-					"identity_public_key": "03e625e9768651c9be268e287245cc33f96a68ce9141b0b4769205db027ee8ed77"
-				},
-				{
-					"id": 2,
-					"identifier": "0000000000000000000000000000000000000000000000000000000000000003",
-					"address": "https://2.spark.flashnet.xyz",
-					"identity_public_key": "022eda13465a59205413086130a65dc0ed1b8f8e51937043161f8be0c369b1a410"
-				}
-			]
-		}"#;
-			let operator_pool: OperatorPoolConfig = serde_json::from_str(pool_config)?;
-
 			Ok(WalletConfig {
 				storage_config: StorageConfig::LocalSQLite(storage_path.to_string()),
 				log_file: PathBuf::from(format!("{storage_path}/wallet.log")),
@@ -116,20 +89,9 @@ fn get_config(network: Network) -> Result<WalletConfig<SparkWalletConfig>> {
 				network,
 				seed,
 				tunables: Tunables::default(),
-				extra_config: SparkWalletConfig {
-					network: network.try_into().unwrap(),
-					operator_pool,
-					reconnect_interval_seconds: 1,
-					service_provider_config: ServiceProviderConfig {
-						base_url: "https://api.lightspark.com".to_string(),
-						schema_endpoint: Some("graphql/spark/rc".to_string()),
-						identity_public_key: bitcoin::secp256k1::PublicKey::from_str(
-							"022bf283544b16c0622daecb79422007d167eca6ce9f0c98c0c49833b1f7170bfe",
-						)?,
-					},
-					split_secret_threshold: 2,
-					tokens_config: SparkWalletConfig::default_tokens_config(),
-				},
+				extra_config: SparkWalletConfig::default_config(
+					network.try_into().expect("valid network"),
+				),
 			})
 		},
 		Network::Bitcoin => {
@@ -141,33 +103,6 @@ fn get_config(network: Network) -> Result<WalletConfig<SparkWalletConfig>> {
 				.parse()
 				.context("Failed to parse LSP public key")?;
 			let lsp_token = Some("DeveloperTestingOnly".to_string());
-
-			// pool config json
-			let pool_config = r#"
-		{
-			"coordinator_index": 0,
-			"operators": [
-				{
-					"id": 0,
-					"identifier": "0000000000000000000000000000000000000000000000000000000000000001",
-					"address": "https://0.spark.lightspark.com",
-					"identity_public_key": "03dfbdff4b6332c220f8fa2ba8ed496c698ceada563fa01b67d9983bfc5c95e763"
-				},
-				{
-					"id": 1,
-					"identifier": "0000000000000000000000000000000000000000000000000000000000000002",
-					"address": "https://1.spark.lightspark.com",
-					"identity_public_key": "03e625e9768651c9be268e287245cc33f96a68ce9141b0b4769205db027ee8ed77"
-				},
-				{
-					"id": 2,
-					"identifier": "0000000000000000000000000000000000000000000000000000000000000003",
-					"address": "https://2.spark.flashnet.xyz",
-					"identity_public_key": "022eda13465a59205413086130a65dc0ed1b8f8e51937043161f8be0c369b1a410"
-				}
-			]
-		}"#;
-			let operator_pool: OperatorPoolConfig = serde_json::from_str(pool_config)?;
 
 			Ok(WalletConfig {
 				storage_config: StorageConfig::LocalSQLite(storage_path.to_string()),
@@ -182,20 +117,9 @@ fn get_config(network: Network) -> Result<WalletConfig<SparkWalletConfig>> {
 				network,
 				seed,
 				tunables: Tunables::default(),
-				extra_config: SparkWalletConfig {
-					network: network.try_into().unwrap(),
-					operator_pool,
-					reconnect_interval_seconds: 1,
-					service_provider_config: ServiceProviderConfig {
-						base_url: "https://api.lightspark.com".to_string(),
-						schema_endpoint: Some("graphql/spark/rc".to_string()),
-						identity_public_key: bitcoin::secp256k1::PublicKey::from_str(
-							"023e33e2920326f64ea31058d44777442d97d7d5cbfcf54e3060bc1695e5261c93",
-						)?,
-					},
-					split_secret_threshold: 2,
-					tokens_config: SparkWalletConfig::default_tokens_config(),
-				},
+				extra_config: SparkWalletConfig::default_config(
+					network.try_into().expect("valid network"),
+				),
 			})
 		},
 		_ => Err(anyhow::anyhow!("Unsupported network: {network:?}")),
