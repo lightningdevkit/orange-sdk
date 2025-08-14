@@ -187,7 +187,12 @@ impl TrustedWalletInterface for DummyTrustedWallet {
 	}
 
 	fn get_reusable_receive_uri(&self) -> impl Future<Output = Result<String, Error>> + Send {
-		async move { todo!() }
+		async move {
+			match self.ldk_node.bolt12_payment().receive_variable_amount("dummy offer", None) {
+				Ok(offer) => Ok(offer.to_string()),
+				Err(e) => Err(Error::Generic(e.to_string())),
+			}
+		}
 	}
 
 	fn get_bolt11_invoice(

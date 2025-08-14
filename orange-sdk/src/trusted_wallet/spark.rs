@@ -138,7 +138,7 @@ impl TrustedWalletInterface for Spark {
 	}
 
 	fn get_reusable_receive_uri(&self) -> impl Future<Output = Result<String, Error>> + Send {
-		async move { todo!() }
+		async move { Err(Error::Generic("Spark does not support BOLT 12".to_owned())) }
 	}
 
 	fn get_bolt11_invoice(

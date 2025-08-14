@@ -838,7 +838,8 @@ where
 
 	/// Estimates the fees required to pay a [`PaymentInstructions`]
 	pub async fn estimate_fee(&self, _payment_info: &PaymentInstructions) -> Amount {
-		todo!()
+		// todo implement fee estimation
+		Amount::ZERO
 	}
 
 	/// Initiates a payment using the provided [`PaymentInfo`]. This will pay from the trusted
