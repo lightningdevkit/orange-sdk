@@ -278,4 +278,10 @@ impl TrustedWalletInterface for DummyTrustedWallet {
 			// self.ldk_node.sync_wallets().unwrap()
 		}
 	}
+
+	fn stop(&self) -> impl Future<Output = ()> + Send {
+		async move {
+			let _ = self.ldk_node.stop();
+		}
+	}
 }

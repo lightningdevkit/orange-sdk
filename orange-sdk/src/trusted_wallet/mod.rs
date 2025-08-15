@@ -79,6 +79,10 @@ pub trait TrustedWalletInterface: Sized + Send + Sync + private::Sealed {
 	/// Sync the wallet.
 	// todo this can be removed once we don't need it for spark, the wallet should handle this itself
 	fn sync(&self) -> impl Future<Output = ()> + Send;
+
+	/// Stops the wallet, cleaning up any resources.
+	/// This is typically used to gracefully shut down the wallet.
+	fn stop(&self) -> impl Future<Output = ()> + Send;
 }
 
 pub(crate) struct WalletTrusted<T: TrustedWalletInterface>(pub(crate) Arc<T>);

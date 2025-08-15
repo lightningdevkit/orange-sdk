@@ -7,7 +7,7 @@ use crate::{Event, EventQueue, InitFailure, Seed, WalletConfig};
 use ldk_node::bitcoin::hashes::Hash;
 use ldk_node::bitcoin::hashes::sha256::Hash as Sha256;
 use ldk_node::lightning::util::logger::Logger as _;
-use ldk_node::lightning::{log_debug, log_error};
+use ldk_node::lightning::{log_debug, log_error, log_info};
 use ldk_node::lightning_invoice::Bolt11Invoice;
 use ldk_node::lightning_types::payment::PaymentHash;
 use ldk_node::payment::ConfirmationStatus;
@@ -20,6 +20,8 @@ use spark_wallet::{
 	WalletEvent,
 };
 
+use tokio::sync::watch;
+
 use std::future::Future;
 use std::str::FromStr;
 use std::sync::Arc;
@@ -29,6 +31,7 @@ use uuid::Uuid;
 #[derive(Clone)]
 pub struct Spark {
 	spark_wallet: Arc<SparkWallet<DefaultSigner>>,
+	shutdown_sender: watch::Sender<()>,
 	logger: Arc<Logger>,
 }
 
@@ -63,70 +66,81 @@ impl TrustedWalletInterface for Spark {
 			let spark_wallet =
 				Arc::new(SparkWallet::connect(config.extra_config.clone(), signer).await?);
 
+			let (shutdown_sender, mut shutdown_receiver) = watch::channel::<()>(());
 			let mut events = spark_wallet.subscribe_events();
 			let l = Arc::clone(&logger);
 			let w = Arc::clone(&spark_wallet);
 			tokio::spawn(async move {
-				match events.recv().await {
-					Ok(event) => {
-						log_debug!(&l, "Spark event: {event:?}");
-						match event {
-							WalletEvent::DepositConfirmed(node_id) => {
-								let transfers = w.list_transfers(None).await.unwrap();
-								if let Some(transfer) = transfers
-									.into_iter()
-									.find(|t| t.leaves.iter().any(|l| l.leaf.id == node_id))
-								{
-									event_queue
-										.add_event(Event::OnchainPaymentReceived {
-											payment_id: PaymentId::Trusted(
-												convert_from_transfer_id(transfer.id.to_bytes()),
-											),
-											// todo this is kinda hacky, maybe we should make this optional
-											txid: transfer
-												.leaves
-												.iter()
-												.find(|t| t.leaf.id == node_id)
-												.unwrap()
-												.leaf
-												.node_tx
-												.compute_txid(),
-											amount_sat: transfer.total_value_sat,
-											status: ConfirmationStatus::Unconfirmed, // fixme dont have block height
-										})
-										.unwrap();
-								}
-							},
-							WalletEvent::StreamConnected => {},
-							WalletEvent::StreamDisconnected => {},
-							WalletEvent::Synced => {},
-							WalletEvent::TransferClaimed(transfer_id) => {
-								let transfers = w.list_transfers(None).await.unwrap();
-								if let Some(transfer) =
-									transfers.into_iter().find(|t| t.id == transfer_id)
-								{
-									event_queue
-										.add_event(Event::PaymentReceived {
-											payment_id: PaymentId::Trusted(
-												convert_from_transfer_id(transfer.id.to_bytes()),
-											),
-											payment_hash: PaymentHash([0; 32]), // fixme, spark does not give us the payment hash
-											amount_msat: transfer.total_value_sat * 1000,
-											custom_records: vec![],
-											lsp_fee_msats: None,
-										})
-										.unwrap();
-								}
-							},
+				loop {
+					tokio::select! {
+						_ = shutdown_receiver.changed() => {
+							log_info!(l, "Deposit tracking loop shutdown signal received");
+							return;
 						}
-					},
-					Err(e) => {
-						log_debug!(l, "Spark event error: {e:?}");
-					},
+						event = events.recv() => {
+							match event {
+								Ok(event) => {
+									log_debug!(&l, "Spark event: {event:?}");
+									match event {
+										WalletEvent::DepositConfirmed(node_id) => {
+											let transfers = w.list_transfers(None).await.unwrap();
+											if let Some(transfer) = transfers
+												.into_iter()
+												.find(|t| t.leaves.iter().any(|l| l.leaf.id == node_id))
+											{
+												event_queue
+													.add_event(Event::OnchainPaymentReceived {
+														payment_id: PaymentId::Trusted(
+															convert_from_transfer_id(transfer.id.to_bytes()),
+														),
+														// todo this is kinda hacky, maybe we should make this optional
+														txid: transfer
+															.leaves
+															.iter()
+															.find(|t| t.leaf.id == node_id)
+															.unwrap()
+															.leaf
+															.node_tx
+															.compute_txid(),
+														amount_sat: transfer.total_value_sat,
+														status: ConfirmationStatus::Unconfirmed, // fixme dont have block height
+													})
+													.unwrap();
+											}
+										},
+										WalletEvent::StreamConnected => {},
+										WalletEvent::StreamDisconnected => {},
+										WalletEvent::Synced => {},
+										WalletEvent::TransferClaimed(transfer_id) => {
+											let transfers = w.list_transfers(None).await.unwrap();
+											if let Some(transfer) =
+												transfers.into_iter().find(|t| t.id == transfer_id)
+											{
+												event_queue
+													.add_event(Event::PaymentReceived {
+														payment_id: PaymentId::Trusted(
+															convert_from_transfer_id(transfer.id.to_bytes()),
+														),
+														payment_hash: PaymentHash([0; 32]), // fixme, spark does not give us the payment hash
+														amount_msat: transfer.total_value_sat * 1000,
+														custom_records: vec![],
+														lsp_fee_msats: None,
+													})
+													.unwrap();
+											}
+										},
+									}
+								},
+								Err(e) => {
+									log_debug!(l, "Spark event error: {e:?}");
+								},
+							}
+						}
+					}
 				}
 			});
 
-			Ok(Spark { spark_wallet, logger })
+			Ok(Spark { spark_wallet, shutdown_sender, logger })
 		}
 	}
 
@@ -226,6 +240,13 @@ impl TrustedWalletInterface for Spark {
 	fn sync(&self) -> impl Future<Output = ()> + Send {
 		async move {
 			let _ = self.spark_wallet.sync().await;
+		}
+	}
+
+	fn stop(&self) -> impl Future<Output = ()> + Send {
+		async move {
+			log_info!(self.logger, "Stopping Spark wallet");
+			let _ = self.shutdown_sender.send(());
 		}
 	}
 }

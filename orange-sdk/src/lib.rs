@@ -1110,6 +1110,9 @@ where
 		log_info!(self.inner.logger, "Stopping rebalancer...");
 		let _ = self.inner.rebalancer.stop().await;
 
+		log_info!(self.inner.logger, "Stopping trusted wallet...");
+		self.inner.trusted.stop().await;
+
 		log_debug!(self.inner.logger, "Stopping ln wallet...");
 		self.inner.ln_wallet.stop();
 	}
