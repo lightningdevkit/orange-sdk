@@ -264,39 +264,67 @@ impl PaymentInfo {
 	///
 	/// If [`PaymentInstructions`] is a [`PaymentInstructions::FixedAmount`], the amount must match the
 	/// fixed on-chain or lightning amount specified.
-	pub fn build(instructions: PaymentInstructions, amount: Amount) -> Result<PaymentInfo, ()> {
+	pub fn build(
+		instructions: PaymentInstructions, amount: Option<Amount>,
+	) -> Result<PaymentInfo, ()> {
 		match &instructions {
-			PaymentInstructions::ConfigurableAmount(conf) => {
-				if conf.min_amt().unwrap_or(Amount::ZERO) > amount
-					|| conf.max_amt().unwrap_or(Amount::MAX) < amount
-				{
-					return Err(());
-				}
+			PaymentInstructions::ConfigurableAmount(conf) => match amount {
+				None => Err(()),
+				Some(amount) => {
+					if conf.min_amt().unwrap_or(Amount::ZERO) > amount
+						|| conf.max_amt().unwrap_or(Amount::MAX) < amount
+					{
+						Err(())
+					} else {
+						Ok(PaymentInfo { instructions, amount })
+					}
+				},
 			},
 			PaymentInstructions::FixedAmount(fixed) => {
 				match (fixed.ln_payment_amount(), fixed.onchain_payment_amount()) {
-					(Some(amt), None) => {
-						if amt != amount {
-							return Err(());
-						}
+					(Some(ln), None) => match amount {
+						None => Ok(PaymentInfo { instructions, amount: ln }),
+						Some(amount) => {
+							if amount != ln {
+								Err(())
+							} else {
+								Ok(PaymentInfo { instructions, amount })
+							}
+						},
 					},
-					(None, Some(amt)) => {
-						if amt != amount {
-							return Err(());
-						}
+					(None, Some(chain)) => match amount {
+						None => Ok(PaymentInfo { instructions, amount: chain }),
+						Some(amount) => {
+							if amount != chain {
+								Err(())
+							} else {
+								Ok(PaymentInfo { instructions, amount })
+							}
+						},
 					},
-					(Some(ln), Some(chain)) => {
-						if ln != amount && chain != amount {
-							return Err(());
-						}
+					(Some(ln), Some(chain)) => match amount {
+						None => {
+							if ln == chain {
+								Ok(PaymentInfo { instructions, amount: ln })
+							} else {
+								Err(())
+							}
+						},
+						Some(amount) => {
+							if ln != amount && chain != amount {
+								Err(())
+							} else {
+								Ok(PaymentInfo { instructions, amount })
+							}
+						},
 					},
-					(None, None) => {
-						return Err(());
+					(None, None) => match amount {
+						None => Err(()),
+						Some(amount) => Ok(PaymentInfo { instructions, amount }),
 					},
 				}
 			},
 		}
-		Ok(PaymentInfo { instructions, amount })
 	}
 }
 

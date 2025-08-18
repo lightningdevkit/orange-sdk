@@ -340,7 +340,7 @@ fn run_test_pay_lightning_from_self_custody(amountless: bool) {
 		};
 
 		let instr = wallet.parse_payment_instructions(invoice.to_string().as_str()).await.unwrap();
-		let info = PaymentInfo::build(instr, amount).unwrap();
+		let info = PaymentInfo::build(instr, Some(amount)).unwrap();
 		wallet.pay(&info).await.unwrap();
 
 		let event = wait_next_event(&wallet).await;
@@ -420,7 +420,7 @@ fn run_test_pay_bolt12_from_self_custody(amountless: bool) {
 		};
 
 		let instr = wallet.parse_payment_instructions(offer.to_string().as_str()).await.unwrap();
-		let info = PaymentInfo::build(instr, amount).unwrap();
+		let info = PaymentInfo::build(instr, Some(amount)).unwrap();
 		wallet.pay(&info).await.unwrap();
 
 		let event = wait_next_event(&wallet).await;
@@ -519,7 +519,7 @@ fn test_pay_onchain_from_self_custody() {
 		let send_amount = Amount::from_sats(100_000).unwrap();
 
 		let instr = wallet.parse_payment_instructions(addr.to_string().as_str()).await.unwrap();
-		let info = PaymentInfo::build(instr, send_amount).unwrap();
+		let info = PaymentInfo::build(instr, Some(send_amount)).unwrap();
 		wallet.pay(&info).await.unwrap();
 
 		// confirm the tx
@@ -978,7 +978,7 @@ fn test_invalid_payment_instructions() {
 			third_party.bolt11_payment().receive(amount.milli_sats(), &desc, 300).unwrap();
 
 		let instr = wallet.parse_payment_instructions(invoice.to_string().as_str()).await.unwrap();
-		let info = PaymentInfo::build(instr, amount).unwrap();
+		let info = PaymentInfo::build(instr, Some(amount)).unwrap();
 
 		// This should fail due to insufficient balance
 		let result = wallet.pay(&info).await;
@@ -1009,7 +1009,7 @@ fn test_invalid_payment_instructions() {
 		let invoice = third_party.bolt11_payment().receive(1000, &desc, 300).unwrap(); // 1 msat
 
 		let instr = wallet.parse_payment_instructions(invoice.to_string().as_str()).await.unwrap();
-		let result = PaymentInfo::build(instr, zero_amount);
+		let result = PaymentInfo::build(instr, Some(zero_amount));
 		assert!(result.is_err(), "Zero amount payment should be rejected");
 
 		// Test 5: Payment with mismatched amount (fixed amount invoice with different amount)
@@ -1021,7 +1021,7 @@ fn test_invalid_payment_instructions() {
 
 		let instr =
 			wallet.parse_payment_instructions(fixed_invoice.to_string().as_str()).await.unwrap();
-		let result = PaymentInfo::build(instr, different_amount);
+		let result = PaymentInfo::build(instr, Some(different_amount));
 		assert!(result.is_err(), "Mismatched amount for fixed invoice should be rejected");
 
 		// Test 6: Verify no failed transactions are recorded
@@ -1107,7 +1107,7 @@ fn test_payment_network_mismatch() {
 
 		// If it parsed, trying to pay should fail due to network mismatch
 		let amount = Amount::from_sats(1000).unwrap();
-		let info = PaymentInfo::build(instr, amount).unwrap();
+		let info = PaymentInfo::build(instr, Some(amount)).unwrap();
 		let pay_result = wallet.pay(&info).await;
 		assert!(
 			matches!(pay_result, Err(WalletError::LdkNodeFailure(NodeError::InvalidAddress))),
@@ -1177,9 +1177,9 @@ fn test_concurrent_payments() {
 		let instr2 = instr_result2.expect("Second instruction parsing should succeed");
 		let instr3 = instr_result3.expect("Third instruction parsing should succeed");
 
-		let info1 = PaymentInfo::build(instr1, payment_amount).unwrap();
-		let info2 = PaymentInfo::build(instr2, payment_amount).unwrap();
-		let info3 = PaymentInfo::build(instr3, payment_amount).unwrap();
+		let info1 = PaymentInfo::build(instr1, Some(payment_amount)).unwrap();
+		let info2 = PaymentInfo::build(instr2, Some(payment_amount)).unwrap();
+		let info3 = PaymentInfo::build(instr3, Some(payment_amount)).unwrap();
 
 		// Test: Launch multiple payments concurrently
 		let (result1, result2, result3) =
@@ -1728,7 +1728,7 @@ fn test_lsp_connectivity_fallback() {
 			)
 			.unwrap();
 		let instr = wallet.parse_payment_instructions(inv.to_string().as_str()).await.unwrap();
-		let info = PaymentInfo::build(instr, amount).unwrap();
+		let info = PaymentInfo::build(instr, Some(amount)).unwrap();
 		let _ = wallet.pay(&info).await;
 
 		// Wait for the payment to be processed

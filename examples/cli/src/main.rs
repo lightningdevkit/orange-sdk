@@ -37,8 +37,8 @@ enum Commands {
 	Send {
 		/// Destination address or invoice
 		destination: String,
-		/// Amount in sats
-		amount: u64,
+		/// Amount in sats (optional)
+		amount: Option<u64>,
 	},
 	/// Receive a payment
 	Receive {
@@ -318,11 +318,17 @@ fn parse_command(input: &str) -> Result<Commands> {
 	match parts[0].to_lowercase().as_str() {
 		"balance" | "bal" => Ok(Commands::Balance),
 		"send" | "pay" => {
-			if parts.len() < 3 {
+			if parts.len() < 2 {
 				return Err(anyhow::anyhow!("Usage: send <destination> <amount>"));
 			}
 			let destination = parts[1].to_string();
-			let amount = parts[2].parse::<u64>().context("Amount must be a valid number")?;
+
+			let amount = if parts.len() > 2 {
+				Some(parts[2].parse::<u64>().context("Amount must be a valid number")?)
+			} else {
+				None
+			};
+
 			Ok(Commands::Send { destination, amount })
 		},
 		"receive" | "recv" => {
@@ -372,10 +378,13 @@ async fn execute_command(command: Commands, state: &mut WalletState) -> Result<(
 
 			println!("{} Sending payment...", "📤".bright_yellow());
 			println!("Destination: {}", destination.bright_cyan());
-			println!("Amount: {} sats", amount.to_string().bright_green().bold());
+			if let Some(amount) = amount {
+				println!("Amount: {} sats", amount.to_string().bright_green().bold());
+			}
 
-			let amount =
-				Amount::from_sats(amount).map_err(|_| anyhow::anyhow!("Invalid amount"))?;
+			let amount = amount
+				.map(|a| Amount::from_sats(a).map_err(|_| anyhow::anyhow!("Invalid amount")))
+				.transpose()?;
 
 			match wallet.parse_payment_instructions(&destination).await {
 				Ok(instructions) => match PaymentInfo::build(instructions, amount) {
