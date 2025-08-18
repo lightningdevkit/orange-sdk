@@ -5,6 +5,7 @@ use crate::logging::Logger;
 use crate::store::TxStatus;
 use crate::{InitFailure, WalletConfig};
 
+use ldk_node::lightning::util::persist::KVStore;
 use ldk_node::lightning_invoice::Bolt11Invoice;
 
 use bitcoin_payment_instructions::PaymentMethod;
@@ -14,6 +15,7 @@ use spark_wallet::SparkWalletError;
 
 use std::future::Future;
 use std::sync::Arc;
+use std::time::Duration;
 
 #[cfg(feature = "_test-utils")]
 pub mod dummy;
@@ -38,6 +40,8 @@ pub struct Payment {
 	pub status: TxStatus,
 	/// Indicates whether the payment is outbound (`true`) or inbound (`false`).
 	pub outbound: bool,
+	/// The time the transaction was created
+	pub time_since_epoch: Duration,
 }
 
 // todo i dont think we need send + sync
@@ -48,7 +52,8 @@ pub trait TrustedWalletInterface: Sized + Send + Sync + private::Sealed {
 
 	/// Initializes the wallet with the given configuration and logger.
 	fn init(
-		config: &WalletConfig<Self::ExtraConfig>, event_queue: Arc<EventQueue>, logger: Arc<Logger>,
+		config: &WalletConfig<Self::ExtraConfig>, store: Arc<dyn KVStore + Sync + Send>,
+		event_queue: Arc<EventQueue>, logger: Arc<Logger>,
 	) -> impl Future<Output = Result<Self, InitFailure>> + Send;
 
 	/// Returns the current balance of the wallet.
@@ -75,10 +80,6 @@ pub trait TrustedWalletInterface: Sized + Send + Sync + private::Sealed {
 	fn pay(
 		&self, method: &PaymentMethod, amount: Amount,
 	) -> impl Future<Output = Result<[u8; 32], Error>> + Send;
-
-	/// Sync the wallet.
-	// todo this can be removed once we don't need it for spark, the wallet should handle this itself
-	fn sync(&self) -> impl Future<Output = ()> + Send;
 
 	/// Stops the wallet, cleaning up any resources.
 	/// This is typically used to gracefully shut down the wallet.

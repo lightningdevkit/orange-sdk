@@ -10,6 +10,7 @@ use bitcoin_payment_instructions::amount::Amount;
 use corepc_node::client::bitcoin::Network;
 use corepc_node::{Node as Bitcoind, get_available_port};
 use ldk_node::lightning::ln::msgs::SocketAddress;
+use ldk_node::lightning::util::persist::KVStore;
 use ldk_node::lightning_invoice::{Bolt11Invoice, Bolt11InvoiceDescription, Description};
 use ldk_node::{Event, Node};
 use rand::RngCore;
@@ -112,12 +113,19 @@ impl DummyTrustedWallet {
 						let mut payments = pays.write().unwrap();
 						// We create invoices on the fly without adding the payment to our list
 						// We need to insert it into our payments list
+
+						let now = std::time::SystemTime::now()
+							.duration_since(std::time::UNIX_EPOCH)
+							.unwrap_or_default()
+							.as_secs();
+
 						let new = Payment {
 							id,
 							amount: Amount::from_milli_sats(amount_msat).unwrap(),
 							fee: Amount::ZERO,
 							status: TxStatus::Completed,
 							outbound: false,
+							time_since_epoch: Duration::from_secs(now),
 						};
 						payments.push(new);
 						bal.fetch_add(amount_msat, Ordering::SeqCst);
@@ -165,8 +173,8 @@ impl TrustedWalletInterface for DummyTrustedWallet {
 	type ExtraConfig = DummyTrustedWalletExtraConfig;
 
 	fn init(
-		config: &WalletConfig<Self::ExtraConfig>, _eq: Arc<EventQueue>,
-		_logger: Arc<crate::logging::Logger>,
+		config: &WalletConfig<Self::ExtraConfig>, _store: Arc<dyn KVStore + Sync + Send>,
+		_eq: Arc<EventQueue>, _logger: Arc<crate::logging::Logger>,
 	) -> impl Future<Output = Result<Self, InitFailure>> + Send {
 		async move {
 			Ok(Self::new(
@@ -259,6 +267,12 @@ impl TrustedWalletInterface for DummyTrustedWallet {
 
 			// subtract from our balance
 			self.current_bal_msats.fetch_sub(amount.milli_sats(), Ordering::SeqCst);
+
+			let now = std::time::SystemTime::now()
+				.duration_since(std::time::UNIX_EPOCH)
+				.unwrap_or_default()
+				.as_secs();
+
 			// add to payments
 			let mut list = self.payments.write().unwrap();
 			list.push(Payment {
@@ -267,15 +281,10 @@ impl TrustedWalletInterface for DummyTrustedWallet {
 				fee: Amount::ZERO,
 				status: TxStatus::Pending,
 				outbound: true,
+				time_since_epoch: Duration::from_secs(now),
 			});
 
 			Ok(id)
-		}
-	}
-
-	fn sync(&self) -> impl Future<Output = ()> + Send {
-		async move {
-			// self.ldk_node.sync_wallets().unwrap()
 		}
 	}
 

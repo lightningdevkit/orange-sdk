@@ -16,9 +16,10 @@ use bitcoin_payment_instructions::amount::Amount;
 use ldk_node::bitcoin::Txid;
 use ldk_node::bitcoin::hex::{DisplayHex, FromHex};
 use ldk_node::lightning::io;
+use ldk_node::lightning::ln::msgs::DecodeError;
 use ldk_node::lightning::types::payment::PaymentPreimage;
 use ldk_node::lightning::util::persist::KVStore;
-use ldk_node::lightning::util::ser::{Readable, Writeable};
+use ldk_node::lightning::util::ser::{Readable, Writeable, Writer};
 use ldk_node::lightning::{impl_writeable_tlv_based, impl_writeable_tlv_based_enum};
 
 use std::collections::HashMap;
@@ -41,11 +42,35 @@ pub enum TxStatus {
 	Failed,
 }
 
+impl Writeable for TxStatus {
+	fn write<W: Writer>(&self, writer: &mut W) -> Result<(), io::Error> {
+		match self {
+			TxStatus::Pending => 0_u8.write(writer),
+			TxStatus::Completed => 1_u8.write(writer),
+			TxStatus::Failed => 2_u8.write(writer),
+		}
+	}
+}
+
+impl Readable for TxStatus {
+	fn read<R: io::Read>(reader: &mut R) -> Result<Self, DecodeError> {
+		let n: u8 = Readable::read(reader)?;
+		match n {
+			0 => Ok(TxStatus::Pending),
+			1 => Ok(TxStatus::Completed),
+			2 => Ok(TxStatus::Failed),
+			_ => Err(DecodeError::InvalidValue),
+		}
+	}
+}
+
 /// A transaction is a record of a payment made or received. It contains information about the
 /// transaction, such as the amount, fee, and status. It is used to track the state of a payment
 /// and to provide information about the payment to the user.
 #[derive(Debug, Clone)]
 pub struct Transaction {
+	/// The unique identifier for the payment.
+	pub id: PaymentId,
 	/// The transaction status, either (Pending, Completed, or Failed)
 	pub status: TxStatus,
 	/// Indicates whether the payment is outbound (`true`) or inbound (`false`).
@@ -62,6 +87,41 @@ pub struct Transaction {
 	pub payment_type: PaymentType,
 	/// The time the transaction was created
 	pub time_since_epoch: Duration,
+}
+
+/// A [Transaction] that is stored in the database. We have to modify the `Transaction` type
+/// to have types that all implement `Writeable` and `Readable` so that we can store it in the database.
+#[derive(Debug, Clone)]
+pub(crate) struct StoreTransaction {
+	pub status: TxStatus,
+	pub outbound: bool,
+	pub amount_msats: Option<u64>,
+	pub fee_msats: Option<u64>,
+	pub payment_type: PaymentType,
+	/// The time the transaction was created, in seconds since the epoch.
+	pub time_since_epoch: u64,
+}
+
+impl_writeable_tlv_based!(StoreTransaction, {
+	(0, status, required),
+	(2, outbound, required),
+	(3, amount_msats, option),
+	(5, fee_msats, option),
+	(6, payment_type, required),
+	(8, time_since_epoch, required)
+});
+
+impl From<Transaction> for StoreTransaction {
+	fn from(tx: Transaction) -> Self {
+		StoreTransaction {
+			status: tx.status,
+			outbound: tx.outbound,
+			amount_msats: tx.amount.map(|a| a.milli_sats()),
+			fee_msats: tx.fee.map(|a| a.milli_sats()),
+			payment_type: tx.payment_type,
+			time_since_epoch: tx.time_since_epoch.as_secs(),
+		}
+	}
 }
 
 #[derive(Debug, Clone, Hash, PartialEq, Eq)]
@@ -116,8 +176,6 @@ pub enum PaymentType {
 		/// The lightning "payment preimage" which represents proof that the payment completed.
 		/// Will be set for any [`TxStatus::Completed`] payments.
 		payment_preimage: Option<PaymentPreimage>,
-		//offer: Offer,
-		// TODO PoP
 	},
 	/// An outgoing Lightning payment paying a BOLT 11 invoice.
 	///
@@ -128,7 +186,6 @@ pub enum PaymentType {
 		/// The lightning "payment preimage" which represents proof that the payment completed.
 		/// Will be set for any [`TxStatus::Completed`] payments.
 		payment_preimage: Option<PaymentPreimage>,
-		//invoice: Bolt11Invoice,
 	},
 	/// An outgoing on-chain Bitcoin payment.
 	///
@@ -153,9 +210,11 @@ pub enum PaymentType {
 	/// An incoming Lightning payment.
 	///
 	/// This type of payment is used for Lightning payments that are received.
-	IncomingLightning {
-		// TODO: Give all payment instructions an id so that incoming can get matched
-	},
+	IncomingLightning {},
+	/// A payment that is internal to the trusted service. We should not create any
+	/// of these but its possible we have them in our transaction history and we
+	/// need to be able to read them.
+	TrustedInternal {},
 }
 
 impl_writeable_tlv_based_enum!(PaymentType,
@@ -164,6 +223,7 @@ impl_writeable_tlv_based_enum!(PaymentType,
 	(2, OutgoingOnChain) => { (0, txid, option), },
 	(3, IncomingOnChain) => { (0, txid, option) },
 	(4, IncomingLightning) => { },
+	(5, TrustedInternal) => { },
 );
 
 #[derive(Debug, Clone)]
@@ -180,11 +240,9 @@ pub(crate) enum TxType {
 		triggering_txid: Txid,
 	},
 	PaymentTriggeringTransferLightning {
-		// TODO: We should remove `ty` once we get the info we need from the trusted end
 		ty: PaymentType,
 	},
 	Payment {
-		// TODO: We should remove `ty` once we get the info we need from the trusted end
 		ty: PaymentType,
 	},
 }

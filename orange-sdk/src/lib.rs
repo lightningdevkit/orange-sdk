@@ -31,7 +31,7 @@ use ldk_node::io::sqlite_store::SqliteStore;
 use ldk_node::lightning::ln::msgs::SocketAddress;
 use ldk_node::lightning::util::logger::Logger as _;
 use ldk_node::lightning::util::persist::KVStore;
-use ldk_node::lightning::{log_debug, log_error, log_info, log_warn};
+use ldk_node::lightning::{log_debug, log_error, log_info, log_trace, log_warn};
 use ldk_node::lightning_invoice::Bolt11Invoice;
 use ldk_node::payment::PaymentKind;
 use ldk_node::{BuildError, ChannelDetails, NodeError};
@@ -422,8 +422,10 @@ where
 
 		let event_queue = Arc::new(EventQueue::new(Arc::clone(&store), Arc::clone(&logger)));
 
-		let trusted =
-			Arc::new(T::init(&config, Arc::clone(&event_queue), Arc::clone(&logger)).await?);
+		let trusted = Arc::new(
+			T::init(&config, Arc::clone(&store), Arc::clone(&event_queue), Arc::clone(&logger))
+				.await?,
+		);
 		let ln_wallet = Arc::new(
 			LightningWallet::init(
 				Arc::clone(&runtime),
@@ -477,14 +479,11 @@ where
 
 		// Spawn a background thread that every second, we see if we should initiate a rebalance
 		// This will withdraw from the trusted balance to our LN balance, possibly opening a channel.
-		let inner_ref = Arc::clone(&inner);
 		runtime.spawn(async move {
 			loop {
 				rebalancer.do_rebalance_if_needed().await;
 
 				tokio::time::sleep(Duration::from_secs(1)).await;
-
-				inner_ref.trusted.sync().await; // TODO: Remove this when spark fixes their shit
 			}
 		});
 
@@ -562,6 +561,7 @@ where
 							.or_insert(InternalTransfer::default());
 						debug_assert!(entry.transaction.is_none());
 						entry.transaction = Some(Transaction {
+							id: PaymentId::Trusted(payment.id),
 							status: payment.status,
 							outbound: payment.outbound,
 							amount: Some(payment.amount),
@@ -574,6 +574,7 @@ where
 						debug_assert!(!matches!(ty, PaymentType::OutgoingOnChain { .. }));
 						debug_assert!(!matches!(ty, PaymentType::IncomingOnChain { .. }));
 						res.push(Transaction {
+							id: PaymentId::Trusted(payment.id),
 							status: payment.status,
 							outbound: payment.outbound,
 							amount: Some(payment.amount),
@@ -584,9 +585,26 @@ where
 					},
 				}
 			} else {
-				// Apparently this can currently happen due to spark-internal transfers
-				continue;
-				// debug_assert!(false, "Missing trusted payment {}", payment.id);
+				debug_assert!(
+					!payment.outbound,
+					"Missing outbound trusted payment metadata entry on {:?}",
+					payment.id
+				);
+
+				if payment.status != TxStatus::Completed {
+					// We don't bother to surface pending inbound transactions (i.e. issued but
+					// unpaid invoices) in our transaction list.
+					continue;
+				}
+				res.push(Transaction {
+					id: PaymentId::Trusted(payment.id),
+					status: payment.status,
+					outbound: payment.outbound,
+					amount: Some(payment.amount),
+					fee: Some(payment.fee),
+					payment_type: PaymentType::IncomingLightning {},
+					time_since_epoch: payment.time_since_epoch,
+				});
 			}
 		}
 		for payment in lightning_payments {
@@ -648,6 +666,7 @@ where
 						debug_assert!(entry.transaction.is_none());
 
 						entry.transaction = Some(Transaction {
+							id: PaymentId::Lightning(payment.id.0),
 							status: payment.status.into(),
 							outbound: payment.direction == PaymentDirection::Outbound,
 							amount: Amount::from_milli_sats(payment.amount_msat.unwrap_or(0)).ok(), // TODO: when can this be none https://github.com/lightningdevkit/ldk-node/issues/495
@@ -658,6 +677,7 @@ where
 					},
 					TxType::Payment { ty: _ } => {
 						res.push(Transaction {
+							id: PaymentId::Lightning(payment.id.0),
 							status: payment.status.into(),
 							outbound: payment.direction == PaymentDirection::Outbound,
 							amount: Amount::from_milli_sats(payment.amount_msat.unwrap_or(0)).ok(), // TODO: when can this be none https://github.com/lightningdevkit/ldk-node/issues/495
@@ -683,6 +703,7 @@ where
 					continue;
 				}
 				res.push(Transaction {
+					id: PaymentId::Lightning(payment.id.0),
 					status,
 					outbound: payment.direction == PaymentDirection::Outbound,
 					amount: payment.amount_msat.map(|a| Amount::from_milli_sats(a).unwrap()),
@@ -857,33 +878,45 @@ where
 
 		let mut pay_trusted = async |method, ty: &dyn Fn() -> PaymentType| {
 			if instructions.amount <= trusted_balance {
-				if let Ok(trusted_fee) =
-					self.inner.trusted.estimate_fee(method, instructions.amount).await
-				{
-					if trusted_fee.saturating_add(instructions.amount) <= trusted_balance {
-						let res = self.inner.trusted.pay(method, instructions.amount).await;
-						match res {
-							Ok(id) => {
-								self.inner.tx_metadata.insert(
-									PaymentId::Trusted(id),
-									TxMetadata {
-										ty: TxType::Payment { ty: ty() },
-										time: SystemTime::now()
-											.duration_since(SystemTime::UNIX_EPOCH)
-											.unwrap(),
-									},
-								);
-								return Ok(());
-							},
-							Err(e) => {
-								log_debug!(
-									self.inner.logger,
-									"Trusted payment failed with {:?}",
-									e
-								);
-								last_trusted_err = Some(e.into())
-							},
-						}
+				// attempt to estimate the fee for the trusted payment
+				// if we fail to estimate the fee, just assume it is zero and try to pay
+				// sometimes the fee estimation can fail but payments can still succeed
+				let trusted_fee =
+					match self.inner.trusted.estimate_fee(method, instructions.amount).await {
+						Ok(fee) => {
+							log_trace!(
+								self.inner.logger,
+								"Estimated trusted fee: {}msats",
+								fee.milli_sats()
+							);
+							fee
+						},
+
+						Err(e) => {
+							log_warn!(self.inner.logger, "Failed to estimate trusted fee: {e:?}");
+							Amount::ZERO
+						},
+					};
+
+				if trusted_fee.saturating_add(instructions.amount) <= trusted_balance {
+					let res = self.inner.trusted.pay(method, instructions.amount).await;
+					match res {
+						Ok(id) => {
+							self.inner.tx_metadata.insert(
+								PaymentId::Trusted(id),
+								TxMetadata {
+									ty: TxType::Payment { ty: ty() },
+									time: SystemTime::now()
+										.duration_since(SystemTime::UNIX_EPOCH)
+										.unwrap(),
+								},
+							);
+							return Ok(());
+						},
+						Err(e) => {
+							log_debug!(self.inner.logger, "Trusted payment failed with {e:?}");
+							last_trusted_err = Some(e.into())
+						},
 					}
 				}
 			}
@@ -1114,15 +1147,6 @@ where
 		self.inner.trusted.stop().await;
 
 		log_debug!(self.inner.logger, "Stopping ln wallet...");
-		self.inner.ln_wallet.stop();
-	}
-}
-
-impl<T> Drop for Wallet<T>
-where
-	T: TrustedWalletInterface,
-{
-	fn drop(&mut self) {
 		self.inner.ln_wallet.stop();
 	}
 }
