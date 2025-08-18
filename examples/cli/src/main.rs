@@ -316,8 +316,8 @@ fn parse_command(input: &str) -> Result<Commands> {
 	}
 
 	match parts[0].to_lowercase().as_str() {
-		"balance" => Ok(Commands::Balance),
-		"send" => {
+		"balance" | "bal" => Ok(Commands::Balance),
+		"send" | "pay" => {
 			if parts.len() < 3 {
 				return Err(anyhow::anyhow!("Usage: send <destination> <amount>"));
 			}
@@ -325,7 +325,7 @@ fn parse_command(input: &str) -> Result<Commands> {
 			let amount = parts[2].parse::<u64>().context("Amount must be a valid number")?;
 			Ok(Commands::Send { destination, amount })
 		},
-		"receive" => {
+		"receive" | "recv" => {
 			let amount = if parts.len() > 1 {
 				Some(parts[1].parse::<u64>().context("Amount must be a valid number")?)
 			} else {
@@ -337,7 +337,7 @@ fn parse_command(input: &str) -> Result<Commands> {
 		"transactions" | "txs" | "tx" => Ok(Commands::Transactions),
 		"channels" | "chan" => Ok(Commands::Channels),
 		"clear" | "cls" => Ok(Commands::Clear),
-		"exit" | "quit" => Ok(Commands::Exit),
+		"exit" | "quit" | "q" => Ok(Commands::Exit),
 		"help" => {
 			print_help();
 			Err(anyhow::anyhow!(""))
@@ -384,7 +384,7 @@ async fn execute_command(command: Commands, state: &mut WalletState) -> Result<(
 							println!("{} Payment initiated successfully!", "✅".bright_green());
 						},
 						Err(e) => {
-							return Err(anyhow::anyhow!("Failed to send payment: {:?}", e));
+							return Err(anyhow::anyhow!("Failed to send payment: {e:?}"));
 						},
 					},
 					Err(_) => {
@@ -394,7 +394,7 @@ async fn execute_command(command: Commands, state: &mut WalletState) -> Result<(
 					},
 				},
 				Err(e) => {
-					return Err(anyhow::anyhow!("Failed to parse payment instructions: {:?}", e));
+					return Err(anyhow::anyhow!("Failed to parse payment instructions: {e:?}"));
 				},
 			}
 		},
