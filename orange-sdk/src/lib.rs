@@ -697,23 +697,25 @@ where
 							id: PaymentId::Lightning(payment.id.0),
 							status: payment.status.into(),
 							outbound: payment.direction == PaymentDirection::Outbound,
-							amount: Amount::from_milli_sats(payment.amount_msat.unwrap_or(0)).ok(), // TODO: when can this be none https://github.com/lightningdevkit/ldk-node/issues/495
+							amount: payment
+								.amount_msat
+								.map(|a| Amount::from_milli_sats(a).expect("Must be valid")),
 							fee,
 							payment_type: (&payment).into(),
 							time_since_epoch: tx_metadata.time,
 						});
 					},
-					TxType::Payment { ty: _ } => {
-						res.push(Transaction {
-							id: PaymentId::Lightning(payment.id.0),
-							status: payment.status.into(),
-							outbound: payment.direction == PaymentDirection::Outbound,
-							amount: Amount::from_milli_sats(payment.amount_msat.unwrap_or(0)).ok(), // TODO: when can this be none https://github.com/lightningdevkit/ldk-node/issues/495
-							fee,
-							payment_type: (&payment).into(),
-							time_since_epoch: tx_metadata.time,
-						})
-					},
+					TxType::Payment { ty: _ } => res.push(Transaction {
+						id: PaymentId::Lightning(payment.id.0),
+						status: payment.status.into(),
+						outbound: payment.direction == PaymentDirection::Outbound,
+						amount: payment
+							.amount_msat
+							.map(|a| Amount::from_milli_sats(a).expect("Must be valid")),
+						fee,
+						payment_type: (&payment).into(),
+						time_since_epoch: tx_metadata.time,
+					}),
 				}
 			} else {
 				debug_assert_ne!(
