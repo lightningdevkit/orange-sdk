@@ -211,7 +211,7 @@ impl<T: TrustedWalletInterface> RebalanceTrigger for OrangeTrigger<T> {
 								let trigger = PaymentId::Lightning(txid.to_byte_array());
 								if self.tx_metadata.read().get(&trigger).is_none() {
 									self.tx_metadata.insert(
-										trigger.clone(),
+										trigger,
 										TxMetadata {
 											ty: TxType::Payment {
 												ty: PaymentType::IncomingOnChain {
@@ -305,11 +305,11 @@ impl graduated_rebalancer::EventHandler for OrangeRebalanceEventHandler {
 					ty: TxType::TrustedToLightning {
 						trusted_payment: rebalance_id,
 						lightning_payment: lightning_id,
-						payment_triggering_transfer: triggering_transaction_id.clone(),
+						payment_triggering_transfer: triggering_transaction_id,
 					},
 					time: SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap(),
 				};
-				self.tx_metadata.insert(PaymentId::Trusted(rebalance_id), metadata.clone());
+				self.tx_metadata.insert(PaymentId::Trusted(rebalance_id), metadata);
 				self.tx_metadata.insert(PaymentId::Lightning(lightning_id), metadata);
 
 				if let Err(e) = self.event_queue.add_event(Event::RebalanceSuccessful {

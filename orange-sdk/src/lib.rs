@@ -568,7 +568,7 @@ where
 						payment_triggering_transfer,
 					} => {
 						let entry = internal_transfers
-							.entry((*payment_triggering_transfer).clone())
+							.entry(*payment_triggering_transfer)
 							.or_insert(InternalTransfer::default());
 						if payment.id == *trusted_payment {
 							debug_assert!(entry.send_fee.is_none());
@@ -594,7 +594,7 @@ where
 							outbound: payment.outbound,
 							amount: Some(payment.amount),
 							fee: Some(payment.fee),
-							payment_type: ty.clone(),
+							payment_type: *ty,
 							time_since_epoch: tx_metadata.time,
 						});
 					},
@@ -607,7 +607,7 @@ where
 							outbound: payment.outbound,
 							amount: Some(payment.amount),
 							fee: Some(payment.fee),
-							payment_type: ty.clone(),
+							payment_type: *ty,
 							time_since_epoch: tx_metadata.time,
 						});
 					},
@@ -661,7 +661,7 @@ where
 						payment_triggering_transfer,
 					} => {
 						let entry = internal_transfers
-							.entry(payment_triggering_transfer.clone())
+							.entry(*payment_triggering_transfer)
 							.or_insert(InternalTransfer::default());
 						if payment.id.0 == *lightning_payment {
 							debug_assert!(entry.receive_fee.is_none());

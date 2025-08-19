@@ -124,7 +124,7 @@ impl From<Transaction> for StoreTransaction {
 	}
 }
 
-#[derive(Debug, Clone, Hash, PartialEq, Eq)]
+#[derive(Debug, Copy, Clone, Hash, PartialEq, Eq)]
 pub enum PaymentId {
 	Lightning([u8; 32]),
 	Trusted([u8; 32]),
@@ -165,7 +165,7 @@ impl_writeable_tlv_based_enum!(PaymentId,
 );
 
 /// Represents the type of payment, including its method and associated metadata.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub enum PaymentType {
 	/// An outgoing Lightning payment paying a BOLT 12 offer.
 	///
@@ -226,7 +226,7 @@ impl_writeable_tlv_based_enum!(PaymentType,
 	(5, TrustedInternal) => { },
 );
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Copy, Clone)]
 pub(crate) enum TxType {
 	TrustedToLightning {
 		trusted_payment: [u8; 32],
@@ -261,7 +261,7 @@ impl_writeable_tlv_based_enum!(TxType,
 	(3, Payment) => { (0, ty, required), },
 );
 
-#[derive(Clone, Debug)]
+#[derive(Debug, Copy, Clone)]
 pub(crate) struct TxMetadata {
 	// TODO: We should remove `time` once we get the info we need from the trusted end
 	pub(crate) time: Duration,
@@ -323,7 +323,7 @@ impl TxMetadataStore {
 		let mut tx_metadata = self.tx_metadata.write().unwrap();
 		if let Some(metadata) = tx_metadata.get_mut(payment_id) {
 			if let TxType::Payment { ty } = &mut metadata.ty {
-				metadata.ty = TxType::PaymentTriggeringTransferLightning { ty: ty.clone() };
+				metadata.ty = TxType::PaymentTriggeringTransferLightning { ty: *ty };
 				let key_str = payment_id.to_string();
 				let ser = metadata.encode();
 				self.store
