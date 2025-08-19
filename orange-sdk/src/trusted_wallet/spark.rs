@@ -58,7 +58,7 @@ impl TrustedWalletInterface for Spark {
 					// hash the seed to make sure it does not conflict with the lightning keys
 					let seed = Sha256::hash(bytes);
 					DefaultSigner::new(&seed[..], config.extra_config.network)
-						.expect("todo real error")
+						.map_err(|e| Error::Generic(format!("Failed to create signer: {e}")))?
 				},
 				Seed::Mnemonic { mnemonic, passphrase } => {
 					// We don't hash the seed here, as mnemonics are meant to be easily recoverable
@@ -66,7 +66,7 @@ impl TrustedWalletInterface for Spark {
 					// in separate wallets.
 					let seed = mnemonic.to_seed(passphrase.as_deref().unwrap_or(""));
 					DefaultSigner::new(&seed[..], config.extra_config.network)
-						.expect("todo real error")
+						.map_err(|e| Error::Generic(format!("Failed to create signer: {e}")))?
 				},
 			};
 
@@ -91,29 +91,30 @@ impl TrustedWalletInterface for Spark {
 									log_debug!(l, "Spark event: {event:?}");
 									match event {
 										WalletEvent::DepositConfirmed(node_id) => {
-											let transfers = w.list_transfers(None).await.unwrap();
-											if let Some(transfer) = transfers
-												.into_iter()
-												.find(|t| t.leaves.iter().any(|l| l.leaf.id == node_id))
-											{
-												event_queue
-													.add_event(Event::OnchainPaymentReceived {
-														payment_id: PaymentId::Trusted(
-															convert_from_transfer_id(transfer.id.to_bytes()),
-														),
-														// todo this is kinda hacky, maybe we should make this optional
-														txid: transfer
-															.leaves
-															.iter()
-															.find(|t| t.leaf.id == node_id)
-															.map(|t| t.leaf
-															.node_tx
-															.compute_txid())
-															.unwrap_or(Txid::all_zeros()),
-														amount_sat: transfer.total_value_sat,
-														status: ConfirmationStatus::Unconfirmed, // fixme dont have block height
-													})
-													.unwrap();
+											if let Ok(transfers) = w.list_transfers(None).await {
+												if let Some(transfer) = transfers
+													.into_iter()
+													.find(|t| t.leaves.iter().any(|l| l.leaf.id == node_id))
+												{
+													event_queue
+														.add_event(Event::OnchainPaymentReceived {
+															payment_id: PaymentId::Trusted(
+																convert_from_transfer_id(transfer.id.to_bytes()),
+															),
+															// todo this is kinda hacky, maybe we should make this optional
+															txid: transfer
+																.leaves
+																.iter()
+																.find(|t| t.leaf.id == node_id)
+																.map(|t| t.leaf
+																.node_tx
+																.compute_txid())
+																.unwrap_or(Txid::all_zeros()),
+															amount_sat: transfer.total_value_sat,
+															status: ConfirmationStatus::Unconfirmed, // fixme dont have block height
+														})
+														.unwrap();
+												}
 											}
 										},
 										WalletEvent::StreamConnected => {
@@ -131,28 +132,28 @@ impl TrustedWalletInterface for Spark {
 											}
 										},
 										WalletEvent::TransferClaimed(transfer_id) => {
-											let transfers = w.list_transfers(None).await.unwrap();
+											if let Ok(transfers) = w.list_transfers(None).await {
+												if let Err(e) = Self::sync_payments_to_storage(w.as_ref(), &s, l.as_ref()).await {
+													log_error!(l, "Failed to sync payments to storage: {e:?}");
+												} else {
+													log_info!(l, "Payments synced to storage");
+												}
 
-											if let Err(e) = Self::sync_payments_to_storage(w.as_ref(), &s, l.as_ref()).await {
-												log_error!(l, "Failed to sync payments to storage: {e:?}");
-											} else {
-												log_info!(l, "Payments synced to storage");
-											}
-
-											if let Some(transfer) =
-												transfers.into_iter().find(|t| t.id == transfer_id)
-											{
-												event_queue
-													.add_event(Event::PaymentReceived {
-														payment_id: PaymentId::Trusted(
-															convert_from_transfer_id(transfer.id.to_bytes()),
-														),
-														payment_hash: PaymentHash([0; 32]), // fixme, spark does not give us the payment hash
-														amount_msat: transfer.total_value_sat * 1000,
-														custom_records: vec![],
-														lsp_fee_msats: None,
-													})
-													.unwrap();
+												if let Some(transfer) =
+													transfers.into_iter().find(|t| t.id == transfer_id)
+												{
+													event_queue
+														.add_event(Event::PaymentReceived {
+															payment_id: PaymentId::Trusted(
+																convert_from_transfer_id(transfer.id.to_bytes()),
+															),
+															payment_hash: PaymentHash([0; 32]), // fixme, spark does not give us the payment hash
+															amount_msat: transfer.total_value_sat * 1000,
+															custom_records: vec![],
+															lsp_fee_msats: None,
+														})
+														.unwrap();
+												}
 											}
 										},
 									}
@@ -172,8 +173,9 @@ impl TrustedWalletInterface for Spark {
 
 	fn get_balance(&self) -> impl Future<Output = Result<Amount, Error>> + Send {
 		async move {
-			let bal = self.spark_wallet.get_balance().await.unwrap();
-			Ok(Amount::from_sats(bal).expect("get_balance failed"))
+			let sats = self.spark_wallet.get_balance().await?;
+			Amount::from_sats(sats)
+				.map_err(|_| Error::Generic(format!("Failed to convert balance to Amount: {sats}")))
 		}
 	}
 
@@ -216,14 +218,37 @@ impl TrustedWalletInterface for Spark {
 					Error::Generic(format!("Failed to parse payment id {key}: {e}"))
 				})?;
 
+				// skip any payment without an amount yet
+				let amount = match store_tx.amount_msats {
+					Some(amount) => Amount::from_milli_sats(amount).map_err(|_| {
+						Error::Generic(format!(
+							"Failed to convert amount ({amount}) for payment {key}"
+						))
+					})?,
+					None => {
+						debug_assert_ne!(
+							store_tx.status,
+							TxStatus::Completed,
+							"Completed payments should have an amount"
+						);
+						continue;
+					},
+				};
+
+				// if we have no fee, assume zero
+				let fee = match store_tx.fee_msats {
+					Some(fee) => Amount::from_milli_sats(fee).map_err(|_| {
+						Error::Generic(format!("Failed to convert fee ({fee}) for payment {key}"))
+					})?,
+					None => Amount::ZERO,
+				};
+
 				res.push(Payment {
 					status: store_tx.status,
 					id: convert_from_transfer_id(uuid.into_bytes()),
-					amount: Amount::from_milli_sats(store_tx.amount_msats.unwrap_or(0))
-						.expect("invalid amount"),
+					amount,
 					outbound: store_tx.outbound,
-					fee: Amount::from_milli_sats(store_tx.fee_msats.unwrap_or(0))
-						.expect("invalid amount"),
+					fee,
 					time_since_epoch: Duration::from_secs(store_tx.time_since_epoch),
 				});
 			}
@@ -236,13 +261,17 @@ impl TrustedWalletInterface for Spark {
 	) -> impl Future<Output = Result<Amount, Error>> + Send {
 		async move {
 			if let PaymentMethod::LightningBolt11(invoice) = method {
-				self.spark_wallet
+				let fee_sats = self
+					.spark_wallet
 					.fetch_lightning_send_fee_estimate(
 						&invoice.to_string(),
 						Some(amount.sats_rounding_up()), // fixme: why do they do sat amounts?
 					)
-					.await
-					.map(|fees| Amount::from_sats(fees).expect("invalid amount"))
+					.await?;
+
+				Amount::from_sats(fee_sats).map_err(|_| {
+					Error::Generic(format!("Failed to convert fee estimate to Amount: {fee_sats}"))
+				})
 			} else {
 				log_error!(self.logger, "Only BOLT 11 is currently supported for fee estimation");
 				Err(Error::Generic("Only BOLT 11 is currently supported".to_owned()))
@@ -267,7 +296,9 @@ impl TrustedWalletInterface for Spark {
 
 				match res {
 					PayLightningInvoiceResult::LightningPayment(pay) => {
-						let uuid = Uuid::from_str(pay.id.as_str()).expect("invalid id");
+						let uuid = Uuid::from_str(pay.id.as_str()).map_err(|_| {
+							Error::Generic(format!("Failed to parse payment id: {}", pay.id))
+						})?;
 						Ok(convert_from_transfer_id(uuid.into_bytes()))
 					},
 					PayLightningInvoiceResult::Transfer(transfer) => {
@@ -365,8 +396,7 @@ impl Spark {
 			}
 
 			// Check if we have more transfers to fetch
-			next_offset =
-				next_offset.saturating_add(u64::try_from(transfers_response.len()).unwrap());
+			next_offset = next_offset.saturating_add(transfers_response.len() as u64);
 			// Update our last processed offset in the storage. We should remove pending payments
 			// from the offset as they might be removed from the list later.
 			let saved_offset = next_offset - pending_payments;

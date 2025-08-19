@@ -123,11 +123,12 @@ impl<T: TrustedWalletInterface> RebalanceTrigger for OrangeTrigger<T> {
 				}
 				if transfer_amt > self.tunables.rebalance_min {
 					new_txn.sort_unstable();
-					let victim_id = new_txn.first().map(|(_, id)| *id).unwrap_or_else(|| {
+					let victim_id = new_txn.first().map(|(_, id)| *id).or_else(|| {
 						// Should only happen due to races settling balance, pick the latest.
-						latest_tx.expect("We cannot have a balance if we have no transactions").1
+						latest_tx.map(|l| l.1)
 					});
-					Some(TriggerParams { amount: transfer_amt, id: *victim_id })
+
+					victim_id.map(|id| TriggerParams { amount: transfer_amt, id: *id })
 				} else {
 					None
 				}
@@ -177,7 +178,7 @@ impl<T: TrustedWalletInterface> RebalanceTrigger for OrangeTrigger<T> {
 					if let Err(e) = self.event_queue.add_event(Event::OnchainPaymentReceived {
 						payment_id,
 						txid,
-						amount_sat: payment.amount_msat.unwrap() / 1_000,
+						amount_sat: payment.amount_msat.expect("must have amount") / 1_000,
 						status,
 					}) {
 						log_error!(
