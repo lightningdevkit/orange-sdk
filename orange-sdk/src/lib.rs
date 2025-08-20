@@ -247,6 +247,32 @@ impl Default for Tunables {
 	}
 }
 
+/// Represents errors that can occur when building a [`PaymentInfo`] from [`PaymentInstructions`].
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum PaymentInfoBuildError {
+	/// The amount given does not match either of the fixed amounts specified in the
+	/// [`PaymentInstructions`].
+	AmountMismatch {
+		/// The amount given by the user.
+		given: Amount,
+		/// The fixed lightning amount specified in the [`PaymentInstructions`].
+		ln_amount: Option<Amount>,
+		/// The fixed on-chain amount specified in the [`PaymentInstructions`].
+		onchain_amount: Option<Amount>,
+	},
+	/// No amount was given and the [`PaymentInstructions`] has no fixed amount.
+	MissingAmount,
+	/// The amount given is outside the range specified in the [`PaymentInstructions`].
+	AmountOutOfRange {
+		/// The amount given by the user.
+		given: Amount,
+		/// The minimum amount specified in the [`PaymentInstructions`].
+		min: Option<Amount>,
+		/// The maximum amount specified in the [`PaymentInstructions`].
+		max: Option<Amount>,
+	},
+}
+
 /// A payable version of [`PaymentInstructions`] (i.e. with a set amount).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PaymentInfo {
@@ -266,15 +292,19 @@ impl PaymentInfo {
 	/// fixed on-chain or lightning amount specified.
 	pub fn build(
 		instructions: PaymentInstructions, amount: Option<Amount>,
-	) -> Result<PaymentInfo, ()> {
+	) -> Result<PaymentInfo, PaymentInfoBuildError> {
 		match &instructions {
 			PaymentInstructions::ConfigurableAmount(conf) => match amount {
-				None => Err(()),
+				None => Err(PaymentInfoBuildError::MissingAmount),
 				Some(amount) => {
 					if conf.min_amt().unwrap_or(Amount::ZERO) > amount
 						|| conf.max_amt().unwrap_or(Amount::MAX) < amount
 					{
-						Err(())
+						Err(PaymentInfoBuildError::AmountOutOfRange {
+							given: amount,
+							min: conf.min_amt(),
+							max: conf.max_amt(),
+						})
 					} else {
 						Ok(PaymentInfo { instructions, amount })
 					}
@@ -286,7 +316,11 @@ impl PaymentInfo {
 						None => Ok(PaymentInfo { instructions, amount: ln }),
 						Some(amount) => {
 							if amount != ln {
-								Err(())
+								Err(PaymentInfoBuildError::AmountMismatch {
+									given: amount,
+									ln_amount: Some(ln),
+									onchain_amount: None,
+								})
 							} else {
 								Ok(PaymentInfo { instructions, amount })
 							}
@@ -296,7 +330,11 @@ impl PaymentInfo {
 						None => Ok(PaymentInfo { instructions, amount: chain }),
 						Some(amount) => {
 							if amount != chain {
-								Err(())
+								Err(PaymentInfoBuildError::AmountMismatch {
+									given: amount,
+									ln_amount: None,
+									onchain_amount: Some(chain),
+								})
 							} else {
 								Ok(PaymentInfo { instructions, amount })
 							}
@@ -307,19 +345,23 @@ impl PaymentInfo {
 							if ln == chain {
 								Ok(PaymentInfo { instructions, amount: ln })
 							} else {
-								Err(())
+								Err(PaymentInfoBuildError::MissingAmount)
 							}
 						},
 						Some(amount) => {
 							if ln != amount && chain != amount {
-								Err(())
+								Err(PaymentInfoBuildError::AmountMismatch {
+									given: amount,
+									ln_amount: Some(ln),
+									onchain_amount: Some(chain),
+								})
 							} else {
 								Ok(PaymentInfo { instructions, amount })
 							}
 						},
 					},
 					(None, None) => match amount {
-						None => Err(()),
+						None => Err(PaymentInfoBuildError::MissingAmount),
 						Some(amount) => Ok(PaymentInfo { instructions, amount }),
 					},
 				}
