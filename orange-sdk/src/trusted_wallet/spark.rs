@@ -1,5 +1,6 @@
 //! A implementation of `TrustedWalletInterface` using the Spark SDK.
 use crate::bitcoin::consensus::encode::deserialize_hex;
+use crate::bitcoin::hex::FromHex;
 use crate::bitcoin::{Txid, io};
 use crate::logging::Logger;
 use crate::store::{PaymentId, StoreTransaction, TxStatus};
@@ -131,28 +132,32 @@ impl TrustedWalletInterface for Spark {
 												log_info!(l, "Payments synced to storage");
 											}
 										},
-										WalletEvent::TransferClaimed(transfer_id) => {
-											if let Ok(transfers) = w.list_transfers(None).await {
-												if let Err(e) = Self::sync_payments_to_storage(w.as_ref(), &s, l.as_ref()).await {
-													log_error!(l, "Failed to sync payments to storage: {e:?}");
-												} else {
-													log_info!(l, "Payments synced to storage");
-												}
+										WalletEvent::TransferClaimed(transfer) => {
+											if let Err(e) = Self::sync_payments_to_storage(w.as_ref(), &s, l.as_ref()).await {
+												log_error!(l, "Failed to sync payments to storage: {e:?}");
+											} else {
+												log_info!(l, "Payments synced to storage");
+											}
 
-												if let Some(transfer) =
-													transfers.into_iter().find(|t| t.id == transfer_id)
-												{
-													event_queue
-														.add_event(Event::PaymentReceived {
-															payment_id: PaymentId::Trusted(
-																convert_from_transfer_id(transfer.id.to_bytes()),
-															),
-															payment_hash: PaymentHash([0; 32]), // fixme, spark does not give us the payment hash
-															amount_msat: transfer.total_value_sat * 1000,
-															custom_records: vec![],
-															lsp_fee_msats: None,
-														})
-														.unwrap();
+											match transfer.user_request {
+												None => {
+													log_debug!(l, "Transfer claimed without user request: {transfer:?}");
+												},
+												Some(SspUserRequest::LightningReceiveRequest(req)) => {
+													if let Ok(hash) = FromHex::from_hex(&req.invoice.payment_hash) {
+														event_queue
+															.add_event(Event::PaymentReceived {
+																payment_id: PaymentId::Trusted(convert_from_transfer_id(transfer.id.to_bytes())),
+																payment_hash: PaymentHash(hash),
+																amount_msat: transfer.total_value_sat * 1_000, // convert to msats
+																custom_records: vec![],
+																lsp_fee_msats: None,
+															})
+															.unwrap();
+													}
+												},
+												Some(req) => {
+													log_debug!(l, "Transfer claimed with user request: {req:?}");
 												}
 											}
 										},
@@ -296,10 +301,19 @@ impl TrustedWalletInterface for Spark {
 
 				match res {
 					PayLightningInvoiceResult::LightningPayment(pay) => {
-						let uuid = Uuid::from_str(pay.id.as_str()).map_err(|_| {
-							Error::Generic(format!("Failed to parse payment id: {}", pay.id))
-						})?;
-						Ok(convert_from_transfer_id(uuid.into_bytes()))
+						// Spark uses UUIDs for payment IDs, so we need to convert them
+						// to our format. Spark uses a UUID in the format `SparkLightningSendRequest:<uuid>`
+						// We only need the UUID part, so we split by ':' and take the last part.
+						// If the format is invalid, we return an error.
+						if let Some(id) = pay.id.split(':').next_back() {
+							let uuid = Uuid::from_str(id).map_err(|_| {
+								Error::Generic(format!("Failed to parse payment id: {id}"))
+							})?;
+							Ok(convert_from_transfer_id(uuid.into_bytes()))
+						} else {
+							log_error!(self.logger, "Invalid payment id format: {}", pay.id);
+							Err(Error::Generic(format!("Invalid payment id format: {}", pay.id)))
+						}
 					},
 					PayLightningInvoiceResult::Transfer(transfer) => {
 						Ok(convert_from_transfer_id(transfer.id.to_bytes()))
