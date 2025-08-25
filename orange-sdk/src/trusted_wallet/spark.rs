@@ -1,10 +1,10 @@
-//! A implementation of `TrustedWalletInterface` using the Spark SDK.
+//! An implementation of `TrustedWalletInterface` using the Spark SDK.
 use crate::bitcoin::consensus::encode::deserialize_hex;
 use crate::bitcoin::hex::FromHex;
 use crate::bitcoin::{Txid, io};
 use crate::logging::Logger;
 use crate::store::{PaymentId, StoreTransaction, TxStatus};
-use crate::trusted_wallet::{Error, Payment, TrustedWalletInterface};
+use crate::trusted_wallet::{Payment, TrustedError, TrustedWalletInterface};
 use crate::{Event, EventQueue, InitFailure, PaymentType, Seed, WalletConfig};
 
 use ldk_node::bitcoin::hashes::Hash;
@@ -51,7 +51,7 @@ impl TrustedWalletInterface for Spark {
 	) -> impl Future<Output = Result<Self, InitFailure>> + Send {
 		async move {
 			if config.network != config.extra_config.network.into() {
-				Err(Error::InvalidNetwork)?
+				Err(TrustedError::InvalidNetwork)?
 			}
 
 			let signer = match &config.seed {
@@ -59,7 +59,7 @@ impl TrustedWalletInterface for Spark {
 					// hash the seed to make sure it does not conflict with the lightning keys
 					let seed = Sha256::hash(bytes);
 					DefaultSigner::new(&seed[..], config.extra_config.network)
-						.map_err(|e| Error::Generic(format!("Failed to create signer: {e}")))?
+						.map_err(|e| TrustedError::Other(format!("Failed to create signer: {e}")))?
 				},
 				Seed::Mnemonic { mnemonic, passphrase } => {
 					// We don't hash the seed here, as mnemonics are meant to be easily recoverable
@@ -67,12 +67,15 @@ impl TrustedWalletInterface for Spark {
 					// in separate wallets.
 					let seed = mnemonic.to_seed(passphrase.as_deref().unwrap_or(""));
 					DefaultSigner::new(&seed[..], config.extra_config.network)
-						.map_err(|e| Error::Generic(format!("Failed to create signer: {e}")))?
+						.map_err(|e| TrustedError::Other(format!("Failed to create signer: {e}")))?
 				},
 			};
 
-			let spark_wallet =
-				Arc::new(SparkWallet::connect(config.extra_config.clone(), signer).await?);
+			let spark_wallet = Arc::new(
+				SparkWallet::connect(config.extra_config.clone(), signer)
+					.await
+					.map_err(|e| InitFailure::TrustedFailure(e.into()))?,
+			);
 
 			let (shutdown_sender, mut shutdown_receiver) = watch::channel::<()>(());
 			let mut events = spark_wallet.subscribe_events();
@@ -176,60 +179,68 @@ impl TrustedWalletInterface for Spark {
 		}
 	}
 
-	fn get_balance(&self) -> impl Future<Output = Result<Amount, Error>> + Send {
+	fn get_balance(&self) -> impl Future<Output = Result<Amount, TrustedError>> + Send {
 		async move {
 			let sats = self.spark_wallet.get_balance().await?;
-			Amount::from_sats(sats)
-				.map_err(|_| Error::Generic(format!("Failed to convert balance to Amount: {sats}")))
+			Amount::from_sats(sats).map_err(|_| TrustedError::AmountError)
 		}
 	}
 
-	fn get_reusable_receive_uri(&self) -> impl Future<Output = Result<String, Error>> + Send {
-		async move { Err(Error::Generic("Spark does not support BOLT 12".to_owned())) }
+	fn get_reusable_receive_uri(
+		&self,
+	) -> impl Future<Output = Result<String, TrustedError>> + Send {
+		async move {
+			Err(TrustedError::UnsupportedOperation("Spark does not support BOLT 12".to_owned()))
+		}
 	}
 
 	fn get_bolt11_invoice(
 		&self, amount: Option<Amount>,
-	) -> impl Future<Output = Result<Bolt11Invoice, Error>> + Send {
+	) -> impl Future<Output = Result<Bolt11Invoice, TrustedError>> + Send {
 		async move {
 			// TODO: get upstream to let us be amount-less
-			let res = self
-				.spark_wallet
-				.create_lightning_invoice(amount.unwrap_or(Amount::ZERO).sats_rounding_up(), None)
-				.await?;
+			match amount {
+				None => Err(TrustedError::UnsupportedOperation(
+					"Spark does not support amount-less invoices".to_owned(),
+				)),
+				Some(a) if a == Amount::ZERO => Err(TrustedError::UnsupportedOperation(
+					"Spark does not support amount-less invoices".to_owned(),
+				)),
+				Some(a) => {
+					let res = self
+						.spark_wallet
+						.create_lightning_invoice(a.sats_rounding_up(), None)
+						.await?;
 
-			Bolt11Invoice::from_str(&res.invoice)
-				.map_err(|e| Error::Generic(format!("Failed to parse invoice: {e}")))
+					Bolt11Invoice::from_str(&res.invoice)
+						.map_err(|e| TrustedError::Other(format!("Failed to parse invoice: {e}")))
+				},
+			}
 		}
 	}
 
-	fn list_payments(&self) -> impl Future<Output = Result<Vec<Payment>, Error>> + Send {
+	fn list_payments(&self) -> impl Future<Output = Result<Vec<Payment>, TrustedError>> + Send {
 		async move {
-			let keys = self
-				.store
-				.list(SPARK_PRIMARY_NAMESPACE, SPARK_PAYMENTS_NAMESPACE)
-				.map_err(|_| Error::Generic("Failed to list payments".to_owned()))?;
+			let keys = self.store.list(SPARK_PRIMARY_NAMESPACE, SPARK_PAYMENTS_NAMESPACE)?;
 
 			let mut res = Vec::with_capacity(keys.len());
 			for key in keys {
-				let data = self
-					.store
-					.read(SPARK_PRIMARY_NAMESPACE, SPARK_PAYMENTS_NAMESPACE, &key)
-					.map_err(|e| Error::Generic(format!("Failed to read payment {key}: {e}")))?;
+				let data =
+					self.store.read(SPARK_PRIMARY_NAMESPACE, SPARK_PAYMENTS_NAMESPACE, &key)?;
 				let mut cursor = io::Cursor::new(data);
-				let store_tx: StoreTransaction = StoreTransaction::read(&mut cursor)
-					.map_err(|e| Error::Generic(format!("Failed to decode payment {key}: {e}")))?;
+				let store_tx: StoreTransaction =
+					StoreTransaction::read(&mut cursor).map_err(|e| {
+						TrustedError::Other(format!("Failed to decode payment {key}: {e}"))
+					})?;
 				let uuid = Uuid::from_str(&key).map_err(|e| {
-					Error::Generic(format!("Failed to parse payment id {key}: {e}"))
+					TrustedError::Other(format!("Failed to parse payment id {key}: {e}"))
 				})?;
 
 				// skip any payment without an amount yet
 				let amount = match store_tx.amount_msats {
-					Some(amount) => Amount::from_milli_sats(amount).map_err(|_| {
-						Error::Generic(format!(
-							"Failed to convert amount ({amount}) for payment {key}"
-						))
-					})?,
+					Some(amount) => {
+						Amount::from_milli_sats(amount).map_err(|_| TrustedError::AmountError)?
+					},
 					None => {
 						debug_assert_ne!(
 							store_tx.status,
@@ -242,9 +253,9 @@ impl TrustedWalletInterface for Spark {
 
 				// if we have no fee, assume zero
 				let fee = match store_tx.fee_msats {
-					Some(fee) => Amount::from_milli_sats(fee).map_err(|_| {
-						Error::Generic(format!("Failed to convert fee ({fee}) for payment {key}"))
-					})?,
+					Some(fee) => {
+						Amount::from_milli_sats(fee).map_err(|_| TrustedError::AmountError)?
+					},
 					None => Amount::ZERO,
 				};
 
@@ -263,7 +274,7 @@ impl TrustedWalletInterface for Spark {
 
 	fn estimate_fee(
 		&self, method: &PaymentMethod, amount: Amount,
-	) -> impl Future<Output = Result<Amount, Error>> + Send {
+	) -> impl Future<Output = Result<Amount, TrustedError>> + Send {
 		async move {
 			if let PaymentMethod::LightningBolt11(invoice) = method {
 				let fee_sats = self
@@ -274,19 +285,19 @@ impl TrustedWalletInterface for Spark {
 					)
 					.await?;
 
-				Amount::from_sats(fee_sats).map_err(|_| {
-					Error::Generic(format!("Failed to convert fee estimate to Amount: {fee_sats}"))
-				})
+				Amount::from_sats(fee_sats).map_err(|_| TrustedError::AmountError)
 			} else {
 				log_error!(self.logger, "Only BOLT 11 is currently supported for fee estimation");
-				Err(Error::Generic("Only BOLT 11 is currently supported".to_owned()))
+				Err(TrustedError::UnsupportedOperation(
+					"Only BOLT 11 is currently supported".to_owned(),
+				))
 			}
 		}
 	}
 
 	fn pay(
 		&self, method: &PaymentMethod, amount: Amount,
-	) -> impl Future<Output = Result<[u8; 32], Error>> + Send {
+	) -> impl Future<Output = Result<[u8; 32], TrustedError>> + Send {
 		async move {
 			if let PaymentMethod::LightningBolt11(invoice) = method {
 				let res = self
@@ -307,12 +318,15 @@ impl TrustedWalletInterface for Spark {
 						// If the format is invalid, we return an error.
 						if let Some(id) = pay.id.split(':').next_back() {
 							let uuid = Uuid::from_str(id).map_err(|_| {
-								Error::Generic(format!("Failed to parse payment id: {id}"))
+								TrustedError::Other(format!("Failed to parse payment id: {id}"))
 							})?;
 							Ok(convert_from_transfer_id(uuid.into_bytes()))
 						} else {
 							log_error!(self.logger, "Invalid payment id format: {}", pay.id);
-							Err(Error::Generic(format!("Invalid payment id format: {}", pay.id)))
+							Err(TrustedError::Other(format!(
+								"Invalid payment id format: {}",
+								pay.id
+							)))
 						}
 					},
 					PayLightningInvoiceResult::Transfer(transfer) => {
@@ -320,7 +334,9 @@ impl TrustedWalletInterface for Spark {
 					},
 				}
 			} else {
-				Err(Error::Generic("Only BOLT 11 is currently supported".to_owned()))
+				Err(TrustedError::UnsupportedOperation(
+					"Only BOLT 11 is currently supported".to_owned(),
+				))
 			}
 		}
 	}
@@ -343,7 +359,7 @@ impl Spark {
 	async fn sync_payments_to_storage(
 		spark_wallet: &SparkWallet<DefaultSigner>, store: &Arc<dyn KVStore + Send + Sync>,
 		logger: &Logger,
-	) -> Result<(), Error> {
+	) -> Result<(), TrustedError> {
 		// sync payments
 		const BATCH_SIZE: u64 = 50;
 
@@ -353,10 +369,9 @@ impl Spark {
 			SPARK_SYNC_NAMESPACE,
 			SPARK_SYNC_OFFSET_KEY,
 		) {
-			Ok(data) => u64::from_be_bytes(
-				data.try_into()
-					.map_err(|e| Error::Generic(format!("Failed to convert sync offset: {e:?}")))?,
-			),
+			Ok(data) => u64::from_be_bytes(data.try_into().map_err(|e| {
+				TrustedError::Other(format!("Failed to convert sync offset: {e:?}"))
+			})?),
 			Err(e) => {
 				if e.kind() == io::ErrorKind::NotFound {
 					// If not found, start from the beginning
@@ -364,7 +379,7 @@ impl Spark {
 					0
 				} else {
 					log_error!(logger, "Failed to read sync info: {e:?}");
-					return Err(Error::Generic("Failed to read sync info".to_owned()));
+					return Err(TrustedError::IOError(e));
 				}
 			},
 		};
@@ -432,14 +447,22 @@ impl Spark {
 }
 
 impl TryFrom<&WalletTransfer> for StoreTransaction {
-	type Error = SparkWalletError;
+	type Error = TrustedError;
 
-	fn try_from(transfer: &WalletTransfer) -> Result<Self, Error> {
+	fn try_from(transfer: &WalletTransfer) -> Result<Self, TrustedError> {
 		let fee_sats: u64 = match &transfer.user_request {
 			Some(user_request) => match user_request {
-				SspUserRequest::LightningSendRequest(r) => r.fee.as_sats()?,
-				SspUserRequest::CoopExitRequest(r) => r.fee.as_sats()?,
-				_ => 0,
+				SspUserRequest::LightningSendRequest(r) => {
+					r.fee.as_sats().map_err(|e| TrustedError::Other(format!("{e:?}")))?
+				},
+				SspUserRequest::CoopExitRequest(r) => {
+					r.fee.as_sats().map_err(|e| TrustedError::Other(format!("{e:?}")))?
+				},
+				SspUserRequest::LeavesSwapRequest(r) => {
+					r.fee.as_sats().map_err(|e| TrustedError::Other(format!("{e:?}")))?
+				},
+				SspUserRequest::ClaimStaticDeposit(_) => 0,
+				SspUserRequest::LightningReceiveRequest(_) => 0,
 			},
 			None => 0,
 		};
@@ -516,6 +539,53 @@ impl From<TransferStatus> for TxStatus {
 			TransferStatus::Expired
 			| TransferStatus::Returned
 			| TransferStatus::ReceiverRefundSigned => TxStatus::Failed,
+		}
+	}
+}
+
+impl From<SparkWalletError> for TrustedError {
+	fn from(e: SparkWalletError) -> Self {
+		match e {
+			SparkWalletError::ValidationError(_) => {
+				TrustedError::WalletOperationFailed(format!("{e:?}"))
+			},
+			SparkWalletError::InsufficientFunds => TrustedError::InsufficientFunds,
+			SparkWalletError::InvalidNetwork => TrustedError::InvalidNetwork,
+			SparkWalletError::InvalidAddress(_) => {
+				TrustedError::WalletOperationFailed(format!("{e:?}"))
+			},
+			SparkWalletError::InvalidOutputIndex => {
+				TrustedError::WalletOperationFailed(format!("{e:?}"))
+			},
+			SparkWalletError::LeavesNotFound => {
+				TrustedError::WalletOperationFailed(format!("{e:?}"))
+			},
+			SparkWalletError::NotADepositOutput => {
+				TrustedError::WalletOperationFailed(format!("{e:?}"))
+			},
+			SparkWalletError::SignerServiceError(_) => {
+				TrustedError::WalletOperationFailed(format!("{e:?}"))
+			},
+			SparkWalletError::DepositAddressUsed => {
+				TrustedError::WalletOperationFailed(format!("{e:?}"))
+			},
+			SparkWalletError::OperatorRpcError(_) => {
+				TrustedError::WalletOperationFailed(format!("{e:?}"))
+			},
+			SparkWalletError::OperatorPoolError(_) => {
+				TrustedError::WalletOperationFailed(format!("{e:?}"))
+			},
+			SparkWalletError::AddressError(_) => {
+				TrustedError::WalletOperationFailed(format!("{e:?}"))
+			},
+			SparkWalletError::TreeServiceError(_) => {
+				TrustedError::WalletOperationFailed(format!("{e:?}"))
+			},
+			SparkWalletError::ServiceError(_) => {
+				TrustedError::WalletOperationFailed(format!("{e:?}"))
+			},
+			SparkWalletError::SspError(_) => TrustedError::WalletOperationFailed(format!("{e:?}")),
+			SparkWalletError::Generic(str) => TrustedError::Other(str),
 		}
 	}
 }

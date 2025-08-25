@@ -61,7 +61,7 @@ impl Default for RebalanceTunables {
 /// Trait representing a trusted wallet backend
 pub trait TrustedWallet: Send + Sync {
 	/// Error type for trusted wallet operations
-	type Error: std::error::Error + Send + Sync + 'static;
+	type Error: Debug + Send + Sync + 'static;
 
 	/// Get the current balance of the trusted wallet
 	fn get_balance(&self) -> impl Future<Output = Result<Amount, Self::Error>> + Send;
@@ -83,7 +83,7 @@ pub trait TrustedWallet: Send + Sync {
 /// Trait representing a lightning wallet backend
 pub trait LightningWallet: Send + Sync {
 	/// Error type for lightning wallet operations
-	type Error: std::error::Error + Send + Sync + 'static;
+	type Error: Debug + Send + Sync + 'static;
 
 	/// Get the current balance of the lightning wallet
 	fn get_balance(&self) -> LightningBalance;

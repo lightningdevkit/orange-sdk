@@ -11,8 +11,6 @@ use ldk_node::lightning_invoice::Bolt11Invoice;
 use bitcoin_payment_instructions::PaymentMethod;
 use bitcoin_payment_instructions::amount::Amount;
 
-use spark_wallet::SparkWalletError;
-
 use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
@@ -20,9 +18,6 @@ use std::time::Duration;
 #[cfg(feature = "_test-utils")]
 pub mod dummy;
 pub mod spark;
-
-// todo generic error type
-pub(crate) type Error = SparkWalletError;
 
 /// Represents a payment with its associated details.
 ///
@@ -57,29 +52,30 @@ pub trait TrustedWalletInterface: Sized + Send + Sync + private::Sealed {
 	) -> impl Future<Output = Result<Self, InitFailure>> + Send;
 
 	/// Returns the current balance of the wallet.
-	fn get_balance(&self) -> impl Future<Output = Result<Amount, Error>> + Send;
+	fn get_balance(&self) -> impl Future<Output = Result<Amount, TrustedError>> + Send;
 
 	/// Generates a new reusable address for receiving payments.
 	/// Generally, this should be a BOLT 12 offer.
-	fn get_reusable_receive_uri(&self) -> impl Future<Output = Result<String, Error>> + Send;
+	fn get_reusable_receive_uri(&self)
+	-> impl Future<Output = Result<String, TrustedError>> + Send;
 
 	/// Generates a Bolt11 invoice for the specified amount.
 	fn get_bolt11_invoice(
 		&self, amount: Option<Amount>,
-	) -> impl Future<Output = Result<Bolt11Invoice, Error>> + Send;
+	) -> impl Future<Output = Result<Bolt11Invoice, TrustedError>> + Send;
 
 	/// Lists all payments made through the wallet.
-	fn list_payments(&self) -> impl Future<Output = Result<Vec<Payment>, Error>> + Send;
+	fn list_payments(&self) -> impl Future<Output = Result<Vec<Payment>, TrustedError>> + Send;
 
 	/// Estimates the fee for a payment to the given payment method with the specified amount.
 	fn estimate_fee(
 		&self, method: &PaymentMethod, amount: Amount,
-	) -> impl Future<Output = Result<Amount, Error>> + Send;
+	) -> impl Future<Output = Result<Amount, TrustedError>> + Send;
 
 	/// Pays to the given payment method with the specified amount.
 	fn pay(
 		&self, method: &PaymentMethod, amount: Amount,
-	) -> impl Future<Output = Result<[u8; 32], Error>> + Send;
+	) -> impl Future<Output = Result<[u8; 32], TrustedError>> + Send;
 
 	/// Stops the wallet, cleaning up any resources.
 	/// This is typically used to gracefully shut down the wallet.
@@ -89,7 +85,7 @@ pub trait TrustedWalletInterface: Sized + Send + Sync + private::Sealed {
 pub(crate) struct WalletTrusted<T: TrustedWalletInterface>(pub(crate) Arc<T>);
 
 impl<T: TrustedWalletInterface> graduated_rebalancer::TrustedWallet for WalletTrusted<T> {
-	type Error = crate::trusted_wallet::Error;
+	type Error = TrustedError;
 
 	fn get_balance(&self) -> impl Future<Output = Result<Amount, Self::Error>> + Send {
 		async move { self.0.get_balance().await }
@@ -126,4 +122,29 @@ mod private {
 	impl Sealed for super::spark::Spark {}
 	#[cfg(feature = "_test-utils")]
 	impl Sealed for super::dummy::DummyTrustedWallet {}
+}
+
+/// An error type for the Spark wallet implementation.
+#[derive(Debug)]
+pub enum TrustedError {
+	/// Not enough funds to complete the operation.
+	InsufficientFunds,
+	/// The wallet operation failed with a specific message.
+	WalletOperationFailed(String),
+	/// The provided network is invalid.
+	InvalidNetwork,
+	/// The spark wallet does not yet support the operation.
+	UnsupportedOperation(String),
+	/// Failed to convert an amount.
+	AmountError,
+	/// An I/O error occurred.
+	IOError(ldk_node::lightning::io::Error),
+	/// An unspecified error occurred.
+	Other(String),
+}
+
+impl From<ldk_node::lightning::io::Error> for TrustedError {
+	fn from(e: ldk_node::lightning::io::Error) -> Self {
+		TrustedError::IOError(e)
+	}
 }

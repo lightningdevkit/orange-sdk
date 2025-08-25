@@ -53,7 +53,7 @@ pub mod trusted_wallet;
 
 use lightning_wallet::LightningWallet;
 use logging::Logger;
-use trusted_wallet::Error as TrustedError;
+use trusted_wallet::TrustedError;
 use trusted_wallet::TrustedWalletInterface;
 
 pub use bitcoin_payment_instructions;
@@ -380,7 +380,7 @@ pub enum InitFailure {
 	/// Failure to start the LDK node.
 	LdkNodeStartFailure(NodeError),
 	/// Failure in the trusted wallet implementation.
-	TrustedFailure(Box<TrustedError>),
+	TrustedFailure(TrustedError),
 }
 
 impl From<io::Error> for InitFailure {
@@ -403,7 +403,7 @@ impl From<NodeError> for InitFailure {
 
 impl From<TrustedError> for InitFailure {
 	fn from(e: TrustedError) -> InitFailure {
-		InitFailure::TrustedFailure(Box::new(e))
+		InitFailure::TrustedFailure(e)
 	}
 }
 

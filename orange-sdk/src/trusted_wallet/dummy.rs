@@ -3,7 +3,7 @@
 use crate::bitcoin::hashes::Hash;
 use crate::event::EventQueue;
 use crate::store::TxStatus;
-use crate::trusted_wallet::{Error, Payment, TrustedWalletInterface};
+use crate::trusted_wallet::{Payment, TrustedError, TrustedWalletInterface};
 use crate::{InitFailure, WalletConfig};
 use bitcoin_payment_instructions::PaymentMethod;
 use bitcoin_payment_instructions::amount::Amount;
@@ -187,25 +187,27 @@ impl TrustedWalletInterface for DummyTrustedWallet {
 		}
 	}
 
-	fn get_balance(&self) -> impl Future<Output = Result<Amount, Error>> + Send {
+	fn get_balance(&self) -> impl Future<Output = Result<Amount, TrustedError>> + Send {
 		async move {
 			let msats = self.current_bal_msats.load(Ordering::SeqCst);
 			Ok(Amount::from_milli_sats(msats).expect("valid msats"))
 		}
 	}
 
-	fn get_reusable_receive_uri(&self) -> impl Future<Output = Result<String, Error>> + Send {
+	fn get_reusable_receive_uri(
+		&self,
+	) -> impl Future<Output = Result<String, TrustedError>> + Send {
 		async move {
 			match self.ldk_node.bolt12_payment().receive_variable_amount("dummy offer", None) {
 				Ok(offer) => Ok(offer.to_string()),
-				Err(e) => Err(Error::Generic(e.to_string())),
+				Err(e) => Err(TrustedError::WalletOperationFailed(e.to_string())),
 			}
 		}
 	}
 
 	fn get_bolt11_invoice(
 		&self, amount: Option<Amount>,
-	) -> impl Future<Output = Result<Bolt11Invoice, Error>> + Send {
+	) -> impl Future<Output = Result<Bolt11Invoice, TrustedError>> + Send {
 		async move {
 			let desc = Bolt11InvoiceDescription::Direct(Description::empty());
 			match amount {
@@ -226,19 +228,19 @@ impl TrustedWalletInterface for DummyTrustedWallet {
 		}
 	}
 
-	fn list_payments(&self) -> impl Future<Output = Result<Vec<Payment>, Error>> + Send {
+	fn list_payments(&self) -> impl Future<Output = Result<Vec<Payment>, TrustedError>> + Send {
 		async move { Ok(self.payments.read().unwrap().clone()) }
 	}
 
 	fn estimate_fee(
 		&self, _method: &PaymentMethod, _amount: Amount,
-	) -> impl Future<Output = Result<Amount, Error>> + Send {
+	) -> impl Future<Output = Result<Amount, TrustedError>> + Send {
 		async move { Ok(Amount::ZERO) }
 	}
 
 	fn pay(
 		&self, method: &PaymentMethod, amount: Amount,
-	) -> impl Future<Output = Result<[u8; 32], Error>> + Send {
+	) -> impl Future<Output = Result<[u8; 32], TrustedError>> + Send {
 		async move {
 			let id = match method {
 				PaymentMethod::LightningBolt11(inv) => {
