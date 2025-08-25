@@ -301,23 +301,8 @@ where
 	/// Perform on-chain to lightning rebalance by opening a channel
 	async fn do_onchain_rebalance(&self, params: TriggerParams) {
 		// This should open a channel with the LSP using available on-chain funds
-		// and create appropriate metadata entries for the channel opening transaction
 
 		let _ = self.balance_mutex.lock().await;
-
-		// make sure we have a metadata entry for the triggering transaction
-		// let trigger = PaymentId::Lightning(triggering_txid.to_byte_array());
-		// if self.tx_metadata.read().get(&trigger).is_none() {
-		// 	self.tx_metadata.insert(
-		// 		trigger.clone(),
-		// 		TxMetadata {
-		// 			ty: TxType::Payment {
-		// 				ty: PaymentType::IncomingOnChain { txid: Some(triggering_txid) },
-		// 			},
-		// 			time: SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap(),
-		// 		},
-		// 	);
-		// }
 
 		log_info!(self.logger, "Opening channel with LSP with on-chain funds");
 
@@ -341,36 +326,6 @@ where
 			user_channel_id: user_chan_id,
 			channel_outpoint,
 		});
-
-		// wait for channel to be opened
-		// let mut channel_txid: Option<Txid> = None;
-		// while channel_txid.is_none() {
-		// 	channel_txid = self
-		// 		.ln_wallet
-		// 		.self
-		// 		.ldk_node
-		// 		.list_channels()
-		// 		.iter()
-		// 		.find(|c| c.user_channel_id == user_chan_id)
-		// 		.and_then(|c| c.funding_txo.map(|t| t.txid));
-		// 	if channel_txid.is_none() {
-		// 	}
-		// }
-		//
-		// let chan_txid =
-		// 	channel_txid.expect("channel_txid must be set after waiting for channel to open");
-		//
-		//
-		//
-		// self
-		// 	.tx_metadata
-		// 	.set_tx_caused_rebalance(&trigger)
-		// 	.expect("Failed to write metadata for onchain rebalance transaction");
-		// let metadata = TxMetadata {
-		// 	ty: TxType::OnchainToLightning { channel_txid: chan_txid, triggering_txid },
-		// 	time: SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap(),
-		// };
-		// self.tx_metadata.insert(PaymentId::Lightning(chan_txid.to_byte_array()), metadata);
 	}
 
 	/// Stops the rebalancer, waits for any active rebalances to complete

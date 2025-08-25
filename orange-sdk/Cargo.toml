@@ -14,13 +14,8 @@ bitcoin-payment-instructions = { version = "0.4.0", features = ["http"] }
 chrono = { version = "0.4", default-features = false }
 rand = "0.8.5"
 reqwest = { version = "0.12.23", default-features = false, features = ["rustls-tls"] }
-#spark-rust = { version = "0.1.11" }
-#spark-protos = { version = "=0.1.9", default-features = false }
 spark-wallet = { path = "../../rust-spark/crates/spark-wallet" }
 tokio = { version = "1.0", default-features = false, features = ["rt-multi-thread", "sync"] }
 uuid = { version = "1.0", default-features = false }
 
 corepc-node = { version = "0.8.0", features = ["29_0", "download"], optional = true }
-
-[dev-dependencies]
-rustls = "0.23.26"
