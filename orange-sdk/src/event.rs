@@ -185,6 +185,8 @@ impl_writeable_tlv_based_enum!(Event,
 );
 
 /// A queue for events emitted by the [`Wallet`].
+///
+/// [`Wallet`]: [`crate::Wallet`]
 pub struct EventQueue {
 	queue: Arc<Mutex<VecDeque<Event>>>,
 	waker: Arc<Mutex<Option<Waker>>>,

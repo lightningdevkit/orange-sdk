@@ -4,7 +4,7 @@ set -x
 
 RUSTC_MINOR_VERSION=$(rustc --version | awk '{ split($2,a,"."); print a[2] }')
 
-RUSTFLAGS='-D warnings' cargo clippy -- \
+cargo clippy -- -D warnings \
 	`# We use this for sat groupings` \
 	-A clippy::inconsistent-digit-grouping \
 	`# Some stuff we do sometimes when its reasonable` \
@@ -20,4 +20,4 @@ RUSTFLAGS='-D warnings' cargo clippy -- \
 	`# TODO eventually remove this` \
 	-A dead-code
 
-cargo doc --all-features
+RUSTDOCFLAGS="-D warnings" cargo doc --all --all-features --no-deps
