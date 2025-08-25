@@ -29,50 +29,6 @@ use std::sync::Arc;
 use tokio::runtime::Runtime;
 use tokio::sync::watch;
 
-impl From<PaymentStatus> for TxStatus {
-	fn from(o: PaymentStatus) -> TxStatus {
-		match o {
-			PaymentStatus::Pending => TxStatus::Pending,
-			PaymentStatus::Succeeded => TxStatus::Completed,
-			PaymentStatus::Failed => TxStatus::Failed,
-		}
-	}
-}
-
-impl From<&PaymentDetails> for PaymentType {
-	fn from(d: &PaymentDetails) -> PaymentType {
-		match (&d.kind, d.direction == PaymentDirection::Outbound) {
-			(
-				PaymentKind::Bolt11 { preimage, .. } | PaymentKind::Bolt11Jit { preimage, .. },
-				true,
-			) => {
-				if d.status == PaymentStatus::Succeeded {
-					debug_assert!(preimage.is_some());
-				}
-				PaymentType::OutgoingLightningBolt11 { payment_preimage: *preimage }
-			},
-			(PaymentKind::Bolt12Offer { preimage, .. }, true) => {
-				PaymentType::OutgoingLightningBolt12 { payment_preimage: *preimage }
-			},
-			(
-				PaymentKind::Bolt12Refund { preimage, .. }
-				| PaymentKind::Spontaneous { preimage, .. },
-				true,
-			) => {
-				debug_assert!(false);
-				PaymentType::OutgoingLightningBolt12 { payment_preimage: *preimage }
-			},
-			(PaymentKind::Onchain { txid, .. }, true) => {
-				PaymentType::OutgoingOnChain { txid: Some(*txid) }
-			},
-			(PaymentKind::Onchain { txid, .. }, false) => {
-				PaymentType::IncomingOnChain { txid: Some(*txid) }
-			},
-			(_, false) => PaymentType::IncomingLightning {},
-		}
-	}
-}
-
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct LightningWalletBalance {
 	pub(crate) lightning: Amount,
@@ -90,6 +46,8 @@ pub(crate) struct LightningWalletImpl {
 pub(crate) struct LightningWallet {
 	pub(crate) inner: Arc<LightningWalletImpl>,
 }
+
+const DEFAULT_INVOICE_EXPIRY_SECS: u32 = 86_400; // 24 hours
 
 impl LightningWallet {
 	pub(super) async fn init<E>(
@@ -240,24 +198,32 @@ impl LightningWallet {
 		let desc = Bolt11InvoiceDescription::Direct(Description::empty());
 		if let Some(amt) = amount {
 			if self.estimate_receivable_balance() >= amt {
-				self.inner.ldk_node.bolt11_payment().receive(amt.milli_sats(), &desc, 86400)
+				self.inner.ldk_node.bolt11_payment().receive(
+					amt.milli_sats(),
+					&desc,
+					DEFAULT_INVOICE_EXPIRY_SECS,
+				)
 			} else {
 				self.inner.ldk_node.bolt11_payment().receive_via_jit_channel(
 					amt.milli_sats(),
 					&desc,
-					86400,
+					DEFAULT_INVOICE_EXPIRY_SECS,
 					None,
 				)
 			}
-		} else if self.estimate_receivable_balance()
+		} else if self.estimate_receivable_balance() // if we can receive at least 100k sats, don't use JIT
 			>= Amount::from_sats(100_000).expect("valid amount")
 		{
-			self.inner.ldk_node.bolt11_payment().receive_variable_amount(&desc, 86400)
-		} else {
 			self.inner
 				.ldk_node
 				.bolt11_payment()
-				.receive_variable_amount_via_jit_channel(&desc, 86400, None)
+				.receive_variable_amount(&desc, DEFAULT_INVOICE_EXPIRY_SECS)
+		} else {
+			self.inner.ldk_node.bolt11_payment().receive_variable_amount_via_jit_channel(
+				&desc,
+				DEFAULT_INVOICE_EXPIRY_SECS,
+				None,
+			)
 		}
 	}
 
@@ -447,6 +413,50 @@ impl graduated_rebalancer::LightningWallet for LightningWallet {
 					},
 				}
 			}
+		}
+	}
+}
+
+impl From<PaymentStatus> for TxStatus {
+	fn from(o: PaymentStatus) -> TxStatus {
+		match o {
+			PaymentStatus::Pending => TxStatus::Pending,
+			PaymentStatus::Succeeded => TxStatus::Completed,
+			PaymentStatus::Failed => TxStatus::Failed,
+		}
+	}
+}
+
+impl From<&PaymentDetails> for PaymentType {
+	fn from(d: &PaymentDetails) -> PaymentType {
+		match (&d.kind, d.direction == PaymentDirection::Outbound) {
+			(
+				PaymentKind::Bolt11 { preimage, .. } | PaymentKind::Bolt11Jit { preimage, .. },
+				true,
+			) => {
+				if d.status == PaymentStatus::Succeeded {
+					debug_assert!(preimage.is_some());
+				}
+				PaymentType::OutgoingLightningBolt11 { payment_preimage: *preimage }
+			},
+			(PaymentKind::Bolt12Offer { preimage, .. }, true) => {
+				PaymentType::OutgoingLightningBolt12 { payment_preimage: *preimage }
+			},
+			(
+				PaymentKind::Bolt12Refund { preimage, .. }
+				| PaymentKind::Spontaneous { preimage, .. },
+				true,
+			) => {
+				debug_assert!(false);
+				PaymentType::OutgoingLightningBolt12 { payment_preimage: *preimage }
+			},
+			(PaymentKind::Onchain { txid, .. }, true) => {
+				PaymentType::OutgoingOnChain { txid: Some(*txid) }
+			},
+			(PaymentKind::Onchain { txid, .. }, false) => {
+				PaymentType::IncomingOnChain { txid: Some(*txid) }
+			},
+			(_, false) => PaymentType::IncomingLightning {},
 		}
 	}
 }
