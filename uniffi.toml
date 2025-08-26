@@ -1,0 +1,12 @@
+[bindings.kotlin]
+package_name = "org.lightningdevkit.orangesdk"
+cdylib_name = "orange_sdk"
+
+[bindings.python]
+cdylib_name = "orange_sdk"
+
+[bindings.swift]
+module_name = "OrangeSDK"
+ffi_module_name = "OrangeSDKFFI"
+ffi_module_filename ="OrangeSDKFFI"
+cdylib_name = "orange_sdk"

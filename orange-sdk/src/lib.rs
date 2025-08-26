@@ -51,6 +51,8 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 mod event;
+#[cfg(feature = "uniffi")]
+mod ffi;
 mod lightning_wallet;
 pub(crate) mod logging;
 mod rebalancer;
@@ -74,6 +76,9 @@ pub use ldk_node::payment::ConfirmationStatus;
 pub use spark_wallet::{OperatorPoolConfig, ServiceProviderConfig, SparkWalletConfig};
 pub use store::{PaymentType, Transaction, TxStatus};
 pub use trusted_wallet::ExtraConfig;
+
+#[cfg(feature = "uniffi")]
+uniffi::setup_scaffolding!();
 
 type Rebalancer = GraduatedRebalancer<
 	WalletTrusted<DynTrustedWalletInterface>,

@@ -3,8 +3,13 @@ name = "orange-sdk"
 version = "0.1.0"
 edition = "2024"
 
+[lib]
+crate-type = ["lib", "staticlib", "cdylib"]
+name = "orange_sdk"
+
 [features]
 default = ["spark"]
+uniffi = ["dep:uniffi", "spark", "cashu"]
 spark = ["spark-wallet", "uuid"]
 cashu = ["cdk", "serde_json"]
 _test-utils = ["corepc-node", "cashu", "uuid/v7", "rand"]
@@ -13,12 +18,12 @@ _cashu-tests = ["_test-utils", "cdk-ldk-node", "cdk/mint", "cdk-sqlite", "cdk-ax
 [dependencies]
 graduated-rebalancer = { path = "../graduated-rebalancer", version = "0.1.0" }
 
-ldk-node = { git = "https://github.com/benthecarman/ldk-node.git", branch = "esplora-auth" }
-bitcoin-payment-instructions = { version = "0.4.0", features = ["http"] }
+ldk-node = { path = "../../ldk-node" }
+bitcoin-payment-instructions = { path = "../../bitcoin-payment-instructions", features = ["http"] }
 chrono = { version = "0.4", default-features = false }
 rand = { version = "0.8.5", optional = true }
 reqwest = { version = "0.12.23", default-features = false, features = ["rustls-tls"] }
-spark-wallet = { git = "https://github.com/breez/spark-sdk.git", rev = "5bfde1b207849db2ae02f57714a80efb3f04e0d2", optional = true }
+spark-wallet = { path = "../../rust-spark/crates/spark-wallet", optional = true }
 tokio = { version = "1.0", default-features = false, features = ["rt-multi-thread", "sync"] }
 uuid = { version = "1.0", default-features = false, optional = true }
 cdk = { version = "0.12.0", default-features = false, features = ["wallet"], optional = true }
@@ -30,3 +35,14 @@ cdk-ldk-node = { version = "0.12.0", optional = true }
 cdk-sqlite = { version = "0.12.0", optional = true }
 cdk-axum = { version = "0.12.0", optional = true }
 axum = { version = "0.8.1", optional = true }
+
+uniffi = { version = "0.29", features = ["cli"], optional = true }
+
+[dev-dependencies]
+rustls = "0.23.26"
+
+[profile.release]
+panic = "abort"
+
+[profile.dev]
+panic = "abort"

@@ -1,0 +1,5 @@
+[bindings.kotlin]
+android = true
+android_cleaner = true
+package_name = "org.lightningdevkit.orangesdk"
+cdylib_name = "orange_sdk"
