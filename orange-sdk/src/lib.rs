@@ -21,7 +21,10 @@ use bitcoin_payment_instructions::amount::Amount;
 
 use crate::rebalancer::{OrangeRebalanceEventHandler, OrangeTrigger};
 use crate::store::{PaymentId, TxMetadata, TxMetadataStore, TxType};
-use crate::trusted_wallet::WalletTrusted;
+#[cfg(feature = "_test-utils")]
+use crate::trusted_wallet::dummy::DummyTrustedWallet;
+use crate::trusted_wallet::spark::Spark;
+use crate::trusted_wallet::{DynTrustedWalletInterface, WalletTrusted};
 use graduated_rebalancer::GraduatedRebalancer;
 use ldk_node::bitcoin::Network;
 use ldk_node::bitcoin::hashes::Hash;
@@ -44,6 +47,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
+pub mod builder;
 mod event;
 mod lightning_wallet;
 pub(crate) mod logging;
@@ -54,20 +58,21 @@ pub mod trusted_wallet;
 use lightning_wallet::LightningWallet;
 use logging::Logger;
 use trusted_wallet::TrustedError;
-use trusted_wallet::TrustedWalletInterface;
 
 pub use bitcoin_payment_instructions;
+pub use builder::{BuilderError, WalletBuilder};
 pub use event::{Event, EventQueue};
 pub use ldk_node::bip39::Mnemonic;
 pub use ldk_node::bitcoin;
 pub use ldk_node::payment::ConfirmationStatus;
 pub use spark_wallet::{OperatorPoolConfig, ServiceProviderConfig, SparkWalletConfig};
 pub use store::{PaymentType, Transaction, TxStatus};
+pub use trusted_wallet::ExtraConfig;
 
-type Rebalancer<T> = GraduatedRebalancer<
-	WalletTrusted<T>,
+type Rebalancer = GraduatedRebalancer<
+	WalletTrusted<DynTrustedWalletInterface>,
 	LightningWallet,
-	OrangeTrigger<T>,
+	OrangeTrigger,
 	OrangeRebalanceEventHandler,
 	Logger,
 >;
@@ -93,17 +98,17 @@ impl Balances {
 }
 
 /// The main implementation of the wallet, containing both trusted and lightning wallet components.
-struct WalletImpl<T: TrustedWalletInterface> {
+struct WalletImpl {
 	/// The main implementation of the wallet, containing both trusted and lightning wallet components.
 	ln_wallet: Arc<LightningWallet>,
 	/// The trusted wallet interface for managing small balances.
-	trusted: Arc<T>,
+	trusted: Arc<Box<DynTrustedWalletInterface>>,
 	/// The event handler for processing wallet events.
 	event_queue: Arc<EventQueue>,
 	/// Configuration parameters for when the wallet decides to use the lightning or trusted wallet.
 	tunables: Tunables,
 	/// The rebalancer for managing the transfer of funds between the trusted and lightning wallets.
-	rebalancer: Arc<Rebalancer<T>>,
+	rebalancer: Arc<Rebalancer>,
 	/// The Bitcoin network the wallet operates on (e.g., Mainnet, Testnet).
 	network: Network,
 	/// Metadata store for tracking transactions.
@@ -118,9 +123,9 @@ struct WalletImpl<T: TrustedWalletInterface> {
 /// The primary entry point for orange-sdk. This is the main wallet struct that
 /// contains the trusted wallet and the lightning wallet.
 #[derive(Clone)]
-pub struct Wallet<T: TrustedWalletInterface> {
+pub struct Wallet {
 	/// The internal wallet implementation.
-	inner: Arc<WalletImpl<T>>,
+	inner: Arc<WalletImpl>,
 }
 
 /// Represents the seed used for wallet generation.
@@ -194,7 +199,7 @@ pub enum ChainSource {
 }
 
 /// Configuration for initializing the wallet.
-pub struct WalletConfig<E> {
+pub struct WalletConfig {
 	/// Configuration for wallet storage.
 	pub storage_config: StorageConfig,
 	/// Location of the wallet's log file.
@@ -215,7 +220,7 @@ pub struct WalletConfig<E> {
 	/// Configuration parameters for when the wallet decides to use the lightning or trusted wallet.
 	pub tunables: Tunables,
 	/// Extra configuration specific to the trusted wallet implementation.
-	pub extra_config: E,
+	pub extra_config: ExtraConfig,
 }
 
 /// Configuration parameters for when the wallet decides to use the lightning or trusted wallet.
@@ -373,6 +378,8 @@ impl PaymentInfo {
 /// Represents possible failures during wallet initialization.
 #[derive(Debug)]
 pub enum InitFailure {
+	/// Failure to build the wallet using the builder pattern.
+	BuildError(BuilderError),
 	/// I/O error during initialization.
 	IoError(io::Error),
 	/// Failure to build the LDK node.
@@ -466,18 +473,13 @@ impl fmt::Display for SingleUseReceiveUri {
 	}
 }
 
-impl<E, T> Wallet<T>
-where
-	T: TrustedWalletInterface<ExtraConfig = E> + 'static,
-{
+impl Wallet {
 	/// Constructs a new Wallet.
 	///
 	/// `runtime` must be a reference to the running `tokio` runtime which we are currently
 	/// operating in.
 	// TODO: WOW that is a terrible API lol
-	pub async fn new(
-		runtime: Arc<Runtime>, config: WalletConfig<E>,
-	) -> Result<Wallet<T>, InitFailure> {
+	pub async fn new(runtime: Arc<Runtime>, config: WalletConfig) -> Result<Wallet, InitFailure> {
 		let tunables = config.tunables;
 		let network = config.network;
 		let logger = Arc::new(Logger::new(&config.log_file).expect("Failed to open log file"));
@@ -492,10 +494,22 @@ where
 
 		let event_queue = Arc::new(EventQueue::new(Arc::clone(&store), Arc::clone(&logger)));
 
-		let trusted = Arc::new(
-			T::init(&config, Arc::clone(&store), Arc::clone(&event_queue), Arc::clone(&logger))
+		let trusted: Arc<Box<DynTrustedWalletInterface>> = match &config.extra_config {
+			ExtraConfig::Spark(_) => Arc::new(Box::new(
+				Spark::init(
+					&config,
+					Arc::clone(&store),
+					Arc::clone(&event_queue),
+					Arc::clone(&logger),
+				)
 				.await?,
-		);
+			)),
+			#[cfg(feature = "_test-utils")]
+			ExtraConfig::Dummy(cfg) => Arc::new(Box::new(
+				DummyTrustedWallet::new(cfg.uuid, &cfg.lsp, &cfg.bitcoind, cfg.rt.clone()).await,
+			)),
+		};
+
 		let ln_wallet = Arc::new(
 			LightningWallet::init(
 				Arc::clone(&runtime),
@@ -511,7 +525,7 @@ where
 
 		let wt = Arc::new(WalletTrusted(Arc::clone(&trusted)));
 
-		let trigger = OrangeTrigger::new(
+		let trigger = Arc::new(OrangeTrigger::new(
 			Arc::clone(&ln_wallet),
 			Arc::clone(&trusted),
 			tunables,
@@ -519,23 +533,23 @@ where
 			Arc::clone(&event_queue),
 			Arc::clone(&store),
 			Arc::clone(&logger),
-		);
+		));
 
-		let rebalance_events = OrangeRebalanceEventHandler::new(
+		let rebalance_events = Arc::new(OrangeRebalanceEventHandler::new(
 			tx_metadata.clone(),
 			Arc::clone(&event_queue),
 			Arc::clone(&logger),
-		);
+		));
 
 		let rebalancer = Arc::new(GraduatedRebalancer::new(
 			wt,
 			Arc::clone(&ln_wallet),
-			Arc::new(trigger),
-			Arc::new(rebalance_events),
+			trigger,
+			rebalance_events,
 			Arc::clone(&logger),
 		));
 
-		let inner = Arc::new(WalletImpl::<T> {
+		let inner = Arc::new(WalletImpl {
 			trusted,
 			ln_wallet,
 			event_queue,
@@ -948,27 +962,31 @@ where
 		let mut last_trusted_err = None;
 		let mut last_lightning_err = None;
 
-		let mut pay_trusted = async |method, ty: &dyn Fn() -> PaymentType| {
+		let mut pay_trusted = async |method: PaymentMethod, ty: &dyn Fn() -> PaymentType| {
 			if instructions.amount <= trusted_balance {
 				// attempt to estimate the fee for the trusted payment
 				// if we fail to estimate the fee, just assume it is zero and try to pay
 				// sometimes the fee estimation can fail but payments can still succeed
-				let trusted_fee =
-					match self.inner.trusted.estimate_fee(method, instructions.amount).await {
-						Ok(fee) => {
-							log_trace!(
-								self.inner.logger,
-								"Estimated trusted fee: {}msats",
-								fee.milli_sats()
-							);
-							fee
-						},
+				let trusted_fee = match self
+					.inner
+					.trusted
+					.estimate_fee(method.clone(), instructions.amount)
+					.await
+				{
+					Ok(fee) => {
+						log_trace!(
+							self.inner.logger,
+							"Estimated trusted fee: {}msats",
+							fee.milli_sats()
+						);
+						fee
+					},
 
-						Err(e) => {
-							log_warn!(self.inner.logger, "Failed to estimate trusted fee: {e:?}");
-							Amount::ZERO
-						},
-					};
+					Err(e) => {
+						log_warn!(self.inner.logger, "Failed to estimate trusted fee: {e:?}");
+						Amount::ZERO
+					},
+				};
 
 				if trusted_fee.saturating_add(instructions.amount) <= trusted_balance {
 					let res = self.inner.trusted.pay(method, instructions.amount).await;
@@ -1056,7 +1074,7 @@ where
 		};
 
 		// First try to pay via the trusted balance over lightning
-		for method in &methods {
+		for method in methods.clone() {
 			match method {
 				PaymentMethod::LightningBolt11(_) => {
 					if pay_trusted(method, &|| PaymentType::OutgoingLightningBolt11 {
@@ -1113,7 +1131,7 @@ where
 		//TODO: Try to MPP the payment using both trusted and LN funds
 
 		// Finally, try trusted on-chain first,
-		for method in &methods {
+		for method in methods.clone() {
 			if let PaymentMethod::OnChain { .. } = method {
 				if pay_trusted(method, &|| PaymentType::OutgoingOnChain { txid: None })
 					.await

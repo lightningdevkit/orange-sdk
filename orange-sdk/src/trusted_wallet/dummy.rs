@@ -1,20 +1,18 @@
 //! A dummy implementation of `TrustedWalletInterface` for testing purposes.
 
 use crate::bitcoin::hashes::Hash;
-use crate::event::EventQueue;
 use crate::store::TxStatus;
 use crate::trusted_wallet::{Payment, TrustedError, TrustedWalletInterface};
-use crate::{InitFailure, WalletConfig};
 use bitcoin_payment_instructions::PaymentMethod;
 use bitcoin_payment_instructions::amount::Amount;
 use corepc_node::client::bitcoin::Network;
 use corepc_node::{Node as Bitcoind, get_available_port};
 use ldk_node::lightning::ln::msgs::SocketAddress;
-use ldk_node::lightning::util::persist::KVStore;
 use ldk_node::lightning_invoice::{Bolt11Invoice, Bolt11InvoiceDescription, Description};
 use ldk_node::{Event, Node};
 use rand::RngCore;
 use std::env::temp_dir;
+use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
@@ -25,12 +23,13 @@ use uuid::Uuid;
 /// This wallet uses a local LDK node to handle payments and simulates a custodial wallet
 /// by keeping track of the balance and payments in memory.
 #[derive(Clone)]
-pub struct DummyTrustedWallet {
+pub(crate) struct DummyTrustedWallet {
 	current_bal_msats: Arc<AtomicU64>,
 	payments: Arc<RwLock<Vec<Payment>>>,
 	ldk_node: Arc<Node>,
 }
 
+#[derive(Clone)]
 /// Extra configuration for the `DummyTrustedWallet`.
 pub struct DummyTrustedWalletExtraConfig {
 	/// The test uuid
@@ -45,7 +44,7 @@ pub struct DummyTrustedWalletExtraConfig {
 
 impl DummyTrustedWallet {
 	/// Creates a new `DummyTrustedWallet` instance.
-	pub async fn new(uuid: Uuid, lsp: &Node, bitcoind: &Bitcoind, rt: Arc<Runtime>) -> Self {
+	pub(crate) async fn new(uuid: Uuid, lsp: &Node, bitcoind: &Bitcoind, rt: Arc<Runtime>) -> Self {
 		let mut builder = ldk_node::Builder::new();
 		builder.set_network(Network::Regtest);
 		let mut seed: [u8; 64] = [0; 64];
@@ -170,45 +169,30 @@ impl DummyTrustedWallet {
 }
 
 impl TrustedWalletInterface for DummyTrustedWallet {
-	type ExtraConfig = DummyTrustedWalletExtraConfig;
-
-	fn init(
-		config: &WalletConfig<Self::ExtraConfig>, _store: Arc<dyn KVStore + Sync + Send>,
-		_eq: Arc<EventQueue>, _logger: Arc<crate::logging::Logger>,
-	) -> impl Future<Output = Result<Self, InitFailure>> + Send {
-		async move {
-			Ok(Self::new(
-				config.extra_config.uuid,
-				&config.extra_config.lsp,
-				&config.extra_config.bitcoind,
-				config.extra_config.rt.clone(),
-			)
-			.await)
-		}
-	}
-
-	fn get_balance(&self) -> impl Future<Output = Result<Amount, TrustedError>> + Send {
-		async move {
+	fn get_balance(
+		&self,
+	) -> Pin<Box<dyn Future<Output = Result<Amount, TrustedError>> + Send + '_>> {
+		Box::pin(async move {
 			let msats = self.current_bal_msats.load(Ordering::SeqCst);
 			Ok(Amount::from_milli_sats(msats).expect("valid msats"))
-		}
+		})
 	}
 
 	fn get_reusable_receive_uri(
 		&self,
-	) -> impl Future<Output = Result<String, TrustedError>> + Send {
-		async move {
+	) -> Pin<Box<dyn Future<Output = Result<String, TrustedError>> + Send + '_>> {
+		Box::pin(async move {
 			match self.ldk_node.bolt12_payment().receive_variable_amount("dummy offer", None) {
 				Ok(offer) => Ok(offer.to_string()),
 				Err(e) => Err(TrustedError::WalletOperationFailed(e.to_string())),
 			}
-		}
+		})
 	}
 
 	fn get_bolt11_invoice(
 		&self, amount: Option<Amount>,
-	) -> impl Future<Output = Result<Bolt11Invoice, TrustedError>> + Send {
-		async move {
+	) -> Pin<Box<dyn Future<Output = Result<Bolt11Invoice, TrustedError>> + Send + '_>> {
+		Box::pin(async move {
 			let desc = Bolt11InvoiceDescription::Direct(Description::empty());
 			match amount {
 				Some(amt) => {
@@ -225,35 +209,37 @@ impl TrustedWalletInterface for DummyTrustedWallet {
 					Ok(invoice)
 				},
 			}
-		}
+		})
 	}
 
-	fn list_payments(&self) -> impl Future<Output = Result<Vec<Payment>, TrustedError>> + Send {
-		async move { Ok(self.payments.read().unwrap().clone()) }
+	fn list_payments(
+		&self,
+	) -> Pin<Box<dyn Future<Output = Result<Vec<Payment>, TrustedError>> + Send + '_>> {
+		Box::pin(async move { Ok(self.payments.read().unwrap().clone()) })
 	}
 
 	fn estimate_fee(
-		&self, _method: &PaymentMethod, _amount: Amount,
-	) -> impl Future<Output = Result<Amount, TrustedError>> + Send {
-		async move { Ok(Amount::ZERO) }
+		&self, _method: PaymentMethod, _amount: Amount,
+	) -> Pin<Box<dyn Future<Output = Result<Amount, TrustedError>> + Send + '_>> {
+		Box::pin(async move { Ok(Amount::ZERO) })
 	}
 
 	fn pay(
-		&self, method: &PaymentMethod, amount: Amount,
-	) -> impl Future<Output = Result<[u8; 32], TrustedError>> + Send {
-		async move {
+		&self, method: PaymentMethod, amount: Amount,
+	) -> Pin<Box<dyn Future<Output = Result<[u8; 32], TrustedError>> + Send + '_>> {
+		Box::pin(async move {
 			let id = match method {
 				PaymentMethod::LightningBolt11(inv) => {
 					self.ldk_node
 						.bolt11_payment()
-						.send_using_amount(inv, amount.milli_sats(), None)
+						.send_using_amount(&inv, amount.milli_sats(), None)
 						.unwrap()
 						.0
 				},
 				PaymentMethod::LightningBolt12(offer) => {
 					self.ldk_node
 						.bolt12_payment()
-						.send_using_amount(offer, amount.milli_sats(), None, None)
+						.send_using_amount(&offer, amount.milli_sats(), None, None)
 						.unwrap()
 						.0
 				},
@@ -261,7 +247,7 @@ impl TrustedWalletInterface for DummyTrustedWallet {
 					let txid = self
 						.ldk_node
 						.onchain_payment()
-						.send_to_address(address, amount.sats_rounding_up(), None)
+						.send_to_address(&address, amount.sats_rounding_up(), None)
 						.unwrap();
 					txid.to_byte_array()
 				},
@@ -287,12 +273,12 @@ impl TrustedWalletInterface for DummyTrustedWallet {
 			});
 
 			Ok(id)
-		}
+		})
 	}
 
-	fn stop(&self) -> impl Future<Output = ()> + Send {
-		async move {
+	fn stop(&self) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
+		Box::pin(async move {
 			let _ = self.ldk_node.stop();
-		}
+		})
 	}
 }

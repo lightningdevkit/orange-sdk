@@ -5,7 +5,7 @@ use crate::bitcoin::{Txid, io};
 use crate::logging::Logger;
 use crate::store::{PaymentId, StoreTransaction, TxStatus};
 use crate::trusted_wallet::{Payment, TrustedError, TrustedWalletInterface};
-use crate::{Event, EventQueue, InitFailure, PaymentType, Seed, WalletConfig};
+use crate::{Event, EventQueue, ExtraConfig, InitFailure, PaymentType, Seed, WalletConfig};
 
 use ldk_node::bitcoin::hashes::Hash;
 use ldk_node::bitcoin::hashes::sha256::Hash as Sha256;
@@ -21,13 +21,14 @@ use bitcoin_payment_instructions::PaymentMethod;
 use bitcoin_payment_instructions::amount::Amount;
 
 use spark_wallet::{
-	DefaultSigner, Order, PagingFilter, PayLightningInvoiceResult, SparkWallet, SparkWalletConfig,
-	SparkWalletError, SspUserRequest, TransferStatus, WalletEvent, WalletTransfer,
+	DefaultSigner, Order, PagingFilter, PayLightningInvoiceResult, SparkWallet, SparkWalletError,
+	SspUserRequest, TransferStatus, WalletEvent, WalletTransfer,
 };
 
 use tokio::sync::watch;
 
 use std::future::Future;
+use std::pin::Pin;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
@@ -35,7 +36,7 @@ use uuid::Uuid;
 
 /// A wallet implementation using the Breez Spark SDK.
 #[derive(Clone)]
-pub struct Spark {
+pub(crate) struct Spark {
 	spark_wallet: Arc<SparkWallet<DefaultSigner>>,
 	store: Arc<dyn KVStore + Send + Sync>,
 	shutdown_sender: watch::Sender<()>,
@@ -43,161 +44,27 @@ pub struct Spark {
 }
 
 impl TrustedWalletInterface for Spark {
-	type ExtraConfig = SparkWalletConfig;
-
-	fn init(
-		config: &WalletConfig<SparkWalletConfig>, store: Arc<dyn KVStore + Sync + Send>,
-		event_queue: Arc<EventQueue>, logger: Arc<Logger>,
-	) -> impl Future<Output = Result<Self, InitFailure>> + Send {
-		async move {
-			if config.network != config.extra_config.network.into() {
-				Err(TrustedError::InvalidNetwork)?
-			}
-
-			let signer = match &config.seed {
-				Seed::Seed64(bytes) => {
-					// hash the seed to make sure it does not conflict with the lightning keys
-					let seed = Sha256::hash(bytes);
-					DefaultSigner::new(&seed[..], config.extra_config.network)
-						.map_err(|e| TrustedError::Other(format!("Failed to create signer: {e}")))?
-				},
-				Seed::Mnemonic { mnemonic, passphrase } => {
-					// We don't hash the seed here, as mnemonics are meant to be easily recoverable
-					// and if we hashed them, then you could not recover your spark coins from the mnemonic
-					// in separate wallets.
-					let seed = mnemonic.to_seed(passphrase.as_deref().unwrap_or(""));
-					DefaultSigner::new(&seed[..], config.extra_config.network)
-						.map_err(|e| TrustedError::Other(format!("Failed to create signer: {e}")))?
-				},
-			};
-
-			let spark_wallet = Arc::new(
-				SparkWallet::connect(config.extra_config.clone(), signer)
-					.await
-					.map_err(|e| InitFailure::TrustedFailure(e.into()))?,
-			);
-
-			let (shutdown_sender, mut shutdown_receiver) = watch::channel::<()>(());
-			let mut events = spark_wallet.subscribe_events();
-			let l = Arc::clone(&logger);
-			let w = Arc::clone(&spark_wallet);
-			let s = Arc::clone(&store);
-			tokio::spawn(async move {
-				loop {
-					tokio::select! {
-						_ = shutdown_receiver.changed() => {
-							log_info!(l, "Deposit tracking loop shutdown signal received");
-							return;
-						}
-						event = events.recv() => {
-							match event {
-								Ok(event) => {
-									log_debug!(l, "Spark event: {event:?}");
-									match event {
-										WalletEvent::DepositConfirmed(node_id) => {
-											if let Ok(transfers) = w.list_transfers(None).await {
-												if let Some(transfer) = transfers
-													.into_iter()
-													.find(|t| t.leaves.iter().any(|l| l.leaf.id == node_id))
-												{
-													event_queue
-														.add_event(Event::OnchainPaymentReceived {
-															payment_id: PaymentId::Trusted(
-																convert_from_transfer_id(transfer.id.to_bytes()),
-															),
-															// todo this is kinda hacky, maybe we should make this optional
-															txid: transfer
-																.leaves
-																.iter()
-																.find(|t| t.leaf.id == node_id)
-																.map(|t| t.leaf
-																.node_tx
-																.compute_txid())
-																.unwrap_or(Txid::all_zeros()),
-															amount_sat: transfer.total_value_sat,
-															status: ConfirmationStatus::Unconfirmed, // fixme dont have block height
-														})
-														.unwrap();
-												}
-											}
-										},
-										WalletEvent::StreamConnected => {
-											log_debug!(l, "Spark wallet stream connected");
-										},
-										WalletEvent::StreamDisconnected => {
-											log_debug!(l, "Spark wallet stream connected");
-										},
-										WalletEvent::Synced => {
-											log_debug!(l, "Spark wallet synced");
-											if let Err(e) = Self::sync_payments_to_storage(w.as_ref(), &s, l.as_ref()).await {
-												log_error!(l, "Failed to sync payments to storage: {e:?}");
-											} else {
-												log_info!(l, "Payments synced to storage");
-											}
-										},
-										WalletEvent::TransferClaimed(transfer) => {
-											if let Err(e) = Self::sync_payments_to_storage(w.as_ref(), &s, l.as_ref()).await {
-												log_error!(l, "Failed to sync payments to storage: {e:?}");
-											} else {
-												log_info!(l, "Payments synced to storage");
-											}
-
-											match transfer.user_request {
-												None => {
-													log_debug!(l, "Transfer claimed without user request: {transfer:?}");
-												},
-												Some(SspUserRequest::LightningReceiveRequest(req)) => {
-													if let Ok(hash) = FromHex::from_hex(&req.invoice.payment_hash) {
-														event_queue
-															.add_event(Event::PaymentReceived {
-																payment_id: PaymentId::Trusted(convert_from_transfer_id(transfer.id.to_bytes())),
-																payment_hash: PaymentHash(hash),
-																amount_msat: transfer.total_value_sat * 1_000, // convert to msats
-																custom_records: vec![],
-																lsp_fee_msats: None,
-															})
-															.unwrap();
-													}
-												},
-												Some(req) => {
-													log_debug!(l, "Transfer claimed with user request: {req:?}");
-												}
-											}
-										},
-									}
-								},
-								Err(e) => {
-									log_debug!(l, "Spark event error: {e:?}");
-								},
-							}
-						}
-					}
-				}
-			});
-
-			Ok(Spark { spark_wallet, store, shutdown_sender, logger })
-		}
-	}
-
-	fn get_balance(&self) -> impl Future<Output = Result<Amount, TrustedError>> + Send {
-		async move {
+	fn get_balance(
+		&self,
+	) -> Pin<Box<dyn Future<Output = Result<Amount, TrustedError>> + Send + '_>> {
+		Box::pin(async move {
 			let sats = self.spark_wallet.get_balance().await?;
 			Amount::from_sats(sats).map_err(|_| TrustedError::AmountError)
-		}
+		})
 	}
 
 	fn get_reusable_receive_uri(
 		&self,
-	) -> impl Future<Output = Result<String, TrustedError>> + Send {
-		async move {
+	) -> Pin<Box<dyn Future<Output = Result<String, TrustedError>> + Send + '_>> {
+		Box::pin(async move {
 			Err(TrustedError::UnsupportedOperation("Spark does not support BOLT 12".to_owned()))
-		}
+		})
 	}
 
 	fn get_bolt11_invoice(
 		&self, amount: Option<Amount>,
-	) -> impl Future<Output = Result<Bolt11Invoice, TrustedError>> + Send {
-		async move {
+	) -> Pin<Box<dyn Future<Output = Result<Bolt11Invoice, TrustedError>> + Send + '_>> {
+		Box::pin(async move {
 			// TODO: get upstream to let us be amount-less
 			match amount {
 				None => Err(TrustedError::UnsupportedOperation(
@@ -216,11 +83,13 @@ impl TrustedWalletInterface for Spark {
 						.map_err(|e| TrustedError::Other(format!("Failed to parse invoice: {e}")))
 				},
 			}
-		}
+		})
 	}
 
-	fn list_payments(&self) -> impl Future<Output = Result<Vec<Payment>, TrustedError>> + Send {
-		async move {
+	fn list_payments(
+		&self,
+	) -> Pin<Box<dyn Future<Output = Result<Vec<Payment>, TrustedError>> + Send + '_>> {
+		Box::pin(async move {
 			let keys = self.store.list(SPARK_PRIMARY_NAMESPACE, SPARK_PAYMENTS_NAMESPACE)?;
 
 			let mut res = Vec::with_capacity(keys.len());
@@ -269,13 +138,13 @@ impl TrustedWalletInterface for Spark {
 				});
 			}
 			Ok(res)
-		}
+		})
 	}
 
 	fn estimate_fee(
-		&self, method: &PaymentMethod, amount: Amount,
-	) -> impl Future<Output = Result<Amount, TrustedError>> + Send {
-		async move {
+		&self, method: PaymentMethod, amount: Amount,
+	) -> Pin<Box<dyn Future<Output = Result<Amount, TrustedError>> + Send + '_>> {
+		Box::pin(async move {
 			if let PaymentMethod::LightningBolt11(invoice) = method {
 				let fee_sats = self
 					.spark_wallet
@@ -292,13 +161,13 @@ impl TrustedWalletInterface for Spark {
 					"Only BOLT 11 is currently supported".to_owned(),
 				))
 			}
-		}
+		})
 	}
 
 	fn pay(
-		&self, method: &PaymentMethod, amount: Amount,
-	) -> impl Future<Output = Result<[u8; 32], TrustedError>> + Send {
-		async move {
+		&self, method: PaymentMethod, amount: Amount,
+	) -> Pin<Box<dyn Future<Output = Result<[u8; 32], TrustedError>> + Send + '_>> {
+		Box::pin(async move {
 			if let PaymentMethod::LightningBolt11(invoice) = method {
 				let res = self
 					.spark_wallet
@@ -338,14 +207,14 @@ impl TrustedWalletInterface for Spark {
 					"Only BOLT 11 is currently supported".to_owned(),
 				))
 			}
-		}
+		})
 	}
 
-	fn stop(&self) -> impl Future<Output = ()> + Send {
-		async move {
+	fn stop(&self) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
+		Box::pin(async move {
 			log_info!(self.logger, "Stopping Spark wallet");
 			let _ = self.shutdown_sender.send(());
-		}
+		})
 	}
 }
 
@@ -355,6 +224,145 @@ const SPARK_PAYMENTS_NAMESPACE: &str = "payment";
 const SPARK_SYNC_OFFSET_KEY: &str = "sync_offset";
 
 impl Spark {
+	/// Initialize a new Spark wallet instance with the given configuration.
+	pub(crate) async fn init(
+		config: &WalletConfig, store: Arc<dyn KVStore + Sync + Send>, event_queue: Arc<EventQueue>,
+		logger: Arc<Logger>,
+	) -> Result<Self, InitFailure> {
+		let extra_config = match &config.extra_config {
+			ExtraConfig::Spark(sp) => sp.clone(),
+			#[cfg(feature = "_test-utils")]
+			ExtraConfig::Dummy(_) => unreachable!("Not reachable, we are in Spark"),
+		};
+
+		if config.network != extra_config.network.into() {
+			Err(TrustedError::InvalidNetwork)?
+		}
+
+		let signer = match &config.seed {
+			Seed::Seed64(bytes) => {
+				// hash the seed to make sure it does not conflict with the lightning keys
+				let seed = Sha256::hash(bytes);
+				DefaultSigner::new(&seed[..], extra_config.network)
+					.map_err(|e| TrustedError::Other(format!("Failed to create signer: {e}")))?
+			},
+			Seed::Mnemonic { mnemonic, passphrase } => {
+				// We don't hash the seed here, as mnemonics are meant to be easily recoverable
+				// and if we hashed them, then you could not recover your spark coins from the mnemonic
+				// in separate wallets.
+				let seed = mnemonic.to_seed(passphrase.as_deref().unwrap_or(""));
+				DefaultSigner::new(&seed[..], extra_config.network)
+					.map_err(|e| TrustedError::Other(format!("Failed to create signer: {e}")))?
+			},
+		};
+
+		let spark_wallet = Arc::new(
+			SparkWallet::connect(extra_config, signer)
+				.await
+				.map_err(|e| InitFailure::TrustedFailure(e.into()))?,
+		);
+
+		let (shutdown_sender, mut shutdown_receiver) = watch::channel::<()>(());
+		let mut events = spark_wallet.subscribe_events();
+		let l = Arc::clone(&logger);
+		let w = Arc::clone(&spark_wallet);
+		let s = Arc::clone(&store);
+		tokio::spawn(async move {
+			loop {
+				tokio::select! {
+					_ = shutdown_receiver.changed() => {
+						log_info!(l, "Deposit tracking loop shutdown signal received");
+						return;
+					}
+					event = events.recv() => {
+						match event {
+							Ok(event) => {
+								log_debug!(l, "Spark event: {event:?}");
+								match event {
+									WalletEvent::DepositConfirmed(node_id) => {
+										if let Ok(transfers) = w.list_transfers(None).await {
+											if let Some(transfer) = transfers
+												.into_iter()
+												.find(|t| t.leaves.iter().any(|l| l.leaf.id == node_id))
+											{
+												event_queue
+													.add_event(Event::OnchainPaymentReceived {
+														payment_id: PaymentId::Trusted(
+															convert_from_transfer_id(transfer.id.to_bytes()),
+														),
+														// todo this is kinda hacky, maybe we should make this optional
+														txid: transfer
+															.leaves
+															.iter()
+															.find(|t| t.leaf.id == node_id)
+															.map(|t| t.leaf
+															.node_tx
+															.compute_txid())
+															.unwrap_or(Txid::all_zeros()),
+														amount_sat: transfer.total_value_sat,
+														status: ConfirmationStatus::Unconfirmed, // fixme dont have block height
+													})
+													.unwrap();
+											}
+										}
+									},
+									WalletEvent::StreamConnected => {
+										log_debug!(l, "Spark wallet stream connected");
+									},
+									WalletEvent::StreamDisconnected => {
+										log_debug!(l, "Spark wallet stream connected");
+									},
+									WalletEvent::Synced => {
+										log_debug!(l, "Spark wallet synced");
+										if let Err(e) = Self::sync_payments_to_storage(w.as_ref(), &s, l.as_ref()).await {
+											log_error!(l, "Failed to sync payments to storage: {e:?}");
+										} else {
+											log_info!(l, "Payments synced to storage");
+										}
+									},
+									WalletEvent::TransferClaimed(transfer) => {
+										if let Err(e) = Self::sync_payments_to_storage(w.as_ref(), &s, l.as_ref()).await {
+											log_error!(l, "Failed to sync payments to storage: {e:?}");
+										} else {
+											log_info!(l, "Payments synced to storage");
+										}
+
+										match transfer.user_request {
+											None => {
+												log_debug!(l, "Transfer claimed without user request: {transfer:?}");
+											},
+											Some(SspUserRequest::LightningReceiveRequest(req)) => {
+												if let Ok(hash) = FromHex::from_hex(&req.invoice.payment_hash) {
+													event_queue
+														.add_event(Event::PaymentReceived {
+															payment_id: PaymentId::Trusted(convert_from_transfer_id(transfer.id.to_bytes())),
+															payment_hash: PaymentHash(hash),
+															amount_msat: transfer.total_value_sat * 1_000, // convert to msats
+															custom_records: vec![],
+															lsp_fee_msats: None,
+														})
+														.unwrap();
+												}
+											},
+											Some(req) => {
+												log_debug!(l, "Transfer claimed with user request: {req:?}");
+											}
+										}
+									},
+								}
+							},
+							Err(e) => {
+								log_debug!(l, "Spark event error: {e:?}");
+							},
+						}
+					}
+				}
+			}
+		});
+
+		Ok(Spark { spark_wallet, store, shutdown_sender, logger })
+	}
+
 	/// Synchronizes payments from transfers to persistent storage
 	async fn sync_payments_to_storage(
 		spark_wallet: &SparkWallet<DefaultSigner>, store: &Arc<dyn KVStore + Send + Sync>,

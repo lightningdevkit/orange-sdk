@@ -1,4 +1,5 @@
 #![deny(missing_docs)]
+#![allow(clippy::type_complexity)]
 
 //! A library for managing graduated rebalancing between trusted and lightning wallets.
 //!
@@ -16,6 +17,7 @@ use lightning::{log_debug, log_error, log_info};
 use lightning_invoice::Bolt11Invoice;
 use std::fmt::Debug;
 use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -64,20 +66,22 @@ pub trait TrustedWallet: Send + Sync {
 	type Error: Debug + Send + Sync + 'static;
 
 	/// Get the current balance of the trusted wallet
-	fn get_balance(&self) -> impl Future<Output = Result<Amount, Self::Error>> + Send;
+	fn get_balance(&self)
+		-> Pin<Box<dyn Future<Output = Result<Amount, Self::Error>> + Send + '_>>;
 
 	/// Generate a BOLT11 invoice for the specified amount
 	fn get_bolt11_invoice(
 		&self, amount: Option<Amount>,
-	) -> impl Future<Output = Result<Bolt11Invoice, Self::Error>> + Send;
+	) -> Pin<Box<dyn Future<Output = Result<Bolt11Invoice, Self::Error>> + Send + '_>>;
 
 	/// Make a payment using the trusted wallet
 	fn pay(
-		&self, method: &PaymentMethod, amount: Amount,
-	) -> impl Future<Output = Result<[u8; 32], Self::Error>> + Send;
+		&self, method: PaymentMethod, amount: Amount,
+	) -> Pin<Box<dyn Future<Output = Result<[u8; 32], Self::Error>> + Send + '_>>;
 
 	/// Get transaction fee paid
-	fn get_tx_fee(&self, id: [u8; 32]) -> impl Future<Output = Option<Amount>> + Send;
+	fn get_tx_fee(&self, id: [u8; 32])
+		-> Pin<Box<dyn Future<Output = Option<Amount>> + Send + '_>>;
 }
 
 /// Trait representing a lightning wallet backend
@@ -91,25 +95,27 @@ pub trait LightningWallet: Send + Sync {
 	/// Generate a BOLT11 invoice for the specified amount
 	fn get_bolt11_invoice(
 		&self, amount: Option<Amount>,
-	) -> impl Future<Output = Result<Bolt11Invoice, Self::Error>> + Send;
+	) -> Pin<Box<dyn Future<Output = Result<Bolt11Invoice, Self::Error>> + Send + '_>>;
 
 	/// Make a payment using the lightning wallet
 	fn pay(
-		&self, method: &PaymentMethod, amount: Amount,
-	) -> impl Future<Output = Result<[u8; 32], Self::Error>> + Send;
+		&self, method: PaymentMethod, amount: Amount,
+	) -> Pin<Box<dyn Future<Output = Result<[u8; 32], Self::Error>> + Send + '_>>;
 
 	/// Wait for a payment receipt notification
 	fn await_payment_receipt(
 		&self, payment_hash: [u8; 32],
-	) -> impl Future<Output = Option<ReceivedLightningPayment>> + Send;
+	) -> Pin<Box<dyn Future<Output = Option<ReceivedLightningPayment>> + Send + '_>>;
 
 	/// Open a channel with the LSP using on-chain funds
 	fn open_channel_with_lsp(
 		&self, amt: Amount,
-	) -> impl Future<Output = Result<u128, Self::Error>> + Send;
+	) -> Pin<Box<dyn Future<Output = Result<u128, Self::Error>> + Send + '_>>;
 
 	/// Wait for a channel pending notification, returns the new channel's outpoint
-	fn await_channel_pending(&self, channel_id: u128) -> impl Future<Output = OutPoint> + Send;
+	fn await_channel_pending(
+		&self, channel_id: u128,
+	) -> Pin<Box<dyn Future<Output = OutPoint> + Send + '_>>;
 }
 
 /// Represents a payment from the lightning wallet
@@ -200,17 +206,17 @@ pub struct GraduatedRebalancer<
 	balance_mutex: tokio::sync::Mutex<()>,
 }
 
-impl<T, L, R, E, O> GraduatedRebalancer<T, L, R, E, O>
+impl<T, LN, R, E, L> GraduatedRebalancer<T, LN, R, E, L>
 where
 	T: TrustedWallet,
-	L: LightningWallet,
+	LN: LightningWallet,
 	R: RebalanceTrigger,
 	E: EventHandler,
-	O: Logger,
+	L: Logger,
 {
 	/// Create a new graduated rebalancer
 	pub fn new(
-		trusted: Arc<T>, ln_wallet: Arc<L>, trigger: Arc<R>, event_handler: Arc<E>, logger: Arc<O>,
+		trusted: Arc<T>, ln_wallet: Arc<LN>, trigger: Arc<R>, event_handler: Arc<E>, logger: Arc<L>,
 	) -> Self {
 		Self {
 			trusted,
@@ -245,7 +251,7 @@ where
 				"Attempting to pay invoice {inv} to rebalance for {transfer_amt:?}",
 			);
 			let expected_hash = *inv.payment_hash();
-			match self.trusted.pay(&PaymentMethod::LightningBolt11(inv), transfer_amt).await {
+			match self.trusted.pay(PaymentMethod::LightningBolt11(inv), transfer_amt).await {
 				Ok(rebalance_id) => {
 					log_debug!(
 						self.logger,

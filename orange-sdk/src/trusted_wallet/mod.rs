@@ -1,17 +1,14 @@
 //! This module defines the `TrustedWalletInterface` trait and its associated types.
 
-use crate::event::EventQueue;
-use crate::logging::Logger;
 use crate::store::TxStatus;
-use crate::{InitFailure, WalletConfig};
 
-use ldk_node::lightning::util::persist::KVStore;
 use ldk_node::lightning_invoice::Bolt11Invoice;
 
 use bitcoin_payment_instructions::PaymentMethod;
 use bitcoin_payment_instructions::amount::Amount;
 
 use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -39,76 +36,88 @@ pub struct Payment {
 	pub time_since_epoch: Duration,
 }
 
+pub(crate) type DynTrustedWalletInterface = dyn TrustedWalletInterface + Send + Sync;
+
 // todo i dont think we need send + sync
 /// Represents a trait for a trusted wallet interface.
-pub trait TrustedWalletInterface: Sized + Send + Sync + private::Sealed {
-	/// Extra configuration parameters for this type of wallet.
-	type ExtraConfig;
-
-	/// Initializes the wallet with the given configuration and logger.
-	fn init(
-		config: &WalletConfig<Self::ExtraConfig>, store: Arc<dyn KVStore + Sync + Send>,
-		event_queue: Arc<EventQueue>, logger: Arc<Logger>,
-	) -> impl Future<Output = Result<Self, InitFailure>> + Send;
-
+pub trait TrustedWalletInterface: Send + Sync + private::Sealed {
 	/// Returns the current balance of the wallet.
-	fn get_balance(&self) -> impl Future<Output = Result<Amount, TrustedError>> + Send;
+	fn get_balance(
+		&self,
+	) -> Pin<Box<dyn Future<Output = Result<Amount, TrustedError>> + Send + '_>>;
 
 	/// Generates a new reusable address for receiving payments.
 	/// Generally, this should be a BOLT 12 offer.
-	fn get_reusable_receive_uri(&self)
-	-> impl Future<Output = Result<String, TrustedError>> + Send;
+	fn get_reusable_receive_uri(
+		&self,
+	) -> Pin<Box<dyn Future<Output = Result<String, TrustedError>> + Send + '_>>;
 
 	/// Generates a Bolt11 invoice for the specified amount.
 	fn get_bolt11_invoice(
 		&self, amount: Option<Amount>,
-	) -> impl Future<Output = Result<Bolt11Invoice, TrustedError>> + Send;
+	) -> Pin<Box<dyn Future<Output = Result<Bolt11Invoice, TrustedError>> + Send + '_>>;
 
 	/// Lists all payments made through the wallet.
-	fn list_payments(&self) -> impl Future<Output = Result<Vec<Payment>, TrustedError>> + Send;
+	fn list_payments(
+		&self,
+	) -> Pin<Box<dyn Future<Output = Result<Vec<Payment>, TrustedError>> + Send + '_>>;
 
 	/// Estimates the fee for a payment to the given payment method with the specified amount.
 	fn estimate_fee(
-		&self, method: &PaymentMethod, amount: Amount,
-	) -> impl Future<Output = Result<Amount, TrustedError>> + Send;
+		&self, method: PaymentMethod, amount: Amount,
+	) -> Pin<Box<dyn Future<Output = Result<Amount, TrustedError>> + Send + '_>>;
 
 	/// Pays to the given payment method with the specified amount.
 	fn pay(
-		&self, method: &PaymentMethod, amount: Amount,
-	) -> impl Future<Output = Result<[u8; 32], TrustedError>> + Send;
+		&self, method: PaymentMethod, amount: Amount,
+	) -> Pin<Box<dyn Future<Output = Result<[u8; 32], TrustedError>> + Send + '_>>;
 
 	/// Stops the wallet, cleaning up any resources.
 	/// This is typically used to gracefully shut down the wallet.
-	fn stop(&self) -> impl Future<Output = ()> + Send;
+	fn stop(&self) -> Pin<Box<dyn Future<Output = ()> + Send + '_>>;
 }
 
-pub(crate) struct WalletTrusted<T: TrustedWalletInterface>(pub(crate) Arc<T>);
+pub(crate) struct WalletTrusted<T: TrustedWalletInterface + ?Sized>(pub(crate) Arc<Box<T>>);
 
-impl<T: TrustedWalletInterface> graduated_rebalancer::TrustedWallet for WalletTrusted<T> {
+impl<T: ?Sized + TrustedWalletInterface> graduated_rebalancer::TrustedWallet for WalletTrusted<T> {
 	type Error = TrustedError;
 
-	fn get_balance(&self) -> impl Future<Output = Result<Amount, Self::Error>> + Send {
-		async move { self.0.get_balance().await }
+	fn get_balance(
+		&self,
+	) -> Pin<Box<dyn Future<Output = Result<Amount, Self::Error>> + Send + '_>> {
+		Box::pin(async move { self.0.get_balance().await })
 	}
 
 	fn get_bolt11_invoice(
 		&self, amount: Option<Amount>,
-	) -> impl Future<Output = Result<Bolt11Invoice, Self::Error>> + Send {
-		async move { self.0.get_bolt11_invoice(amount).await }
+	) -> Pin<Box<dyn Future<Output = Result<Bolt11Invoice, Self::Error>> + Send + '_>> {
+		Box::pin(async move { self.0.get_bolt11_invoice(amount).await })
 	}
 
 	fn pay(
-		&self, method: &PaymentMethod, amount: Amount,
-	) -> impl Future<Output = Result<[u8; 32], Self::Error>> + Send {
-		async move { self.0.pay(method, amount).await }
+		&self, method: PaymentMethod, amount: Amount,
+	) -> Pin<Box<dyn Future<Output = Result<[u8; 32], Self::Error>> + Send + '_>> {
+		Box::pin(async move { self.0.pay(method, amount).await })
 	}
 
-	fn get_tx_fee(&self, id: [u8; 32]) -> impl Future<Output = Option<Amount>> + Send {
-		async move {
+	fn get_tx_fee(
+		&self, id: [u8; 32],
+	) -> Pin<Box<dyn Future<Output = Option<Amount>> + Send + '_>> {
+		Box::pin(async move {
 			let trusted_txs = self.0.list_payments().await.unwrap_or_default();
 			trusted_txs.iter().find(|p| p.id == id).map(|p| p.fee)
-		}
+		})
 	}
+}
+
+#[derive(Clone)]
+/// Extra configuration needed for different types of wallets.
+pub enum ExtraConfig {
+	/// Configuration for Spark wallet.
+	Spark(crate::SparkWalletConfig),
+	#[cfg(feature = "_test-utils")]
+	/// Configuration for dummy wallet (test-only).
+	Dummy(dummy::DummyTrustedWalletExtraConfig),
 }
 
 /// Private module with a marker trait. This is to get around `private_bounds` errors while also
