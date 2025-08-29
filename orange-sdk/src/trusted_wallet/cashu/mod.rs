@@ -16,6 +16,7 @@ use ldk_node::lightning_types::payment::PaymentHash;
 use bitcoin_payment_instructions::PaymentMethod;
 use bitcoin_payment_instructions::amount::Amount;
 
+use cdk::amount::SplitTarget;
 use cdk::nuts::CurrencyUnit;
 use cdk::nuts::MeltOptions;
 use cdk::nuts::nut23::Amountless;
@@ -117,20 +118,21 @@ impl TrustedWalletInterface for Cashu {
 							))
 						})?;
 
+					// Get the invoice from the quote
+					let invoice = Bolt11Invoice::from_str(&quote.request).map_err(|e| {
+						TrustedError::Other(format!("Failed to parse invoice: {e}"))
+					})?;
+
 					// Send the quote to monitoring channel - if it fails, log but don't fail the operation
-					if let Err(e) = self.mint_quote_sender.send(quote.clone()).await {
+					let id = quote.id.clone();
+					if let Err(e) = self.mint_quote_sender.send(quote).await {
 						log_error!(
 							self.logger,
-							"Failed to send mint quote {} for monitoring: {e}",
-							quote.id
+							"Failed to send mint quote {id} for monitoring: {e}",
 						);
 					}
 
-					// Get the invoice from the quote
-					let invoice_str = quote.request;
-
-					Bolt11Invoice::from_str(&invoice_str)
-						.map_err(|e| TrustedError::Other(format!("Failed to parse invoice: {e}")))
+					Ok(invoice)
 				},
 			}
 		})
@@ -175,8 +177,7 @@ impl TrustedWalletInterface for Cashu {
 						})?;
 
 					// The fee is in the quote
-					let fee_str = format!("{}", quote.fee_reserve);
-					let fee_sats = fee_str.parse::<u64>().map_err(|_| TrustedError::AmountError)?;
+					let fee_sats: u64 = quote.fee_reserve.into();
 					Amount::from_sats(fee_sats).map_err(|_| TrustedError::AmountError)
 				},
 				PaymentMethod::LightningBolt12(offer) => {
@@ -191,8 +192,7 @@ impl TrustedWalletInterface for Cashu {
 						})?;
 
 					// The fee is in the quote
-					let fee_str = format!("{}", quote.fee_reserve);
-					let fee_sats = fee_str.parse::<u64>().map_err(|_| TrustedError::AmountError)?;
+					let fee_sats: u64 = quote.fee_reserve.into();
 					Amount::from_sats(fee_sats).map_err(|_| TrustedError::AmountError)
 				},
 				PaymentMethod::OnChain(_) => Err(TrustedError::UnsupportedOperation(
@@ -283,7 +283,7 @@ impl Cashu {
 			},
 		};
 
-		let db = Arc::new(CashuKvDatabase::new(Arc::clone(&store)).map_err(|e| {
+		let db = Arc::new(CashuKvDatabase::new(store).map_err(|e| {
 			InitFailure::TrustedFailure(TrustedError::Other(format!(
 				"Failed to create Cashu database: {e}"
 			)))
@@ -319,18 +319,15 @@ impl Cashu {
 			})
 			.unwrap_or(false);
 
-		let (shutdown_sender, shutdown_receiver) = watch::channel::<()>(());
+		let (shutdown_sender, mut shutdown_receiver) = watch::channel::<()>(());
 
 		// Create channel for mint quote monitoring with bounded capacity
 		let (mint_quote_sender, mut mint_quote_receiver) = mpsc::channel::<MintQuote>(32);
 
 		// Start mint quote monitoring task
 		let wallet_for_monitoring = Arc::clone(&cashu_wallet);
-		let event_queue_for_monitoring = Arc::clone(&event_queue);
 		let logger_for_monitoring = Arc::clone(&logger);
-		let shutdown_receiver_clone = shutdown_receiver.clone();
 		tokio::spawn(async move {
-			let mut shutdown_receiver = shutdown_receiver_clone;
 			loop {
 				tokio::select! {
 					_ = shutdown_receiver.changed() => {
@@ -342,12 +339,11 @@ impl Cashu {
 
 						// Start monitoring this quote
 						let wallet = Arc::clone(&wallet_for_monitoring);
-						let event_queue = Arc::clone(&event_queue_for_monitoring);
+						let event_queue = Arc::clone(&event_queue);
 						let logger = Arc::clone(&logger_for_monitoring);
-						let logger_clone = Arc::clone(&logger);
 						tokio::spawn(async move {
-							if let Err(e) = Self::monitor_mint_quote(wallet, event_queue, logger, mint_quote).await {
-								log_error!(logger_clone, "Failed to monitor mint quote: {e:?}");
+							if let Err(e) = Self::monitor_mint_quote(wallet, event_queue, &logger, mint_quote).await {
+								log_error!(logger, "Failed to monitor mint quote: {e:?}");
 							}
 						});
 					}
@@ -357,11 +353,11 @@ impl Cashu {
 
 		if let Ok(pending_mints) = cashu_wallet.get_active_mint_quotes().await {
 			for pending_mint in pending_mints {
-				if let Err(e) = mint_quote_sender.send(pending_mint.clone()).await {
+				let id = pending_mint.id.clone();
+				if let Err(e) = mint_quote_sender.send(pending_mint).await {
 					log_error!(
 						logger,
-						"Failed to send pending mint quote {} for monitoring: {e}",
-						pending_mint.id
+						"Failed to send pending mint quote {id} for monitoring: {e}",
 					);
 				}
 			}
@@ -407,14 +403,12 @@ impl Cashu {
 
 	/// Monitor a mint quote and automatically mint tokens when the quote is paid
 	async fn monitor_mint_quote(
-		wallet: Arc<Wallet>, event_queue: Arc<EventQueue>, logger: Arc<Logger>,
-		mint_quote: MintQuote,
+		wallet: Arc<Wallet>, event_queue: Arc<EventQueue>, logger: &Logger, mint_quote: MintQuote,
 	) -> Result<(), TrustedError> {
 		log_info!(logger, "Starting monitoring for mint quote: {}", mint_quote.id);
 
 		// Wait for the mint quote to be paid and mint the tokens
-		let mut stream =
-			wallet.proof_stream(mint_quote.clone(), Default::default(), Default::default());
+		let mut stream = wallet.proof_stream(mint_quote.clone(), SplitTarget::default(), None);
 		while let Some(proofs) = stream.next().await {
 			let proofs =
 				proofs.map_err(|e| TrustedError::Other(format!("Failed mint proofs: {e}")))?;
