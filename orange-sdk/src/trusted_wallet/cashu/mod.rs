@@ -271,15 +271,19 @@ impl Cashu {
 		event_queue: Arc<EventQueue>, logger: Arc<Logger>,
 	) -> Result<Self, InitFailure> {
 		// Create the seed from the configuration
-		let seed = match &config.seed {
+		let seed: [u8; 64] = match &config.seed {
 			Seed::Seed64(bytes) => {
 				// Hash the seed to make sure it does not conflict with the lightning keys
 				let seed = Sha256::hash(bytes);
-				seed[..].to_vec()
+				let mut seed_array = [0u8; 64];
+				// Copy the 32-byte hash twice to fill 64 bytes
+				seed_array[..32].copy_from_slice(seed.as_byte_array());
+				seed_array[32..].copy_from_slice(seed.as_byte_array());
+				seed_array
 			},
 			Seed::Mnemonic { mnemonic, passphrase } => {
 				// Use the mnemonic directly as seed
-				mnemonic.to_seed(passphrase.as_deref().unwrap_or("")).to_vec()
+				mnemonic.to_seed(passphrase.as_deref().unwrap_or(""))
 			},
 		};
 
@@ -291,22 +295,13 @@ impl Cashu {
 
 		// Create the Cashu wallet
 		let cashu_wallet = Arc::new(
-			Wallet::new(
-				&cashu_config.mint_url,
-				cashu_config.unit,
-				db,
-				seed.try_into().map_err(|_| {
-					InitFailure::TrustedFailure(TrustedError::Other(
-						"Invalid seed length".to_string(),
-					))
-				})?,
-				None,
-			)
-			.map_err(|e| {
-				InitFailure::TrustedFailure(TrustedError::Other(format!(
-					"Failed to create Cashu wallet: {e}"
-				)))
-			})?,
+			Wallet::new(&cashu_config.mint_url, cashu_config.unit, db, seed, None).map_err(
+				|e| {
+					InitFailure::TrustedFailure(TrustedError::Other(format!(
+						"Failed to create Cashu wallet: {e}"
+					)))
+				},
+			)?,
 		);
 
 		let supports_bolt12 = cashu_wallet
