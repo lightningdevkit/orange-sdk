@@ -7,7 +7,7 @@ edition = "2024"
 default = ["spark"]
 spark = ["spark-wallet", "uuid"]
 cashu = ["cdk", "serde_json"]
-_test-utils = ["corepc-node", "cashu", "uuid/v7"]
+_test-utils = ["corepc-node", "cashu", "uuid/v7", "rand"]
 
 [dependencies]
 graduated-rebalancer = { path = "../graduated-rebalancer", version = "0.1.0" }
@@ -15,7 +15,7 @@ graduated-rebalancer = { path = "../graduated-rebalancer", version = "0.1.0" }
 ldk-node = { git = "https://github.com/benthecarman/ldk-node.git", branch = "esplora-auth" }
 bitcoin-payment-instructions = { version = "0.4.0", features = ["http"] }
 chrono = { version = "0.4", default-features = false }
-rand = "0.8.5"
+rand = { version = "0.8.5", optional = true }
 reqwest = { version = "0.12.23", default-features = false, features = ["rustls-tls"] }
 spark-wallet = { path = "../../rust-spark/crates/spark-wallet", optional = true }
 tokio = { version = "1.0", default-features = false, features = ["rt-multi-thread", "sync"] }
