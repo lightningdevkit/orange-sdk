@@ -15,6 +15,7 @@ use std::time::Duration;
 #[cfg(feature = "_test-utils")]
 pub mod dummy;
 pub mod spark;
+pub mod cashu;
 
 /// Represents a payment with its associated details.
 ///
@@ -129,6 +130,7 @@ mod private {
 
 	// Only implement Sealed for types you want to allow
 	impl Sealed for super::spark::Spark {}
+	impl Sealed for super::cashu::Cashu {}
 	#[cfg(feature = "_test-utils")]
 	impl Sealed for super::dummy::DummyTrustedWallet {}
 }

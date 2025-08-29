@@ -17,5 +17,8 @@ reqwest = { version = "0.12.23", default-features = false, features = ["rustls-t
 spark-wallet = { path = "../../rust-spark/crates/spark-wallet" }
 tokio = { version = "1.0", default-features = false, features = ["rt-multi-thread", "sync"] }
 uuid = { version = "1.0", default-features = false }
+cdk = "0.12.0"
+serde_json = "1.0"
+async-trait = "0.1"
 
 corepc-node = { version = "0.8.0", features = ["29_0", "download"], optional = true }
