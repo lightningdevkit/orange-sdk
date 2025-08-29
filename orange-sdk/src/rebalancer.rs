@@ -4,7 +4,7 @@ use crate::bitcoin::hex::DisplayHex;
 use crate::lightning_wallet::LightningWallet;
 use crate::logging::Logger;
 use crate::store::{PaymentId, TxMetadata, TxMetadataStore, TxType};
-use crate::trusted_wallet::TrustedWalletInterface;
+use crate::trusted_wallet::DynTrustedWalletInterface;
 use crate::{Event, EventQueue, PaymentType, Tunables, store};
 use bitcoin_payment_instructions::amount::Amount;
 use graduated_rebalancer::{RebalanceTrigger, RebalancerEvent, TriggerParams};
@@ -17,11 +17,11 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime};
 
-pub(crate) struct OrangeTrigger<T: TrustedWalletInterface> {
+pub(crate) struct OrangeTrigger {
 	/// The main implementation of the wallet, containing both trusted and lightning wallet components.
 	ln_wallet: Arc<LightningWallet>,
 	/// The trusted wallet interface for managing small balances.
-	trusted: Arc<T>,
+	trusted: Arc<Box<DynTrustedWalletInterface>>,
 	/// Configuration parameters for when the wallet decides to use the lightning or trusted wallet.
 	tunables: Tunables,
 	/// Metadata store for tracking transactions.
@@ -36,11 +36,11 @@ pub(crate) struct OrangeTrigger<T: TrustedWalletInterface> {
 	logger: Arc<Logger>,
 }
 
-impl<T: TrustedWalletInterface> OrangeTrigger<T> {
+impl OrangeTrigger {
 	/// Creates a new `OrangeTrigger` instance.
 	pub(crate) fn new(
-		ln_wallet: Arc<LightningWallet>, trusted: Arc<T>, tunables: Tunables,
-		tx_metadata: TxMetadataStore, event_queue: Arc<EventQueue>,
+		ln_wallet: Arc<LightningWallet>, trusted: Arc<Box<DynTrustedWalletInterface>>,
+		tunables: Tunables, tx_metadata: TxMetadataStore, event_queue: Arc<EventQueue>,
 		store: Arc<dyn KVStore + Send + Sync>, logger: Arc<Logger>,
 	) -> Self {
 		let start =
@@ -58,7 +58,7 @@ impl<T: TrustedWalletInterface> OrangeTrigger<T> {
 	}
 }
 
-impl<T: TrustedWalletInterface> RebalanceTrigger for OrangeTrigger<T> {
+impl RebalanceTrigger for OrangeTrigger {
 	fn needs_trusted_rebalance(&self) -> impl Future<Output = Option<TriggerParams>> + Send {
 		async move {
 			let rebalance_enabled = store::get_rebalance_enabled(self.store.as_ref());

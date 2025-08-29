@@ -4,13 +4,12 @@ use bitcoin_payment_instructions::amount::Amount;
 use corepc_node::client::bitcoin::Network;
 use corepc_node::{Conf, Node as Bitcoind, get_available_port};
 use ldk_node::bitcoin::hashes::Hash;
-use ldk_node::bitcoin::secp256k1::PublicKey;
 use ldk_node::lightning::ln::msgs::SocketAddress;
 use ldk_node::liquidity::LSPS2ServiceConfig;
 use ldk_node::payment::PaymentStatus;
 use ldk_node::{Node, bitcoin};
-use orange_sdk::trusted_wallet::dummy::{DummyTrustedWallet, DummyTrustedWalletExtraConfig};
-use orange_sdk::{ChainSource, Seed, StorageConfig, Wallet, WalletConfig};
+use orange_sdk::trusted_wallet::dummy::DummyTrustedWalletExtraConfig;
+use orange_sdk::{ChainSource, ExtraConfig, Seed, StorageConfig, Wallet, WalletBuilder};
 use rand::RngCore;
 use std::env::temp_dir;
 use std::future::Future;
@@ -39,7 +38,7 @@ pub async fn wait_for_condition<F, Fut>(
 /// If no event is received within this time, it panics.
 /// This is useful for testing purposes to ensure that the wallet is responsive and events are being processed.
 /// Otherwise, we can have the test hang indefinitely.
-pub async fn wait_next_event(wallet: &Wallet<DummyTrustedWallet>) -> orange_sdk::Event {
+pub async fn wait_next_event(wallet: &Wallet) -> orange_sdk::Event {
 	let event =
 		tokio::time::timeout(Duration::from_secs(20), wallet.next_event_async()).await.unwrap();
 	wallet.event_handled().unwrap();
@@ -165,33 +164,8 @@ fn fund_node(node: &Node, bitcoind: &Bitcoind) {
 	generate_blocks(bitcoind, 6);
 }
 
-fn build_wallet_config<E>(
-	uuid: Uuid, bitcoind: &Bitcoind, lsp_pk: PublicKey, socket_addr: SocketAddress, extra_config: E,
-) -> WalletConfig<E> {
-	let tmp = temp_dir().join(format!("orange-test-{uuid}/ldk-node"));
-	let cookie = bitcoind.params.get_cookie_values().unwrap().unwrap();
-	let mut seed: [u8; 64] = [0; 64];
-	rand::thread_rng().fill_bytes(&mut seed);
-	WalletConfig {
-		storage_config: StorageConfig::LocalSQLite(tmp.to_str().unwrap().to_string()),
-		log_file: tmp.join("orange.log"),
-		chain_source: ChainSource::BitcoindRPC {
-			host: "127.0.0.1".to_string(),
-			port: bitcoind.params.rpc_socket.port(),
-			user: cookie.user,
-			password: cookie.password,
-		},
-		lsp: (socket_addr, lsp_pk, None),
-		scorer_url: None,
-		network: Network::Regtest,
-		seed: Seed::Seed64(seed),
-		tunables: Default::default(),
-		extra_config,
-	}
-}
-
 pub struct TestParams {
-	pub wallet: Wallet<DummyTrustedWallet>,
+	pub wallet: Wallet,
 	pub lsp: Arc<Node>,
 	pub third_party: Arc<Node>,
 	pub bitcoind: Arc<Bitcoind>,
@@ -255,18 +229,37 @@ pub fn build_test_nodes() -> TestParams {
 		rt: Arc::clone(&rt),
 	};
 
-	let config =
-		build_wallet_config(test_id, &bitcoind, lsp.node_id(), lsp_listen, dummy_wallet_config);
+	let tmp = temp_dir().join(format!("orange-test-{test_id}/ldk-node"));
+	let cookie = bitcoind.params.get_cookie_values().unwrap().unwrap();
+	let mut seed: [u8; 64] = [0; 64];
+	rand::thread_rng().fill_bytes(&mut seed);
 
 	let rt_clone = Arc::clone(&rt);
-	let wallet = rt.block_on(async move { Wallet::new(rt_clone, config).await.unwrap() });
+	let lsp_node_id = lsp.node_id();
+	let bitcoind_port = bitcoind.params.rpc_socket.port();
+	let wallet = rt.block_on(async move {
+		WalletBuilder::new()
+			.runtime(rt_clone)
+			.storage_config(StorageConfig::LocalSQLite(tmp.to_str().unwrap().to_string()))
+			.log_file(tmp.join("orange.log"))
+			.chain_source(ChainSource::BitcoindRPC {
+				host: "127.0.0.1".to_string(),
+				port: bitcoind_port,
+				user: cookie.user,
+				password: cookie.password,
+			})
+			.lsp(lsp_node_id, lsp_listen, None)
+			.network(Network::Regtest)
+			.seed(Seed::Seed64(seed))
+			.build(ExtraConfig::Dummy(dummy_wallet_config))
+			.await
+			.unwrap()
+	});
 
 	TestParams { wallet, lsp, third_party, bitcoind, rt }
 }
 
-pub async fn open_channel_from_lsp(
-	wallet: &Wallet<DummyTrustedWallet>, payer: Arc<Node>,
-) -> Amount {
+pub async fn open_channel_from_lsp(wallet: &Wallet, payer: Arc<Node>) -> Amount {
 	let starting_bal = wallet.get_balance().await.unwrap();
 
 	// recv 2x the trusted balance limit to trigger a lightning channel

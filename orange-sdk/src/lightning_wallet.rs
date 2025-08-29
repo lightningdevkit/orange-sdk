@@ -24,6 +24,7 @@ use graduated_rebalancer::{LightningBalance, ReceivedLightningPayment};
 
 use std::collections::HashMap;
 use std::fmt::Debug;
+use std::pin::Pin;
 use std::sync::Arc;
 
 use tokio::runtime::Runtime;
@@ -50,8 +51,8 @@ pub(crate) struct LightningWallet {
 const DEFAULT_INVOICE_EXPIRY_SECS: u32 = 86_400; // 24 hours
 
 impl LightningWallet {
-	pub(super) async fn init<E>(
-		runtime: Arc<Runtime>, config: WalletConfig<E>, store: Arc<dyn KVStore + Sync + Send>,
+	pub(super) async fn init(
+		runtime: Arc<Runtime>, config: WalletConfig, store: Arc<dyn KVStore + Sync + Send>,
 		event_queue: Arc<EventQueue>, logger: Arc<Logger>,
 	) -> Result<Self, InitFailure> {
 		let anchor_channels_config = ldk_node::config::AnchorChannelsConfig {
@@ -345,20 +346,20 @@ impl graduated_rebalancer::LightningWallet for LightningWallet {
 
 	fn get_bolt11_invoice(
 		&self, amount: Option<Amount>,
-	) -> impl Future<Output = Result<Bolt11Invoice, Self::Error>> + Send {
-		async move { self.get_bolt11_invoice(amount).await }
+	) -> Pin<Box<dyn Future<Output = Result<Bolt11Invoice, Self::Error>> + Send + '_>> {
+		Box::pin(async move { self.get_bolt11_invoice(amount).await })
 	}
 
 	fn pay(
-		&self, method: &PaymentMethod, amount: Amount,
-	) -> impl Future<Output = Result<[u8; 32], Self::Error>> + Send {
-		async move { self.pay(method, amount).await.map(|p| p.0) }
+		&self, method: PaymentMethod, amount: Amount,
+	) -> Pin<Box<dyn Future<Output = Result<[u8; 32], Self::Error>> + Send + '_>> {
+		Box::pin(async move { self.pay(&method, amount).await.map(|p| p.0) })
 	}
 
 	fn await_payment_receipt(
 		&self, payment_hash: [u8; 32],
-	) -> impl Future<Output = Option<ReceivedLightningPayment>> + Send {
-		async move {
+	) -> Pin<Box<dyn Future<Output = Option<ReceivedLightningPayment>> + Send + '_>> {
+		Box::pin(async move {
 			let id = PaymentId(payment_hash);
 			loop {
 				if let Some(payment) = self.inner.ldk_node.payment(&id) {
@@ -386,20 +387,22 @@ impl graduated_rebalancer::LightningWallet for LightningWallet {
 				}
 				self.await_payment_receipt().await;
 			}
-		}
+		})
 	}
 
 	fn open_channel_with_lsp(
 		&self, _amt: Amount,
-	) -> impl Future<Output = Result<u128, Self::Error>> + Send {
-		async move {
+	) -> Pin<Box<dyn Future<Output = Result<u128, Self::Error>> + Send + '_>> {
+		Box::pin(async move {
 			// we don't use the amount and just use our full spendable balance in open_channel_with_lsp
 			self.open_channel_with_lsp().await.map(|c| c.0)
-		}
+		})
 	}
 
-	fn await_channel_pending(&self, channel_id: u128) -> impl Future<Output = OutPoint> + Send {
-		async move {
+	fn await_channel_pending(
+		&self, channel_id: u128,
+	) -> Pin<Box<dyn Future<Output = OutPoint> + Send + '_>> {
+		Box::pin(async move {
 			loop {
 				let channels = self.inner.ldk_node.list_channels();
 				let chan = channels
@@ -413,7 +416,7 @@ impl graduated_rebalancer::LightningWallet for LightningWallet {
 					},
 				}
 			}
-		}
+		})
 	}
 }
 

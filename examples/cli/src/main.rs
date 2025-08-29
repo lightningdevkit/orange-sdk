@@ -5,10 +5,9 @@ use rustyline::DefaultEditor;
 use rustyline::error::ReadlineError;
 
 use orange_sdk::bitcoin_payment_instructions::amount::Amount;
-use orange_sdk::trusted_wallet::spark::Spark;
 use orange_sdk::{
-	ChainSource, Event, Mnemonic, PaymentInfo, Seed, SparkWalletConfig, StorageConfig, Tunables,
-	Wallet, WalletConfig, bitcoin::Network,
+	ChainSource, Event, ExtraConfig, Mnemonic, PaymentInfo, Seed, SparkWalletConfig, StorageConfig,
+	Tunables, Wallet, WalletConfig, bitcoin::Network,
 };
 use rand::RngCore;
 use std::fs;
@@ -58,12 +57,12 @@ enum Commands {
 }
 
 struct WalletState {
-	wallet: Wallet<Spark>,
+	wallet: Wallet,
 	_runtime: Arc<Runtime>, // Keep runtime alive
 	shutdown: Arc<AtomicBool>,
 }
 
-fn get_config(network: Network) -> Result<WalletConfig<SparkWalletConfig>> {
+fn get_config(network: Network) -> Result<WalletConfig> {
 	let storage_path = format!("./wallet_data/{network}");
 
 	// Generate or load seed
@@ -89,9 +88,9 @@ fn get_config(network: Network) -> Result<WalletConfig<SparkWalletConfig>> {
 				network,
 				seed,
 				tunables: Tunables::default(),
-				extra_config: SparkWalletConfig::default_config(
+				extra_config: ExtraConfig::Spark(SparkWalletConfig::default_config(
 					network.try_into().expect("valid network"),
-				),
+				)),
 			})
 		},
 		Network::Bitcoin => {
@@ -117,9 +116,9 @@ fn get_config(network: Network) -> Result<WalletConfig<SparkWalletConfig>> {
 				network,
 				seed,
 				tunables: Tunables::default(),
-				extra_config: SparkWalletConfig::default_config(
+				extra_config: ExtraConfig::Spark(SparkWalletConfig::default_config(
 					network.try_into().expect("valid network"),
-				),
+				)),
 			})
 		},
 		_ => Err(anyhow::anyhow!("Unsupported network: {network:?}")),
@@ -203,7 +202,7 @@ impl WalletState {
 		}
 	}
 
-	fn wallet(&self) -> &Wallet<Spark> {
+	fn wallet(&self) -> &Wallet {
 		&self.wallet
 	}
 
