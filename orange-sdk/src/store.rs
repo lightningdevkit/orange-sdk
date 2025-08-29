@@ -92,6 +92,7 @@ pub struct Transaction {
 /// A [Transaction] that is stored in the database. We have to modify the `Transaction` type
 /// to have types that all implement `Writeable` and `Readable` so that we can store it in the database.
 #[derive(Debug, Clone)]
+#[allow(dead_code)] // Some trusted backends don't use this
 pub(crate) struct StoreTransaction {
 	pub status: TxStatus,
 	pub outbound: bool,

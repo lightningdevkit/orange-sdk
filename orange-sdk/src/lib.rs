@@ -1,4 +1,4 @@
-#![deny(missing_docs)]
+﻿#![deny(missing_docs)]
 
 //! A library implementing the full backend for a modern, highly usable, Bitcoin wallet focusing on
 //! maximizing security and self-custody without trading off user experience.
@@ -21,8 +21,11 @@ use bitcoin_payment_instructions::amount::Amount;
 
 use crate::rebalancer::{OrangeRebalanceEventHandler, OrangeTrigger};
 use crate::store::{PaymentId, TxMetadata, TxMetadataStore, TxType};
+#[cfg(feature = "cashu")]
+use crate::trusted_wallet::cashu::Cashu;
 #[cfg(feature = "_test-utils")]
 use crate::trusted_wallet::dummy::DummyTrustedWallet;
+#[cfg(feature = "spark")]
 use crate::trusted_wallet::spark::Spark;
 use crate::trusted_wallet::{DynTrustedWalletInterface, WalletTrusted};
 use graduated_rebalancer::GraduatedRebalancer;
@@ -59,12 +62,17 @@ use lightning_wallet::LightningWallet;
 use logging::Logger;
 use trusted_wallet::TrustedError;
 
+#[cfg(feature = "cashu")]
+pub use crate::trusted_wallet::cashu::CashuConfig;
 pub use bitcoin_payment_instructions;
 pub use builder::{BuilderError, WalletBuilder};
+#[cfg(feature = "cashu")]
+pub use cdk::nuts::nut00::CurrencyUnit;
 pub use event::{Event, EventQueue};
 pub use ldk_node::bip39::Mnemonic;
 pub use ldk_node::bitcoin;
 pub use ldk_node::payment::ConfirmationStatus;
+#[cfg(feature = "spark")]
 pub use spark_wallet::{OperatorPoolConfig, ServiceProviderConfig, SparkWalletConfig};
 pub use store::{PaymentType, Transaction, TxStatus};
 pub use trusted_wallet::ExtraConfig;
@@ -495,9 +503,22 @@ impl Wallet {
 		let event_queue = Arc::new(EventQueue::new(Arc::clone(&store), Arc::clone(&logger)));
 
 		let trusted: Arc<Box<DynTrustedWalletInterface>> = match &config.extra_config {
-			ExtraConfig::Spark(_) => Arc::new(Box::new(
+			#[cfg(feature = "spark")]
+			ExtraConfig::Spark(sp) => Arc::new(Box::new(
 				Spark::init(
 					&config,
+					sp.clone(),
+					Arc::clone(&store),
+					Arc::clone(&event_queue),
+					Arc::clone(&logger),
+				)
+				.await?,
+			)),
+			#[cfg(feature = "cashu")]
+			ExtraConfig::Cashu(cashu) => Arc::new(Box::new(
+				Cashu::init(
+					&config,
+					cashu.clone(),
 					Arc::clone(&store),
 					Arc::clone(&event_queue),
 					Arc::clone(&logger),

@@ -1,5 +1,6 @@
 //! Builder for constructing [`Wallet`] instances with a fluent API.
 
+#[cfg(feature = "spark")]
 use crate::trusted_wallet::TrustedError;
 use crate::{
 	ChainSource, ExtraConfig, InitFailure, Seed, StorageConfig, Tunables, Wallet, WalletConfig,
@@ -8,7 +9,6 @@ use crate::{
 use ldk_node::bitcoin::secp256k1::PublicKey;
 use ldk_node::bitcoin::{Network, io};
 use ldk_node::lightning::ln::msgs::SocketAddress;
-use spark_wallet::SparkWalletConfig;
 use std::fmt;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -264,11 +264,7 @@ impl WalletBuilder {
 			},
 		};
 
-		match &config.extra_config {
-			ExtraConfig::Spark(_) => Wallet::new(runtime, config).await,
-			#[cfg(feature = "_test-utils")]
-			ExtraConfig::Dummy(_) => Wallet::new(runtime, config).await,
-		}
+		Wallet::new(runtime, config).await
 	}
 
 	/// Builds and initializes the wallet with the configured parameters for Spark wallet.
@@ -289,14 +285,15 @@ impl WalletBuilder {
 	/// - Network connection fails
 	/// - Trusted wallet initialization fails
 	/// - LDK node fails to start
+	#[cfg(feature = "spark")]
 	pub async fn build_spark(
-		self, spark_config: Option<SparkWalletConfig>,
+		self, spark_config: Option<spark_wallet::SparkWalletConfig>,
 	) -> Result<Wallet, InitFailure> {
 		let spark_config = match spark_config {
 			Some(cfg) => cfg,
 			None => {
 				let network = self.network.ok_or(BuilderError::MissingNetwork)?;
-				SparkWalletConfig::default_config(
+				spark_wallet::SparkWalletConfig::default_config(
 					network
 						.try_into()
 						.map_err(|_| InitFailure::TrustedFailure(TrustedError::InvalidNetwork))?,
