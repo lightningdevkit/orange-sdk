@@ -326,4 +326,55 @@ impl WalletBuilder {
 
 		Wallet::new(runtime, config).await
 	}
+
+	/// Builds and initializes the wallet with the configured parameters for Cashu wallet.
+	///
+	/// # Type Parameters
+	///
+	/// * `T` - The trusted wallet implementation type
+	///
+	/// # Returns
+	///
+	/// Returns a [`Result`] containing the initialized [`Wallet`] on success, or an [`InitFailure`] on error.
+	///
+	/// # Errors
+	///
+	/// This method will return an error if:
+	/// - Required configuration is missing
+	/// - Storage initialization fails
+	/// - Network connection fails
+	/// - Trusted wallet initialization fails
+	/// - LDK node fails to start
+	#[cfg(feature = "cashu")]
+	pub async fn build_cashu(
+		self, mint_url: String, unit: Option<cdk::nuts::CurrencyUnit>,
+	) -> Result<Wallet, InitFailure> {
+		let cashu_config =
+			crate::CashuConfig { mint_url, unit: unit.unwrap_or(cdk::nuts::CurrencyUnit::Sat) };
+
+		let runtime = match self.runtime {
+			Some(runtime) => runtime,
+			None => {
+				let rt = tokio::runtime::Builder::new_multi_thread()
+					.enable_all()
+					.build()
+					.map_err(|e| InitFailure::IoError(e.into()))?;
+				Arc::new(rt)
+			},
+		};
+
+		let config = WalletConfig {
+			storage_config: self.storage_config.ok_or(BuilderError::MissingStorageConfig)?,
+			log_file: self.log_file.ok_or(BuilderError::MissingLogFile)?,
+			chain_source: self.chain_source.ok_or(BuilderError::MissingChainSource)?,
+			lsp: self.lsp.ok_or(BuilderError::MissingLsp)?,
+			scorer_url: self.scorer_url,
+			network: self.network.ok_or(BuilderError::MissingNetwork)?,
+			seed: self.seed.ok_or(BuilderError::MissingSeed)?,
+			tunables: self.tunables.unwrap_or_default(),
+			extra_config: ExtraConfig::Cashu(cashu_config),
+		};
+
+		Wallet::new(runtime, config).await
+	}
 }
