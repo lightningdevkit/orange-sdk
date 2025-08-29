@@ -264,11 +264,7 @@ impl WalletBuilder {
 			},
 		};
 
-		match &config.extra_config {
-			ExtraConfig::Spark(_) => Wallet::new(runtime, config).await,
-			#[cfg(feature = "_test-utils")]
-			ExtraConfig::Dummy(_) => Wallet::new(runtime, config).await,
-		}
+		Wallet::new(runtime, config).await
 	}
 
 	/// Builds and initializes the wallet with the configured parameters for Spark wallet.

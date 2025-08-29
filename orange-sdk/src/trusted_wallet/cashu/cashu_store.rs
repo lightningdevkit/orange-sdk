@@ -218,7 +218,7 @@ impl CashuKvDatabase {
 				Ok(Some(info))
 			},
 			Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
-			Err(e) => Err(DatabaseError::Io(e).into()),
+			Err(e) => Err(DatabaseError::Io(e)),
 		}
 	}
 
@@ -234,7 +234,7 @@ impl CashuKvDatabase {
 
 	fn generate_proof_key(proof: &ProofInfo) -> String {
 		// Generate a unique key for the proof based on the Y coordinate
-		format!("proof_{}", hex::encode(&proof.y.serialize()))
+		format!("proof_{}", hex::encode(proof.y.serialize()))
 	}
 
 	fn generate_mint_key(mint_url: &MintUrl) -> String {
@@ -370,7 +370,7 @@ impl WalletDatabase for CashuKvDatabase {
 
 		for keyset in keysets {
 			// Check if keyset already exists in individual keysets table
-			let keyset_key = format!("keyset_{}", keyset.id.to_string());
+			let keyset_key = format!("keyset_{}", keyset.id);
 			let existing_keyset =
 				match self.store.read(CASHU_PRIMARY_KEY, KEYSETS_TABLE_KEY, &keyset_key) {
 					Ok(data) if !data.is_empty() => {
@@ -670,7 +670,7 @@ impl WalletDatabase for CashuKvDatabase {
 
 		// Remove proofs by Y values
 		for y in &removed_ys {
-			let key = format!("proof_{}", hex::encode(&y.serialize()));
+			let key = format!("proof_{}", hex::encode(y.serialize()));
 
 			self.store
 				.write(CASHU_PRIMARY_KEY, PROOFS_KEY, &key, &[])
@@ -727,7 +727,7 @@ impl WalletDatabase for CashuKvDatabase {
 	async fn update_proofs_state(&self, ys: Vec<PublicKey>, state: State) -> Result<(), Self::Err> {
 		// Update proofs in storage and cache
 		for y in &ys {
-			let key = format!("proof_{}", hex::encode(&y.serialize()));
+			let key = format!("proof_{}", hex::encode(y.serialize()));
 
 			// Read existing proof
 			match self.store.read(CASHU_PRIMARY_KEY, PROOFS_KEY, &key) {

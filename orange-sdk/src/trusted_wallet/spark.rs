@@ -231,8 +231,7 @@ impl Spark {
 	) -> Result<Self, InitFailure> {
 		let extra_config = match &config.extra_config {
 			ExtraConfig::Spark(sp) => sp.clone(),
-			#[cfg(feature = "_test-utils")]
-			ExtraConfig::Dummy(_) => unreachable!("Not reachable, we are in Spark"),
+			_ => unreachable!("Not reachable, we are in Spark"),
 		};
 
 		if config.network != extra_config.network.into() {

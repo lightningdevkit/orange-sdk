@@ -1,4 +1,4 @@
-#![deny(missing_docs)]
+﻿#![deny(missing_docs)]
 
 //! A library implementing the full backend for a modern, highly usable, Bitcoin wallet focusing on
 //! maximizing security and self-custody without trading off user experience.
@@ -21,6 +21,7 @@ use bitcoin_payment_instructions::amount::Amount;
 
 use crate::rebalancer::{OrangeRebalanceEventHandler, OrangeTrigger};
 use crate::store::{PaymentId, TxMetadata, TxMetadataStore, TxType};
+use crate::trusted_wallet::cashu::Cashu;
 #[cfg(feature = "_test-utils")]
 use crate::trusted_wallet::dummy::DummyTrustedWallet;
 use crate::trusted_wallet::spark::Spark;
@@ -497,6 +498,15 @@ impl Wallet {
 		let trusted: Arc<Box<DynTrustedWalletInterface>> = match &config.extra_config {
 			ExtraConfig::Spark(_) => Arc::new(Box::new(
 				Spark::init(
+					&config,
+					Arc::clone(&store),
+					Arc::clone(&event_queue),
+					Arc::clone(&logger),
+				)
+				.await?,
+			)),
+			ExtraConfig::Cashu(_) => Arc::new(Box::new(
+				Cashu::init(
 					&config,
 					Arc::clone(&store),
 					Arc::clone(&event_queue),
