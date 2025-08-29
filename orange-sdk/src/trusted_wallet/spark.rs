@@ -5,7 +5,7 @@ use crate::bitcoin::{Txid, io};
 use crate::logging::Logger;
 use crate::store::{PaymentId, StoreTransaction, TxStatus};
 use crate::trusted_wallet::{Payment, TrustedError, TrustedWalletInterface};
-use crate::{Event, EventQueue, ExtraConfig, InitFailure, PaymentType, Seed, WalletConfig};
+use crate::{Event, EventQueue, InitFailure, PaymentType, Seed, WalletConfig};
 
 use ldk_node::bitcoin::hashes::Hash;
 use ldk_node::bitcoin::hashes::sha256::Hash as Sha256;
@@ -21,8 +21,8 @@ use bitcoin_payment_instructions::PaymentMethod;
 use bitcoin_payment_instructions::amount::Amount;
 
 use spark_wallet::{
-	DefaultSigner, Order, PagingFilter, PayLightningInvoiceResult, SparkWallet, SparkWalletError,
-	SspUserRequest, TransferStatus, WalletEvent, WalletTransfer,
+	DefaultSigner, Order, PagingFilter, PayLightningInvoiceResult, SparkWallet, SparkWalletConfig,
+	SparkWalletError, SspUserRequest, TransferStatus, WalletEvent, WalletTransfer,
 };
 
 use tokio::sync::watch;
@@ -226,15 +226,10 @@ const SPARK_SYNC_OFFSET_KEY: &str = "sync_offset";
 impl Spark {
 	/// Initialize a new Spark wallet instance with the given configuration.
 	pub(crate) async fn init(
-		config: &WalletConfig, store: Arc<dyn KVStore + Sync + Send>, event_queue: Arc<EventQueue>,
-		logger: Arc<Logger>,
+		config: &WalletConfig, spark_config: SparkWalletConfig,
+		store: Arc<dyn KVStore + Sync + Send>, event_queue: Arc<EventQueue>, logger: Arc<Logger>,
 	) -> Result<Self, InitFailure> {
-		let extra_config = match &config.extra_config {
-			ExtraConfig::Spark(sp) => sp.clone(),
-			_ => unreachable!("Not reachable, we are in Spark"),
-		};
-
-		if config.network != extra_config.network.into() {
+		if config.network != spark_config.network.into() {
 			Err(TrustedError::InvalidNetwork)?
 		}
 
@@ -242,7 +237,7 @@ impl Spark {
 			Seed::Seed64(bytes) => {
 				// hash the seed to make sure it does not conflict with the lightning keys
 				let seed = Sha256::hash(bytes);
-				DefaultSigner::new(&seed[..], extra_config.network)
+				DefaultSigner::new(&seed[..], spark_config.network)
 					.map_err(|e| TrustedError::Other(format!("Failed to create signer: {e}")))?
 			},
 			Seed::Mnemonic { mnemonic, passphrase } => {
@@ -250,13 +245,13 @@ impl Spark {
 				// and if we hashed them, then you could not recover your spark coins from the mnemonic
 				// in separate wallets.
 				let seed = mnemonic.to_seed(passphrase.as_deref().unwrap_or(""));
-				DefaultSigner::new(&seed[..], extra_config.network)
+				DefaultSigner::new(&seed[..], spark_config.network)
 					.map_err(|e| TrustedError::Other(format!("Failed to create signer: {e}")))?
 			},
 		};
 
 		let spark_wallet = Arc::new(
-			SparkWallet::connect(extra_config, signer)
+			SparkWallet::connect(spark_config, signer)
 				.await
 				.map_err(|e| InitFailure::TrustedFailure(e.into()))?,
 		);

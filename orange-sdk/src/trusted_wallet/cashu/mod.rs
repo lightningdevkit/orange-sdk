@@ -3,7 +3,7 @@
 use crate::logging::Logger;
 use crate::store::{PaymentId, TxStatus};
 use crate::trusted_wallet::{Payment, TrustedError, TrustedWalletInterface};
-use crate::{Event, EventQueue, ExtraConfig, InitFailure, Seed, WalletConfig};
+use crate::{Event, EventQueue, InitFailure, Seed, WalletConfig};
 
 use ldk_node::bitcoin::hashes::Hash;
 use ldk_node::bitcoin::hashes::sha256::Hash as Sha256;
@@ -267,14 +267,9 @@ impl TrustedWalletInterface for Cashu {
 
 impl Cashu {
 	pub(crate) async fn init(
-		config: &WalletConfig, store: Arc<dyn KVStore + Sync + Send>,
+		config: &WalletConfig, cashu_config: CashuConfig, store: Arc<dyn KVStore + Sync + Send>,
 		event_queue: Arc<EventQueue>, logger: Arc<Logger>,
 	) -> Result<Self, InitFailure> {
-		let cashu_config = match config.extra_config {
-			ExtraConfig::Cashu(ref c) => c.clone(),
-			_ => unreachable!(),
-		};
-
 		// Create the seed from the configuration
 		let seed = match &config.seed {
 			Seed::Seed64(bytes) => {
@@ -372,13 +367,7 @@ impl Cashu {
 			}
 		}
 
-		Ok(Cashu {
-			cashu_wallet,
-			shutdown_sender,
-			logger,
-			supports_bolt12,
-			mint_quote_sender,
-		})
+		Ok(Cashu { cashu_wallet, shutdown_sender, logger, supports_bolt12, mint_quote_sender })
 	}
 
 	/// Convert an ID string to a 32-byte array

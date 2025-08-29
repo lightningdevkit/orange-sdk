@@ -12,10 +12,12 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
+#[cfg(feature = "cashu")]
+pub mod cashu;
 #[cfg(feature = "_test-utils")]
 pub mod dummy;
+#[cfg(feature = "spark")]
 pub mod spark;
-pub mod cashu;
 
 /// Represents a payment with its associated details.
 ///
@@ -115,8 +117,10 @@ impl<T: ?Sized + TrustedWalletInterface> graduated_rebalancer::TrustedWallet for
 /// Extra configuration needed for different types of wallets.
 pub enum ExtraConfig {
 	/// Configuration for Spark wallet.
+	#[cfg(feature = "spark")]
 	Spark(crate::SparkWalletConfig),
 	/// Configuration for Cashu wallet.
+	#[cfg(feature = "cashu")]
 	Cashu(cashu::CashuConfig),
 	/// Configuration for dummy wallet (test-only).
 	#[cfg(feature = "_test-utils")]
@@ -131,7 +135,9 @@ mod private {
 	pub trait Sealed {}
 
 	// Only implement Sealed for types you want to allow
+	#[cfg(feature = "spark")]
 	impl Sealed for super::spark::Spark {}
+	#[cfg(feature = "cashu")]
 	impl Sealed for super::cashu::Cashu {}
 	#[cfg(feature = "_test-utils")]
 	impl Sealed for super::dummy::DummyTrustedWallet {}
