@@ -477,29 +477,18 @@ impl WalletDatabase for CashuKvDatabase {
 	}
 
 	async fn get_keyset_by_id(&self, keyset_id: &Id) -> Result<Option<KeySetInfo>, Self::Err> {
-		// Get all mint keysets and search for the one with matching ID
-		let keys =
-			self.store.list(CASHU_PRIMARY_KEY, MINT_KEYSETS_KEY).map_err(DatabaseError::Io)?;
-
-		for key in keys {
-			let data = self
-				.store
-				.read(CASHU_PRIMARY_KEY, MINT_KEYSETS_KEY, &key)
-				.map_err(DatabaseError::Io)?;
-
-			if !data.is_empty() {
-				let keysets: Vec<KeySetInfo> = serde_json::from_slice(&data)
+		// Read directly from the dedicated KEYSETS_TABLE keyed by the keyset ID for efficiency
+		let key = format!("keyset_{}", keyset_id);
+		match self.store.read(CASHU_PRIMARY_KEY, KEYSETS_TABLE_KEY, &key) {
+			Ok(data) if !data.is_empty() => {
+				let keyset: KeySetInfo = serde_json::from_slice(&data)
 					.map_err(|e| DatabaseError::Serialization(e.to_string()))?;
-
-				for keyset in keysets {
-					if &keyset.id == keyset_id {
-						return Ok(Some(keyset));
-					}
-				}
-			}
+				Ok(Some(keyset))
+			},
+			Ok(_) => Ok(None),
+			Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
+			Err(e) => Err(DatabaseError::Io(e).into()),
 		}
-
-		Ok(None)
 	}
 
 	async fn add_mint_quote(&self, quote: MintQuote) -> Result<(), Self::Err> {
@@ -616,6 +605,8 @@ impl WalletDatabase for CashuKvDatabase {
 	}
 
 	async fn add_keys(&self, keyset: KeySet) -> Result<(), Self::Err> {
+		keyset.verify_id().map_err(|e| cdk::cdk_database::Error::Database(e.to_string().into()))?;
+
 		if self.get_keys(&keyset.id).await?.is_some() {
 			return Ok(());
 		}
