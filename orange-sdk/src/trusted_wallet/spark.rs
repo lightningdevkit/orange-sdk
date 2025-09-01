@@ -21,8 +21,9 @@ use bitcoin_payment_instructions::PaymentMethod;
 use bitcoin_payment_instructions::amount::Amount;
 
 use spark_wallet::{
-	DefaultSigner, Order, PagingFilter, PayLightningInvoiceResult, SparkWallet, SparkWalletConfig,
-	SparkWalletError, SspUserRequest, TransferStatus, WalletEvent, WalletTransfer,
+	DefaultSigner, Order, PagingFilter, PayLightningInvoiceResult, Signer, SparkWallet,
+	SparkWalletConfig, SparkWalletError, SspUserRequest, TransferStatus, WalletEvent,
+	WalletTransfer,
 };
 
 use tokio::sync::watch;
@@ -249,6 +250,10 @@ impl Spark {
 					.map_err(|e| TrustedError::Other(format!("Failed to create signer: {e}")))?
 			},
 		};
+
+		let pk =
+			signer.get_identity_public_key().map_err(|e| TrustedError::Other(format!("{e:?}")))?;
+		log_info!(logger, "Starting Spark wallet with public key: {pk}");
 
 		let spark_wallet = Arc::new(
 			SparkWallet::connect(spark_config, signer)
