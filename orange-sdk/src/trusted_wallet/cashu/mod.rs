@@ -7,19 +7,20 @@ use crate::{Event, EventQueue, InitFailure, Seed, WalletConfig};
 
 use ldk_node::bitcoin::hashes::Hash;
 use ldk_node::bitcoin::hashes::sha256::Hash as Sha256;
+use ldk_node::bitcoin::hex::FromHex;
 use ldk_node::lightning::util::logger::Logger as _;
 use ldk_node::lightning::util::persist::KVStore;
 use ldk_node::lightning::{log_error, log_info};
 use ldk_node::lightning_invoice::Bolt11Invoice;
-use ldk_node::lightning_types::payment::PaymentHash;
+use ldk_node::lightning_types::payment::{PaymentHash, PaymentPreimage};
 
 use bitcoin_payment_instructions::PaymentMethod;
 use bitcoin_payment_instructions::amount::Amount;
 
 use cdk::amount::SplitTarget;
-use cdk::nuts::CurrencyUnit;
 use cdk::nuts::MeltOptions;
 use cdk::nuts::nut23::Amountless;
+use cdk::nuts::{CurrencyUnit, MeltQuoteState};
 use cdk::wallet::MintQuote;
 use cdk::wallet::Wallet;
 use cdk::wallet::types::{Transaction, TransactionDirection};
@@ -55,6 +56,7 @@ pub struct Cashu {
 	logger: Arc<Logger>,
 	supports_bolt12: bool,
 	mint_quote_sender: mpsc::Sender<MintQuote>,
+	event_queue: Arc<EventQueue>,
 }
 
 impl TrustedWalletInterface for Cashu {
@@ -210,8 +212,11 @@ impl TrustedWalletInterface for Cashu {
 				amountless: Amountless { amount_msat: amount.milli_sats().into() },
 			});
 
+			let mut payment_hash: Option<PaymentHash> = None;
+
 			let quote = match method {
 				PaymentMethod::LightningBolt11(invoice) => {
+					payment_hash = Some(PaymentHash(*invoice.payment_hash().as_byte_array()));
 					// Create a melt quote
 					self.cashu_wallet.melt_quote(invoice.to_string(), melt_options).await.map_err(
 						|e| {
@@ -244,25 +249,103 @@ impl TrustedWalletInterface for Cashu {
 				},
 			};
 
+			// Convert quote ID to a 32-byte array for consistency
+			// We'll use the quote ID as the payment identifier
+			let payment_id = Self::id_to_32_byte_array(&quote.id);
+
 			// Execute the melt in separate thread, do not block on it being successful/failed
 			let cashu_wallet = Arc::clone(&self.cashu_wallet);
 			let logger = Arc::clone(&self.logger);
+			let event_queue = Arc::clone(&self.event_queue);
 			let quote_id = quote.id.clone();
 			tokio::spawn(async move {
 				// todo react with events too
 				match cashu_wallet.melt(&quote_id).await {
-					Ok(_) => {
-						log_info!(logger, "Successfully sent for quote: {quote_id}");
+					Ok(res) => {
+						match res.state {
+							MeltQuoteState::Paid => {
+								log_info!(logger, "Successfully sent for quote: {quote_id}");
+
+								let preimage: Option<PaymentPreimage> = match &res.preimage {
+									Some(str) => match FromHex::from_hex(str) {
+										Ok(b) => Some(PaymentPreimage(b)),
+										Err(e) => {
+											log_error!(
+												logger,
+												"Failed to decode preimage ({:?}) for quote {quote_id}: {e}",
+												res.preimage
+											);
+											None
+										},
+									},
+									None => {
+										debug_assert!(
+											false,
+											"Melt succeeded but no preimage for quote: {quote_id}"
+										);
+										log_error!(
+											logger,
+											"Melt succeeded but no preimage for quote: {quote_id}"
+										);
+										None // Placeholder, should not happen
+									},
+								};
+
+								let hash = match payment_hash {
+									Some(hash) => hash,
+									None => {
+										match preimage {
+											Some(pre) => {
+												let hash = Sha256::hash(&pre.0);
+												PaymentHash(hash.to_byte_array())
+											},
+											None => {
+												log_error!(
+													logger,
+													"Melt succeeded but no payment hash or preimage for quote: {quote_id}"
+												);
+												PaymentHash([0u8; 32]) // Placeholder, should not happen
+											},
+										}
+									},
+								};
+
+								let fee_paid_sat: u64 = res.fee_paid.into();
+								let _ = event_queue.add_event(Event::PaymentSuccessful {
+									payment_id: PaymentId::Trusted(payment_id),
+									payment_hash: hash,
+									payment_preimage: preimage
+										.unwrap_or(PaymentPreimage([0u8; 32])),
+									fee_paid_msat: Some(fee_paid_sat * 1_000), // convert to msats
+								});
+							},
+							MeltQuoteState::Failed => {
+								log_error!(logger, "Melt failed for quote: {quote_id}");
+								let _ = event_queue.add_event(Event::PaymentFailed {
+									payment_id: PaymentId::Trusted(payment_id),
+									payment_hash,
+									reason: None,
+								});
+							},
+							state => {
+								log_error!(
+									logger,
+									"Melt in unknown state {state} for quote: {quote_id}"
+								);
+								// todo should we watch for it to complete?
+							},
+						}
 					},
 					Err(e) => {
-						log_error!(logger, "Failed to melt quote {quote_id}: {e}",);
+						log_error!(logger, "Failed to melt quote {quote_id}: {e}");
+						let _ = event_queue.add_event(Event::PaymentFailed {
+							payment_id: PaymentId::Trusted(payment_id),
+							payment_hash,
+							reason: None,
+						});
 					},
 				}
 			});
-
-			// Convert quote ID to a 32-byte array for consistency
-			// We'll use the quote ID as the payment identifier
-			let payment_id = Self::id_to_32_byte_array(&quote.id);
 
 			Ok(payment_id)
 		})
@@ -333,6 +416,7 @@ impl Cashu {
 		// Start mint quote monitoring task
 		let wallet_for_monitoring = Arc::clone(&cashu_wallet);
 		let logger_for_monitoring = Arc::clone(&logger);
+		let eq_for_monitoring = Arc::clone(&event_queue);
 		tokio::spawn(async move {
 			loop {
 				tokio::select! {
@@ -345,7 +429,7 @@ impl Cashu {
 
 						// Start monitoring this quote
 						let wallet = Arc::clone(&wallet_for_monitoring);
-						let event_queue = Arc::clone(&event_queue);
+						let event_queue = Arc::clone(&eq_for_monitoring);
 						let logger = Arc::clone(&logger_for_monitoring);
 						tokio::spawn(async move {
 							if let Err(e) = Self::monitor_mint_quote(wallet, event_queue, &logger, mint_quote).await {
@@ -369,7 +453,14 @@ impl Cashu {
 			}
 		}
 
-		Ok(Cashu { cashu_wallet, shutdown_sender, logger, supports_bolt12, mint_quote_sender })
+		Ok(Cashu {
+			cashu_wallet,
+			shutdown_sender,
+			logger,
+			supports_bolt12,
+			mint_quote_sender,
+			event_queue,
+		})
 	}
 
 	/// Convert an ID string to a 32-byte array
