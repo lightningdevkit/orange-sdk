@@ -1,6 +1,12 @@
 #![cfg(feature = "_test-utils")]
 
 use bitcoin_payment_instructions::amount::Amount;
+#[cfg(feature = "_cashu-tests")]
+use cdk::mint::{MintBuilder, MintMeltLimits};
+#[cfg(feature = "_cashu-tests")]
+use cdk::types::FeeReserve;
+#[cfg(feature = "_cashu-tests")]
+use cdk_ldk_node::{BitcoinRpcConfig, GossipSource};
 use corepc_node::client::bitcoin::Network;
 use corepc_node::{Conf, Node as Bitcoind, get_available_port};
 use ldk_node::bitcoin::hashes::Hash;
@@ -8,11 +14,16 @@ use ldk_node::lightning::ln::msgs::SocketAddress;
 use ldk_node::liquidity::LSPS2ServiceConfig;
 use ldk_node::payment::PaymentStatus;
 use ldk_node::{Node, bitcoin};
+#[cfg(not(feature = "_cashu-tests"))]
 use orange_sdk::trusted_wallet::dummy::DummyTrustedWalletExtraConfig;
-use orange_sdk::{ChainSource, ExtraConfig, Seed, StorageConfig, Wallet, WalletBuilder};
+use orange_sdk::{ChainSource, ExtraConfig, Seed, StorageConfig, WalletBuilder};
 use rand::RngCore;
 use std::env::temp_dir;
 use std::future::Future;
+#[cfg(feature = "_cashu-tests")]
+use std::net::SocketAddr;
+#[cfg(feature = "_cashu-tests")]
+use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::runtime::Runtime;
@@ -38,7 +49,7 @@ pub async fn wait_for_condition<F, Fut>(
 /// If no event is received within this time, it panics.
 /// This is useful for testing purposes to ensure that the wallet is responsive and events are being processed.
 /// Otherwise, we can have the test hang indefinitely.
-pub async fn wait_next_event(wallet: &Wallet) -> orange_sdk::Event {
+pub async fn wait_next_event(wallet: &orange_sdk::Wallet) -> orange_sdk::Event {
 	let event =
 		tokio::time::timeout(Duration::from_secs(20), wallet.next_event_async()).await.unwrap();
 	wallet.event_handled().unwrap();
@@ -165,11 +176,13 @@ fn fund_node(node: &Node, bitcoind: &Bitcoind) {
 }
 
 pub struct TestParams {
-	pub wallet: Wallet,
+	pub wallet: orange_sdk::Wallet,
 	pub lsp: Arc<Node>,
 	pub third_party: Arc<Node>,
 	pub bitcoind: Arc<Bitcoind>,
 	pub rt: Arc<Runtime>,
+	#[cfg(feature = "_cashu-tests")]
+	pub _mint: Arc<cdk::Mint>,
 }
 
 pub fn build_test_nodes() -> TestParams {
@@ -222,44 +235,180 @@ pub fn build_test_nodes() -> TestParams {
 	// make sure it actually became usable
 	assert!(third_party.list_channels().first().unwrap().is_usable);
 
-	let dummy_wallet_config = DummyTrustedWalletExtraConfig {
-		uuid: test_id,
-		lsp: Arc::clone(&lsp),
-		bitcoind: Arc::clone(&bitcoind),
-		rt: Arc::clone(&rt),
-	};
-
-	let tmp = temp_dir().join(format!("orange-test-{test_id}/ldk-node"));
-	let cookie = bitcoind.params.get_cookie_values().unwrap().unwrap();
+	let lsp_node_id = lsp.node_id();
 	let mut seed: [u8; 64] = [0; 64];
 	rand::thread_rng().fill_bytes(&mut seed);
 
-	let rt_clone = Arc::clone(&rt);
-	let lsp_node_id = lsp.node_id();
-	let bitcoind_port = bitcoind.params.rpc_socket.port();
-	let wallet = rt.block_on(async move {
-		WalletBuilder::new()
-			.runtime(rt_clone)
-			.storage_config(StorageConfig::LocalSQLite(tmp.to_str().unwrap().to_string()))
-			.log_file(tmp.join("orange.log"))
-			.chain_source(ChainSource::BitcoindRPC {
+	#[cfg(not(feature = "_cashu-tests"))]
+	let wallet: orange_sdk::Wallet = {
+		let dummy_wallet_config = DummyTrustedWalletExtraConfig {
+			uuid: test_id,
+			lsp: Arc::clone(&lsp),
+			bitcoind: Arc::clone(&bitcoind),
+			rt: Arc::clone(&rt),
+		};
+
+		let tmp = temp_dir().join(format!("orange-test-{test_id}/ldk-node"));
+		let cookie = bitcoind.params.get_cookie_values().unwrap().unwrap();
+
+		let rt_clone = Arc::clone(&rt);
+		let bitcoind_port = bitcoind.params.rpc_socket.port();
+		rt.block_on(async move {
+			WalletBuilder::new()
+				.runtime(rt_clone)
+				.storage_config(StorageConfig::LocalSQLite(tmp.to_str().unwrap().to_string()))
+				.log_file(tmp.join("orange.log"))
+				.chain_source(ChainSource::BitcoindRPC {
+					host: "127.0.0.1".to_string(),
+					port: bitcoind_port,
+					user: cookie.user,
+					password: cookie.password,
+				})
+				.lsp(lsp_node_id, lsp_listen, None)
+				.network(Network::Regtest)
+				.seed(Seed::Seed64(seed))
+				.build(ExtraConfig::Dummy(dummy_wallet_config))
+				.await
+				.unwrap()
+		})
+	};
+
+	#[cfg(feature = "_cashu-tests")]
+	{
+		let tmp = temp_dir().join(format!("orange-test-{test_id}/cashu-ldk-node"));
+		let cookie = bitcoind.params.get_cookie_values().unwrap().unwrap();
+		let bitcoind_port = bitcoind.params.rpc_socket.port();
+		let cdk_port = {
+			let t = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+			t.local_addr().unwrap().port()
+		};
+		let cdk_addr = SocketAddr::from_str(format!("127.0.0.1:{cdk_port}").as_str()).unwrap();
+		let cdk = cdk_ldk_node::CdkLdkNode::new(
+			Network::Regtest,
+			cdk_ldk_node::ChainSource::BitcoinRpc(BitcoinRpcConfig {
 				host: "127.0.0.1".to_string(),
 				port: bitcoind_port,
-				user: cookie.user,
-				password: cookie.password,
-			})
-			.lsp(lsp_node_id, lsp_listen, None)
-			.network(Network::Regtest)
-			.seed(Seed::Seed64(seed))
-			.build(ExtraConfig::Dummy(dummy_wallet_config))
-			.await
-			.unwrap()
-	});
+				user: cookie.user.clone(),
+				password: cookie.password.clone(),
+			}),
+			GossipSource::P2P,
+			tmp.to_str().unwrap().to_string(),
+			FeeReserve { min_fee_reserve: Default::default(), percent_fee_reserve: 0.0 },
+			vec![cdk_addr.into()],
+			Some(rt.clone()),
+		)
+		.unwrap();
+		let cdk = Arc::new(cdk);
 
+		let mint_addr = {
+			let t = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+			let port = t.local_addr().unwrap().port();
+			SocketAddr::from_str(format!("127.0.0.1:{port}").as_str()).unwrap()
+		};
+
+		let bitcoind_clone = Arc::clone(&bitcoind);
+		let lsp_listen_clone = lsp_listen.clone();
+		let mint = rt.block_on(async move {
+			// build mint
+			let mem_db = Arc::new(cdk_sqlite::mint::memory::empty().await.unwrap());
+			let mut mint_seed: [u8; 64] = [0; 64];
+			rand::thread_rng().fill_bytes(&mut mint_seed);
+			let mut builder = MintBuilder::new(mem_db.clone());
+
+			builder
+				.add_payment_processor(
+					orange_sdk::CurrencyUnit::Sat,
+					cdk::nuts::PaymentMethod::Bolt11,
+					MintMeltLimits::new(0, u64::MAX),
+					cdk.clone(),
+				)
+				.await
+				.unwrap();
+
+			builder
+				.add_payment_processor(
+					orange_sdk::CurrencyUnit::Sat,
+					cdk::nuts::PaymentMethod::Bolt12,
+					MintMeltLimits::new(0, u64::MAX),
+					cdk.clone(),
+				)
+				.await
+				.unwrap();
+
+			let mint = Arc::new(builder.build_with_seed(mem_db, &mint_seed).await.unwrap());
+
+			mint.start().await.unwrap();
+
+			let listener = tokio::net::TcpListener::bind(mint_addr).await.unwrap();
+
+			let v1_service = cdk_axum::create_mint_router(Arc::clone(&mint), true).await.unwrap();
+
+			let axum_result = axum::serve(listener, v1_service);
+
+			tokio::spawn(async move {
+				if let Err(e) = axum_result.await {
+					eprintln!("Error running mint axum server: {e}");
+				}
+			});
+
+			// open channel from cashu ldk node to lsp
+			let addr = cdk.node().onchain_payment().new_address().unwrap();
+			bitcoind_clone
+				.client
+				.send_to_address(&addr, bitcoin::Amount::from_btc(1.0).unwrap())
+				.unwrap();
+			generate_blocks(&bitcoind_clone, 6);
+			tokio::time::sleep(Duration::from_secs(5)).await; // wait for sync
+			cdk.node()
+				.open_channel(lsp_node_id, lsp_listen_clone, 10_000_000, Some(5_000_000_000), None)
+				.unwrap();
+			// wait for tx to broadcast
+			tokio::time::sleep(Duration::from_secs(1)).await;
+			generate_blocks(&bitcoind_clone, 10);
+
+			// wait for sync/channel ready
+			for _ in 0..10 {
+				if cdk.node().list_channels().first().is_some_and(|c| c.is_usable) {
+					break;
+				}
+				tokio::time::sleep(Duration::from_secs(1)).await;
+			}
+
+			mint
+		});
+
+		let rt_clone = Arc::clone(&rt);
+		let wallet = rt.block_on(async move {
+			let tmp = temp_dir().join(format!("orange-test-{test_id}/wallet"));
+			WalletBuilder::new()
+				.runtime(rt_clone)
+				.storage_config(StorageConfig::LocalSQLite(tmp.to_str().unwrap().to_string()))
+				.log_file(tmp.join("orange.log"))
+				.chain_source(ChainSource::BitcoindRPC {
+					host: "127.0.0.1".to_string(),
+					port: bitcoind_port,
+					user: cookie.user,
+					password: cookie.password,
+				})
+				.lsp(lsp_node_id, lsp_listen, None)
+				.network(Network::Regtest)
+				.seed(Seed::Seed64(seed))
+				.build(ExtraConfig::Cashu(orange_sdk::CashuConfig {
+					mint_url: format!("http://127.0.0.1:{}", mint_addr.port()),
+					unit: orange_sdk::CurrencyUnit::Sat,
+				}))
+				.await
+				.unwrap()
+		});
+
+		return TestParams { wallet, lsp, third_party, bitcoind, rt, _mint: mint };
+	};
+
+	#[cfg(not(feature = "_cashu-tests"))]
 	TestParams { wallet, lsp, third_party, bitcoind, rt }
 }
 
-pub async fn open_channel_from_lsp(wallet: &Wallet, payer: Arc<Node>) -> Amount {
+pub async fn open_channel_from_lsp(wallet: &orange_sdk::Wallet, payer: Arc<Node>) -> Amount {
 	let starting_bal = wallet.get_balance().await.unwrap();
 
 	// recv 2x the trusted balance limit to trigger a lightning channel

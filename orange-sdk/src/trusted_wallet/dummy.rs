@@ -1,7 +1,8 @@
 //! A dummy implementation of `TrustedWalletInterface` for testing purposes.
 
+use crate::EventQueue;
 use crate::bitcoin::hashes::Hash;
-use crate::store::TxStatus;
+use crate::store::{PaymentId, TxStatus};
 use crate::trusted_wallet::{Payment, TrustedError, TrustedWalletInterface};
 use bitcoin_payment_instructions::PaymentMethod;
 use bitcoin_payment_instructions::amount::Amount;
@@ -44,7 +45,9 @@ pub struct DummyTrustedWalletExtraConfig {
 
 impl DummyTrustedWallet {
 	/// Creates a new `DummyTrustedWallet` instance.
-	pub(crate) async fn new(uuid: Uuid, lsp: &Node, bitcoind: &Bitcoind, rt: Arc<Runtime>) -> Self {
+	pub(crate) async fn new(
+		uuid: Uuid, lsp: &Node, bitcoind: &Bitcoind, event_queue: Arc<EventQueue>, rt: Arc<Runtime>,
+	) -> Self {
 		let mut builder = ldk_node::Builder::new();
 		builder.set_network(Network::Regtest);
 		let mut seed: [u8; 64] = [0; 64];
@@ -105,7 +108,7 @@ impl DummyTrustedWallet {
 							bal.fetch_sub(payment.amount.milli_sats(), Ordering::SeqCst);
 						}
 					},
-					Event::PaymentReceived { payment_id, amount_msat, .. } => {
+					Event::PaymentReceived { payment_id, amount_msat, payment_hash, .. } => {
 						// convert id
 						let id = payment_id.unwrap().0;
 
@@ -128,6 +131,17 @@ impl DummyTrustedWallet {
 						};
 						payments.push(new);
 						bal.fetch_add(amount_msat, Ordering::SeqCst);
+
+						// Send a PaymentReceived event
+						event_queue
+							.add_event(crate::Event::PaymentReceived {
+								payment_id: PaymentId::Trusted(id),
+								payment_hash,
+								amount_msat,
+								custom_records: vec![],
+								lsp_fee_msats: None,
+							})
+							.unwrap();
 					},
 					Event::PaymentForwarded { .. } => {},
 					Event::PaymentClaimable { .. } => {},

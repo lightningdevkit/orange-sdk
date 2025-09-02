@@ -244,10 +244,21 @@ impl TrustedWalletInterface for Cashu {
 				},
 			};
 
-			// Execute the melt
-			let _melt_response = self.cashu_wallet.melt(&quote.id).await.map_err(|e| {
-				TrustedError::WalletOperationFailed(format!("Failed to execute melt: {e}"))
-			})?;
+			// Execute the melt in separate thread, do not block on it being successful/failed
+			let cashu_wallet = Arc::clone(&self.cashu_wallet);
+			let logger = Arc::clone(&self.logger);
+			let quote_id = quote.id.clone();
+			tokio::spawn(async move {
+				// todo react with events too
+				match cashu_wallet.melt(&quote_id).await {
+					Ok(_) => {
+						log_info!(logger, "Successfully sent for quote: {quote_id}");
+					},
+					Err(e) => {
+						log_error!(logger, "Failed to melt quote {quote_id}: {e}",);
+					},
+				}
+			});
 
 			// Convert quote ID to a 32-byte array for consistency
 			// We'll use the quote ID as the payment identifier

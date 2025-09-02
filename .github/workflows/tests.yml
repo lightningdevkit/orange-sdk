@@ -36,3 +36,6 @@ jobs:
 
       - name: Run tests
         run: cargo test --features _test-utils
+
+      - name: Run cashu tests
+        run: cargo test --features _cashu-tests

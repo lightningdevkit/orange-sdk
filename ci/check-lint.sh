@@ -4,7 +4,7 @@ set -x
 
 RUSTC_MINOR_VERSION=$(rustc --version | awk '{ split($2,a,"."); print a[2] }')
 
-cargo clippy -- -D warnings \
+cargo clippy --features _test-utils -- -D warnings \
 	`# We use this for sat groupings` \
 	-A clippy::inconsistent-digit-grouping \
 	`# Some stuff we do sometimes when its reasonable` \

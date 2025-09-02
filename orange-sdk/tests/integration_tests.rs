@@ -18,7 +18,7 @@ mod test_utils;
 
 #[test]
 fn test_node_start() {
-	let TestParams { wallet, lsp: _, bitcoind: _, third_party: _, rt } = build_test_nodes();
+	let TestParams { wallet, rt, .. } = build_test_nodes();
 
 	rt.block_on(async move {
 		let bal = wallet.get_balance().await.unwrap();
@@ -29,7 +29,7 @@ fn test_node_start() {
 
 #[test]
 fn test_receive_to_trusted() {
-	let TestParams { wallet, lsp: _, bitcoind: _, third_party, rt } = build_test_nodes();
+	let TestParams { wallet, third_party, rt, .. } = build_test_nodes();
 
 	rt.block_on(async move {
 		let starting_bal = wallet.get_balance().await.unwrap();
@@ -85,7 +85,7 @@ fn test_receive_to_trusted() {
 
 #[test]
 fn test_sweep_to_ln() {
-	let TestParams { wallet, lsp, bitcoind: _, third_party, rt } = build_test_nodes();
+	let TestParams { wallet, lsp, third_party, rt, .. } = build_test_nodes();
 
 	rt.block_on(async move {
 		let starting_bal = wallet.get_balance().await.unwrap();
@@ -111,6 +111,9 @@ fn test_sweep_to_ln() {
 		)
 		.await;
 
+		let event = wait_next_event(&wallet).await;
+		assert!(matches!(event, Event::PaymentReceived { .. }));
+
 		let intermediate_amt = wallet.get_balance().await.unwrap().available_balance();
 
 		// next receive the limit to trigger the rebalance
@@ -128,8 +131,15 @@ fn test_sweep_to_ln() {
 		)
 		.await;
 
+		// receive to trusted wallet
 		let event = wait_next_event(&wallet).await;
-		assert!(matches!(event, Event::RebalanceInitiated { .. }));
+		assert!(matches!(event, Event::PaymentReceived { .. }));
+
+		let event = wait_next_event(&wallet).await;
+		assert!(
+			matches!(event, Event::RebalanceInitiated { .. }),
+			"Expected RebalanceInitiated event but got {event:?}"
+		);
 
 		// wait for rebalance
 		test_utils::wait_for_condition(
@@ -149,6 +159,7 @@ fn test_sweep_to_ln() {
 			_ => panic!("Expected ChannelOpened event"),
 		}
 
+		// LDK node receives the rebalance payment, todo we should probably not output this event
 		let event = wait_next_event(&wallet).await;
 		assert!(matches!(event, Event::PaymentReceived { .. }));
 
@@ -167,7 +178,7 @@ fn test_sweep_to_ln() {
 
 #[test]
 fn test_receive_to_ln() {
-	let TestParams { wallet, lsp: _, bitcoind: _, third_party, rt } = build_test_nodes();
+	let TestParams { wallet, third_party, rt, .. } = build_test_nodes();
 
 	rt.block_on(async move {
 		let recv_amt = open_channel_from_lsp(&wallet, Arc::clone(&third_party)).await;
@@ -207,7 +218,7 @@ fn test_receive_to_ln() {
 
 #[test]
 fn test_receive_to_onchain() {
-	let TestParams { wallet, lsp, bitcoind, third_party, rt } = build_test_nodes();
+	let TestParams { wallet, lsp, bitcoind, third_party, rt, .. } = build_test_nodes();
 
 	rt.block_on(async move {
 		let starting_bal = wallet.get_balance().await.unwrap();
@@ -317,7 +328,7 @@ fn test_receive_to_onchain() {
 }
 
 fn run_test_pay_lightning_from_self_custody(amountless: bool) {
-	let TestParams { wallet, lsp: _, bitcoind, third_party, rt } = build_test_nodes();
+	let TestParams { wallet, bitcoind, third_party, rt, .. } = build_test_nodes();
 
 	rt.block_on(async move {
 		// get a channel so we can make a payment
@@ -398,7 +409,7 @@ fn test_pay_lightning_from_self_custody() {
 }
 
 fn run_test_pay_bolt12_from_self_custody(amountless: bool) {
-	let TestParams { wallet, lsp: _, bitcoind, third_party, rt } = build_test_nodes();
+	let TestParams { wallet, bitcoind, third_party, rt, .. } = build_test_nodes();
 
 	rt.block_on(async move {
 		// get a channel so we can make a payment
@@ -479,7 +490,7 @@ fn test_pay_bolt12_from_self_custody() {
 
 #[test]
 fn test_pay_onchain_from_self_custody() {
-	let TestParams { wallet, lsp: _, bitcoind, third_party, rt } = build_test_nodes();
+	let TestParams { wallet, bitcoind, third_party, rt, .. } = build_test_nodes();
 
 	rt.block_on(async move {
 		// disable rebalancing so we have on-chain funds
@@ -599,7 +610,7 @@ fn test_pay_onchain_from_self_custody() {
 
 #[test]
 fn test_force_close_handling() {
-	let TestParams { wallet, lsp, bitcoind, third_party, rt } = build_test_nodes();
+	let TestParams { wallet, lsp, bitcoind, third_party, rt, .. } = build_test_nodes();
 
 	rt.block_on(async move {
 		let starting_bal = wallet.get_balance().await.unwrap();
@@ -643,7 +654,7 @@ fn test_force_close_handling() {
 
 #[test]
 fn test_close_all_channels() {
-	let TestParams { wallet, lsp, bitcoind, third_party, rt } = build_test_nodes();
+	let TestParams { wallet, lsp, bitcoind, third_party, rt, .. } = build_test_nodes();
 
 	rt.block_on(async move {
 		let starting_bal = wallet.get_balance().await.unwrap();
@@ -679,7 +690,7 @@ fn test_close_all_channels() {
 
 #[test]
 fn test_threshold_boundary_trusted_balance_limit() {
-	let TestParams { wallet, lsp: _, bitcoind: _, third_party, rt } = build_test_nodes();
+	let TestParams { wallet, third_party, rt, .. } = build_test_nodes();
 
 	rt.block_on(async move {
 		let tunables = wallet.get_tunables();
@@ -698,6 +709,10 @@ fn test_threshold_boundary_trusted_balance_limit() {
 			},
 		)
 		.await;
+
+		// receive to trusted wallet
+		let event = wait_next_event(&wallet).await;
+		assert!(matches!(event, Event::PaymentReceived { .. }));
 
 		let txs = wallet.list_transactions().await.unwrap();
 		assert_eq!(txs.len(), 1);
@@ -730,13 +745,13 @@ fn test_threshold_boundary_trusted_balance_limit() {
 		.await;
 
 		// Should have received a ChannelOpened event
-		let event = test_utils::wait_next_event(&wallet).await;
+		let event = wait_next_event(&wallet).await;
 		assert!(
 			matches!(event, Event::ChannelOpened { .. }),
-			"Payment above limit should trigger channel opening"
+			"Payment above limit should trigger channel opening, got {event:?}"
 		);
 
-		let event = test_utils::wait_next_event(&wallet).await;
+		let event = wait_next_event(&wallet).await;
 		assert!(
 			matches!(event, Event::PaymentReceived { .. }),
 			"Should receive payment through Lightning"
@@ -754,7 +769,7 @@ fn test_threshold_boundary_trusted_balance_limit() {
 
 #[test]
 fn test_threshold_boundary_rebalance_min() {
-	let TestParams { wallet, lsp: _, bitcoind: _, third_party, rt } = build_test_nodes();
+	let TestParams { wallet, third_party, rt, .. } = build_test_nodes();
 
 	rt.block_on(async move {
 		let starting_bal = wallet.get_balance().await.unwrap();
@@ -843,7 +858,7 @@ fn test_threshold_boundary_rebalance_min() {
 
 #[test]
 fn test_threshold_boundary_onchain_receive_threshold() {
-	let TestParams { wallet, lsp: _, bitcoind: _, third_party: _, rt } = build_test_nodes();
+	let TestParams { wallet, rt, .. } = build_test_nodes();
 
 	rt.block_on(async move {
 		let tunables = wallet.get_tunables();
@@ -886,29 +901,32 @@ fn test_threshold_boundary_onchain_receive_threshold() {
 		);
 
 		// Test 4: Amountless receive behavior with enable_amountless_receive_on_chain
-		let uri = wallet.get_single_use_receive_uri(None).await.unwrap();
+		#[cfg(not(feature = "_cashu-tests"))] // Cashu does not support amountless invoices
+		{
+			let uri = wallet.get_single_use_receive_uri(None).await.unwrap();
 
-		if tunables.enable_amountless_receive_on_chain {
+			if tunables.enable_amountless_receive_on_chain {
+				assert!(
+					uri.address.is_some(),
+					"Amountless receive should include on-chain address when enabled"
+				);
+			} else {
+				assert!(
+					uri.address.is_none(),
+					"Amountless receive should not include on-chain address when disabled"
+				);
+			}
 			assert!(
-				uri.address.is_some(),
-				"Amountless receive should include on-chain address when enabled"
-			);
-		} else {
-			assert!(
-				uri.address.is_none(),
-				"Amountless receive should not include on-chain address when disabled"
+				uri.invoice.amount_milli_satoshis().is_none(),
+				"Amountless invoice should have no fixed amount"
 			);
 		}
-		assert!(
-			uri.invoice.amount_milli_satoshis().is_none(),
-			"Amountless invoice should have no fixed amount"
-		);
 	})
 }
 
 #[test]
 fn test_threshold_combinations_and_edge_cases() {
-	let TestParams { wallet, lsp: _, bitcoind: _, third_party: _, rt } = build_test_nodes();
+	let TestParams { wallet, rt, .. } = build_test_nodes();
 
 	rt.block_on(async move {
 		let tunables = wallet.get_tunables();
@@ -937,11 +955,14 @@ fn test_threshold_combinations_and_edge_cases() {
 		assert!(uri.address.is_some(), "Large amount should include on-chain address");
 
 		// Test zero amount (should be handled by amountless logic)
-		let uri = wallet.get_single_use_receive_uri(None).await.unwrap();
-		assert!(
-			uri.invoice.amount_milli_satoshis().is_none(),
-			"Amountless invoice should have no amount"
-		);
+		#[cfg(not(feature = "_cashu-tests"))] // Cashu does not support amountless invoices
+		{
+			let uri = wallet.get_single_use_receive_uri(None).await.unwrap();
+			assert!(
+				uri.invoice.amount_milli_satoshis().is_none(),
+				"Amountless invoice should have no amount"
+			);
+		}
 
 		// Verify the wallet can handle payments at multiple threshold boundaries
 		let test_amounts = [
@@ -968,7 +989,7 @@ fn test_threshold_combinations_and_edge_cases() {
 
 #[test]
 fn test_invalid_payment_instructions() {
-	let TestParams { wallet, lsp: _, bitcoind: _, third_party, rt } = build_test_nodes();
+	let TestParams { wallet, third_party, rt, .. } = build_test_nodes();
 
 	rt.block_on(async move {
 		// Test 1: Payment with insufficient balance
@@ -1032,7 +1053,7 @@ fn test_invalid_payment_instructions() {
 
 #[test]
 fn test_payment_with_expired_invoice() {
-	let TestParams { wallet, lsp: _, bitcoind: _, third_party, rt } = build_test_nodes();
+	let TestParams { wallet, third_party, rt, .. } = build_test_nodes();
 
 	rt.block_on(async move {
 		// Add some balance first so the payment can theoretically succeed if not expired
@@ -1066,7 +1087,7 @@ fn test_payment_with_expired_invoice() {
 
 #[test]
 fn test_payment_network_mismatch() {
-	let TestParams { wallet, lsp: _, bitcoind, third_party: _, rt } = build_test_nodes();
+	let TestParams { wallet, bitcoind, rt, .. } = build_test_nodes();
 
 	rt.block_on(async move {
 		// disable rebalancing so we have on-chain funds
@@ -1085,14 +1106,20 @@ fn test_payment_network_mismatch() {
 
 		// confirm tx
 		generate_blocks(&bitcoind, 6);
-		tokio::time::sleep(Duration::from_secs(5)).await;
+		test_utils::wait_for_condition(
+			Duration::from_secs(1),
+			10,
+			"wallet sync after on-chain receive",
+			|| async { wallet.get_balance().await.unwrap().pending_balance >= recv_amount },
+		)
+		.await;
 
 		// Test 1: Mainnet invoice on regtest wallet (if we can construct one)
 		// This is tricky to test in practice since we're on regtest, but we can test
 		// the validation logic with known invalid network addresses
 
 		// Test 2: Invalid network address format
-		let wrong_network = "tb1qd28npep0s8frcm3y7dxqajkcy2m40eysplyr9v"; // Valid testnet address
+		let wrong_network = "bc1q2xmz60tlma5mnn6xet9r8zyl8ca2fn9rarjtpz"; // Valid mainnet address
 		let result = wallet.parse_payment_instructions(wrong_network).await;
 		assert!(
 			matches!(result, Err(ParseError::WrongNetwork)),
@@ -1101,7 +1128,7 @@ fn test_payment_network_mismatch() {
 
 		// now force a correct parsing to ensure we fail when trying to pay
 		let instr =
-			PaymentInstructions::parse(wrong_network, Network::Testnet, &HTTPHrnResolver, true)
+			PaymentInstructions::parse(wrong_network, Network::Bitcoin, &HTTPHrnResolver, true)
 				.await
 				.unwrap();
 
@@ -1118,7 +1145,7 @@ fn test_payment_network_mismatch() {
 
 #[test]
 fn test_concurrent_payments() {
-	let TestParams { wallet, lsp: _, bitcoind, third_party, rt } = build_test_nodes();
+	let TestParams { wallet, bitcoind, third_party, rt, .. } = build_test_nodes();
 
 	rt.block_on(async move {
 		// First, build up sufficient balance for concurrent sending
@@ -1305,7 +1332,7 @@ fn test_concurrent_payments() {
 
 #[test]
 fn test_concurrent_receive_operations() {
-	let TestParams { wallet, lsp: _, bitcoind: _, third_party, rt } = build_test_nodes();
+	let TestParams { wallet, third_party, rt, .. } = build_test_nodes();
 
 	rt.block_on(async move {
 		let amount = Amount::from_sats(1000).unwrap();
@@ -1381,7 +1408,7 @@ fn test_concurrent_receive_operations() {
 
 #[test]
 fn test_balance_consistency_under_load() {
-	let TestParams { wallet, lsp: _, bitcoind: _, third_party, rt } = build_test_nodes();
+	let TestParams { wallet, third_party, rt, .. } = build_test_nodes();
 
 	rt.block_on(async move {
 		// Add some initial balance
@@ -1434,7 +1461,7 @@ fn test_balance_consistency_under_load() {
 
 #[test]
 fn test_invalid_tunables_relationships() {
-	let TestParams { wallet, lsp: _, bitcoind: _, third_party: _, rt } = build_test_nodes();
+	let TestParams { wallet, rt, .. } = build_test_nodes();
 
 	rt.block_on(async move {
 		let current_tunables = wallet.get_tunables();
@@ -1447,8 +1474,11 @@ fn test_invalid_tunables_relationships() {
 
 		// Test 2: Test edge case amounts with current tunables
 		// Zero amount (should work for URI generation but not payments)
-		let uri_result = wallet.get_single_use_receive_uri(None).await;
-		assert!(uri_result.is_ok(), "Should be able to generate amountless URI");
+		#[cfg(not(feature = "_cashu-tests"))] // Cashu does not support amountless invoices
+		{
+			let uri_result = wallet.get_single_use_receive_uri(None).await;
+			assert!(uri_result.is_ok(), "Should be able to generate amountless URI");
+		}
 
 		// Test 3: Very small amounts
 		let tiny_amount = Amount::from_sats(1).unwrap();
@@ -1522,7 +1552,7 @@ fn test_invalid_tunables_relationships() {
 
 #[test]
 fn test_extreme_amount_handling() {
-	let TestParams { wallet, lsp: _, bitcoind: _, third_party: _, rt } = build_test_nodes();
+	let TestParams { wallet, rt, .. } = build_test_nodes();
 
 	rt.block_on(async move {
 		// Test 1: Large but reasonable Bitcoin amount
@@ -1588,7 +1618,7 @@ fn test_extreme_amount_handling() {
 
 #[test]
 fn test_wallet_configuration_validation() {
-	let TestParams { wallet, lsp: _, bitcoind: _, third_party: _, rt } = build_test_nodes();
+	let TestParams { wallet, rt, .. } = build_test_nodes();
 
 	rt.block_on(async move {
 		// Test 1: Verify wallet is using expected network
@@ -1653,7 +1683,7 @@ fn test_wallet_configuration_validation() {
 
 #[test]
 fn test_edge_case_payment_instruction_parsing() {
-	let TestParams { wallet, lsp: _, bitcoind: _, third_party, rt } = build_test_nodes();
+	let TestParams { wallet, third_party, rt, .. } = build_test_nodes();
 
 	rt.block_on(async move {
 		// Test 1: Empty strings
@@ -1707,7 +1737,7 @@ fn test_edge_case_payment_instruction_parsing() {
 
 #[test]
 fn test_lsp_connectivity_fallback() {
-	let TestParams { wallet, lsp, bitcoind, third_party, rt } = build_test_nodes();
+	let TestParams { wallet, lsp, bitcoind, third_party, rt, .. } = build_test_nodes();
 
 	rt.block_on(async move {
 		// open a channel with the LSP
