@@ -156,6 +156,14 @@ impl DummyTrustedWallet {
 			}
 		});
 
+		// wait for ldk to be ready
+		for _ in 0..10 {
+			if ldk_node.status().is_listening {
+				break;
+			}
+			tokio::time::sleep(Duration::from_secs(1)).await;
+		}
+
 		// have LSP open channel to node
 		lsp.open_channel(ldk_node.node_id(), socket_addr, 1_000_000, Some(500_000_000), None)
 			.unwrap();
