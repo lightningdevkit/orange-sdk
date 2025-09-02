@@ -70,7 +70,14 @@ pub trait TrustedWalletInterface: Send + Sync + private::Sealed {
 		&self, method: PaymentMethod, amount: Amount,
 	) -> Pin<Box<dyn Future<Output = Result<Amount, TrustedError>> + Send + '_>>;
 
-	/// Pays to the given payment method with the specified amount.
+	/// Pays to the given payment method with the specified amount. This should not await
+	/// the result of the payment, it should only initiate it and return the payment ID.
+	///
+	/// This should later emit a [`PaymentSuccessful`] or [`PaymentFailed`] event
+	/// when the payment is completed or failed.
+	///
+	/// [`PaymentSuccessful`]: `crate::event::Event::PaymentSuccessful`
+	/// [`PaymentFailed`]: `crate::event::Event::PaymentFailed`
 	fn pay(
 		&self, method: PaymentMethod, amount: Amount,
 	) -> Pin<Box<dyn Future<Output = Result<[u8; 32], TrustedError>> + Send + '_>>;

@@ -527,7 +527,14 @@ impl Wallet {
 			)),
 			#[cfg(feature = "_test-utils")]
 			ExtraConfig::Dummy(cfg) => Arc::new(Box::new(
-				DummyTrustedWallet::new(cfg.uuid, &cfg.lsp, &cfg.bitcoind, cfg.rt.clone()).await,
+				DummyTrustedWallet::new(
+					cfg.uuid,
+					&cfg.lsp,
+					&cfg.bitcoind,
+					Arc::clone(&event_queue),
+					Arc::clone(&runtime),
+				)
+				.await,
 			)),
 		};
 
