@@ -1,5 +1,4 @@
 //! An implementation of `TrustedWalletInterface` using the Spark SDK.
-use crate::bitcoin::consensus::encode::deserialize_hex;
 use crate::bitcoin::hex::FromHex;
 use crate::bitcoin::{Txid, io};
 use crate::logging::Logger;
@@ -21,8 +20,8 @@ use bitcoin_payment_instructions::PaymentMethod;
 use bitcoin_payment_instructions::amount::Amount;
 
 use spark_wallet::{
-	DefaultSigner, Order, PagingFilter, PayLightningInvoiceResult, Signer, SparkWallet,
-	SparkWalletConfig, SparkWalletError, SspUserRequest, TransferStatus, WalletEvent,
+	DefaultSigner, LightningSendStatus, Order, PagingFilter, PayLightningInvoiceResult, Signer,
+	SparkWallet, SparkWalletConfig, SparkWalletError, SspUserRequest, TransferStatus, WalletEvent,
 	WalletTransfer,
 };
 
@@ -40,7 +39,9 @@ use uuid::Uuid;
 pub(crate) struct Spark {
 	spark_wallet: Arc<SparkWallet<DefaultSigner>>,
 	store: Arc<dyn KVStore + Send + Sync>,
+	event_queue: Arc<EventQueue>,
 	shutdown_sender: watch::Sender<()>,
+	shutdown_receiver: watch::Receiver<()>,
 	logger: Arc<Logger>,
 }
 
@@ -190,7 +191,17 @@ impl TrustedWalletInterface for Spark {
 							let uuid = Uuid::from_str(id).map_err(|_| {
 								TrustedError::Other(format!("Failed to parse payment id: {id}"))
 							})?;
-							Ok(convert_from_transfer_id(uuid.into_bytes()))
+
+							let id = convert_from_transfer_id(uuid.into_bytes());
+
+							// Poll the payment status in the background
+							self.poll_lightning_payment(
+								pay.id,
+								id,
+								PaymentHash(invoice.payment_hash().to_byte_array()),
+							);
+
+							Ok(id)
 						} else {
 							log_error!(self.logger, "Invalid payment id format: {}", pay.id);
 							Err(TrustedError::Other(format!(
@@ -200,7 +211,18 @@ impl TrustedWalletInterface for Spark {
 						}
 					},
 					PayLightningInvoiceResult::Transfer(transfer) => {
-						Ok(convert_from_transfer_id(transfer.id.to_bytes()))
+						let id = convert_from_transfer_id(transfer.id.to_bytes());
+						// transfers just work, no need to poll
+						self.event_queue
+							.add_event(Event::PaymentSuccessful {
+								payment_id: PaymentId::Trusted(id),
+								payment_hash: PaymentHash(invoice.payment_hash().to_byte_array()),
+								payment_preimage: PaymentPreimage([0; 32]), // we don't get the preimage here
+								fee_paid_msat: Some(0),
+							})
+							.unwrap();
+
+						Ok(id)
 					},
 				}
 			} else {
@@ -261,15 +283,17 @@ impl Spark {
 				.map_err(|e| InitFailure::TrustedFailure(e.into()))?,
 		);
 
-		let (shutdown_sender, mut shutdown_receiver) = watch::channel::<()>(());
+		let (shutdown_sender, shutdown_receiver) = watch::channel::<()>(());
 		let mut events = spark_wallet.subscribe_events();
 		let l = Arc::clone(&logger);
 		let w = Arc::clone(&spark_wallet);
 		let s = Arc::clone(&store);
+		let eq = Arc::clone(&event_queue);
+		let mut shutdown_recv = shutdown_receiver.clone();
 		tokio::spawn(async move {
 			loop {
 				tokio::select! {
-					_ = shutdown_receiver.changed() => {
+					_ = shutdown_recv.changed() => {
 						log_info!(l, "Deposit tracking loop shutdown signal received");
 						return;
 					}
@@ -284,24 +308,23 @@ impl Spark {
 												.into_iter()
 												.find(|t| t.leaves.iter().any(|l| l.leaf.id == node_id))
 											{
-												event_queue
-													.add_event(Event::OnchainPaymentReceived {
-														payment_id: PaymentId::Trusted(
-															convert_from_transfer_id(transfer.id.to_bytes()),
-														),
-														// todo this is kinda hacky, maybe we should make this optional
-														txid: transfer
-															.leaves
-															.iter()
-															.find(|t| t.leaf.id == node_id)
-															.map(|t| t.leaf
-															.node_tx
-															.compute_txid())
-															.unwrap_or(Txid::all_zeros()),
-														amount_sat: transfer.total_value_sat,
-														status: ConfirmationStatus::Unconfirmed, // fixme dont have block height
-													})
-													.unwrap();
+												eq.add_event(Event::OnchainPaymentReceived {
+													payment_id: PaymentId::Trusted(
+														convert_from_transfer_id(transfer.id.to_bytes()),
+													),
+													// todo this is kinda hacky, maybe we should make this optional
+													txid: transfer
+														.leaves
+														.iter()
+														.find(|t| t.leaf.id == node_id)
+														.map(|t| t.leaf
+														.node_tx
+														.compute_txid())
+														.unwrap_or(Txid::all_zeros()),
+													amount_sat: transfer.total_value_sat,
+													status: ConfirmationStatus::Unconfirmed, // fixme dont have block height
+												})
+												.unwrap();
 											}
 										}
 									},
@@ -343,15 +366,14 @@ impl Spark {
 											},
 											Some(SspUserRequest::LightningReceiveRequest(req)) => {
 												if let Ok(hash) = FromHex::from_hex(&req.invoice.payment_hash) {
-													event_queue
-														.add_event(Event::PaymentReceived {
-															payment_id: PaymentId::Trusted(convert_from_transfer_id(transfer.id.to_bytes())),
-															payment_hash: PaymentHash(hash),
-															amount_msat: transfer.total_value_sat * 1_000, // convert to msats
-															custom_records: vec![],
-															lsp_fee_msats: None,
-														})
-														.unwrap();
+													eq.add_event(Event::PaymentReceived {
+														payment_id: PaymentId::Trusted(convert_from_transfer_id(transfer.id.to_bytes())),
+														payment_hash: PaymentHash(hash),
+														amount_msat: transfer.total_value_sat * 1_000, // convert to msats
+														custom_records: vec![],
+														lsp_fee_msats: None,
+													})
+													.unwrap();
 												}
 											},
 											Some(req) => {
@@ -370,7 +392,7 @@ impl Spark {
 			}
 		});
 
-		Ok(Spark { spark_wallet, store, shutdown_sender, logger })
+		Ok(Spark { spark_wallet, store, event_queue, shutdown_sender, shutdown_receiver, logger })
 	}
 
 	/// Synchronizes payments from transfers to persistent storage
@@ -462,6 +484,69 @@ impl Spark {
 
 		Ok(())
 	}
+
+	/// Pools the lightning payment until it is in completed state.
+	fn poll_lightning_payment(
+		&self, spark_id: String, payment_id: [u8; 32], payment_hash: PaymentHash,
+	) {
+		const MAX_POLL_ATTEMPTS: u64 = 10;
+		log_info!(self.logger, "Polling lightning send payment {spark_id}");
+
+		let mut shutdown = self.shutdown_receiver.clone();
+		let spark_wallet = Arc::clone(&self.spark_wallet);
+		let event_queue = Arc::clone(&self.event_queue);
+		let logger = Arc::clone(&self.logger);
+		tokio::spawn(async move {
+			for i in 0..MAX_POLL_ATTEMPTS {
+				log_info!(logger, "Polling lightning send payment {spark_id} attempt {i}",);
+				tokio::select! {
+					_ = shutdown.changed() => {
+						log_info!(logger, "Shutdown signal received");
+						return;
+					},
+					p = spark_wallet.fetch_lightning_send_payment(&spark_id) => {
+						if let Ok(Some(p)) = p {
+							let status: TxStatus = p.status.into();
+							match status {
+								TxStatus::Pending => {} // do nothing / wait
+								TxStatus::Completed => {
+									// wait for preimage
+									if p.payment_preimage.is_some() {
+										log_info!(logger, "Polling payment preimage found");
+										let preimage: [u8; 32] = FromHex::from_hex(&p.payment_preimage.unwrap()).unwrap();
+										event_queue
+											.add_event(Event::PaymentSuccessful {
+												payment_id: PaymentId::Trusted(payment_id),
+												payment_hash,
+												payment_preimage: PaymentPreimage(preimage),
+												fee_paid_msat: Some(p.fee_sat * 1_000), // convert to msats
+											})
+										.unwrap();
+										return;
+									}
+								}
+								TxStatus::Failed => {
+									log_info!(logger, "Polling payment failed");
+									event_queue
+										.add_event(Event::PaymentFailed {
+											payment_id: PaymentId::Trusted(payment_id),
+											payment_hash: Some(payment_hash),
+											reason: None,
+										})
+										.unwrap();
+									return;
+								}
+							}
+						}
+						let sleep_time = if i < 5 { Duration::from_secs(1) } else { Duration::from_secs(i) };
+						tokio::time::sleep(sleep_time).await;
+					}
+				}
+			}
+			// todo what if we never get a final state?
+			log_info!(logger, "Polling payment timed out");
+		});
+	}
 }
 
 impl TryFrom<&WalletTransfer> for StoreTransaction {
@@ -523,7 +608,7 @@ impl TryFrom<&SspUserRequest> for PaymentType {
 					.lightning_send_payment_preimage
 					.as_deref()
 					.map(|t| {
-						deserialize_hex(t).map_err(|e| {
+						FromHex::from_hex(t).map_err(|e| {
 							SparkWalletError::Generic(format!(
 								"Invalid LightningSendRequest preimage: {e}"
 							))
@@ -557,6 +642,26 @@ impl From<TransferStatus> for TxStatus {
 			TransferStatus::Expired
 			| TransferStatus::Returned
 			| TransferStatus::ReceiverRefundSigned => TxStatus::Failed,
+		}
+	}
+}
+
+impl From<LightningSendStatus> for TxStatus {
+	fn from(o: LightningSendStatus) -> TxStatus {
+		match o {
+			LightningSendStatus::LightningPaymentSucceeded => TxStatus::Completed,
+			LightningSendStatus::TransferFailed
+			| LightningSendStatus::LightningPaymentFailed
+			| LightningSendStatus::UserSwapReturnFailed
+			| LightningSendStatus::PreimageProvidingFailed => TxStatus::Failed,
+			LightningSendStatus::Unknown
+			| LightningSendStatus::UserSwapReturned
+			| LightningSendStatus::PendingUserSwapReturn
+			| LightningSendStatus::TransferCompleted
+			| LightningSendStatus::Created
+			| LightningSendStatus::RequestValidated
+			| LightningSendStatus::LightningPaymentInitiated
+			| LightningSendStatus::PreimageProvided => TxStatus::Pending,
 		}
 	}
 }
