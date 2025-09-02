@@ -84,7 +84,12 @@ impl DummyTrustedWallet {
 			loop {
 				let event = events_ref.next_event_async().await;
 				match event {
-					Event::PaymentSuccessful { payment_id, fee_paid_msat, .. } => {
+					Event::PaymentSuccessful {
+						payment_id,
+						fee_paid_msat,
+						payment_hash,
+						payment_preimage,
+					} => {
 						// convert id
 						let id = payment_id.unwrap().0;
 
@@ -96,17 +101,37 @@ impl DummyTrustedWallet {
 								payment.fee = Amount::from_milli_sats(fee).expect("valid fee")
 							}
 						}
+
+						// Send a PaymentSuccessful event
+						event_queue
+							.add_event(crate::Event::PaymentSuccessful {
+								payment_id: PaymentId::Trusted(id),
+								payment_hash,
+								payment_preimage: payment_preimage.unwrap(), // safe
+								fee_paid_msat,
+							})
+							.unwrap();
 					},
-					Event::PaymentFailed { payment_id, .. } => {
+					Event::PaymentFailed { payment_id, payment_hash, reason } => {
 						// convert id
 						let id = payment_id.unwrap().0;
 
 						let mut payments = pays.write().unwrap();
 						let item = payments.iter().cloned().enumerate().find(|(_, p)| p.id == id);
 						if let Some((idx, payment)) = item {
+							// remove from list and refund balance
 							payments.remove(idx);
-							bal.fetch_sub(payment.amount.milli_sats(), Ordering::SeqCst);
+							bal.fetch_add(payment.amount.milli_sats(), Ordering::SeqCst);
 						}
+
+						// Send a PaymentFailed event
+						event_queue
+							.add_event(crate::Event::PaymentFailed {
+								payment_id: PaymentId::Trusted(id),
+								payment_hash,
+								reason,
+							})
+							.unwrap();
 					},
 					Event::PaymentReceived { payment_id, amount_msat, payment_hash, .. } => {
 						// convert id
