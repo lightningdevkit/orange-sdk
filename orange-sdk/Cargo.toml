@@ -17,7 +17,7 @@ bitcoin-payment-instructions = { version = "0.4.0", features = ["http"] }
 chrono = { version = "0.4", default-features = false }
 rand = { version = "0.8.5", optional = true }
 reqwest = { version = "0.12.23", default-features = false, features = ["rustls-tls"] }
-spark-wallet = { path = "../../rust-spark/crates/spark-wallet", optional = true }
+spark-wallet = { git = "https://github.com/breez/spark-sdk.git", rev = "5bfde1b207849db2ae02f57714a80efb3f04e0d2", optional = true }
 tokio = { version = "1.0", default-features = false, features = ["rt-multi-thread", "sync"] }
 uuid = { version = "1.0", default-features = false, optional = true }
 cdk = { version = "0.12.0", default-features = false, features = ["wallet"], optional = true }
