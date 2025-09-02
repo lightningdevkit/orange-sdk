@@ -326,7 +326,18 @@ impl Spark {
 											log_info!(l, "Payments synced to storage");
 										}
 
-										match transfer.user_request {
+										// todo: SSP should really include the user request in the event
+										// but for now we have to fetch it ourselves if it's not present
+										let user_request = match transfer.user_request.clone() {
+											Some(req) => Some(req),
+											None => {
+												let transfers = w.list_transfers(None).await.unwrap_or_default();
+												transfers.into_iter().find(|t| t.id == transfer.id)
+												.and_then(|t| t.user_request)
+											}
+										};
+
+										match user_request {
 											None => {
 												log_debug!(l, "Transfer claimed without user request: {transfer:?}");
 											},
