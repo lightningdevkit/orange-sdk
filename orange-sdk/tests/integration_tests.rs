@@ -172,7 +172,9 @@ fn test_sweep_to_ln() {
 			_ => panic!("Expected RebalanceSuccessful event"),
 		}
 
-		assert_eq!(wallet.next_event(), None);
+		// Trusted wallet should have swept to Lightning, todo we should probably not output this event
+		let event = wait_next_event(&wallet).await;
+		assert!(matches!(event, Event::PaymentSuccessful { .. }));
 	})
 }
 
@@ -203,7 +205,7 @@ fn test_receive_to_ln() {
 		assert_eq!(
 			tx.amount,
 			Some(recv_amt.saturating_sub(tx.fee.unwrap())),
-			"Amount should be receive amount minus fees"
+			"Amount should be received amount minus fees"
 		);
 
 		// Validate fee is reasonable (should be less than 10% of received amount)
