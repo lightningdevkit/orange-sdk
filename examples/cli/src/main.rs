@@ -133,7 +133,7 @@ impl WalletState {
 
 		println!("{} Initializing wallet...", "⚡".bright_yellow());
 
-		match Wallet::new(runtime.clone(), config).await {
+		match Wallet::new_with_runtime(runtime.clone(), config).await {
 			Ok(wallet) => {
 				println!("{} Wallet initialized successfully!", "✅".bright_green());
 				println!("Network: {}", NETWORK.to_string().bright_cyan());

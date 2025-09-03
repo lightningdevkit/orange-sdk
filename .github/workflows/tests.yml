@@ -41,6 +41,9 @@ jobs:
       - name: Check clippy
         run: ./ci/check-lint.sh
 
+      - name: Check examples
+        run: cargo check -p orange-cli
+
       - name: Run tests
         run: cargo test --features _test-utils
 
