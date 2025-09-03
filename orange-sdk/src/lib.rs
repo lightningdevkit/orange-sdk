@@ -50,7 +50,6 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
-pub mod builder;
 mod event;
 mod lightning_wallet;
 pub(crate) mod logging;
@@ -65,7 +64,6 @@ use trusted_wallet::TrustedError;
 #[cfg(feature = "cashu")]
 pub use crate::trusted_wallet::cashu::CashuConfig;
 pub use bitcoin_payment_instructions;
-pub use builder::{BuilderError, WalletBuilder};
 #[cfg(feature = "cashu")]
 pub use cdk::nuts::nut00::CurrencyUnit;
 pub use event::{Event, EventQueue};
@@ -386,8 +384,6 @@ impl PaymentInfo {
 /// Represents possible failures during wallet initialization.
 #[derive(Debug)]
 pub enum InitFailure {
-	/// Failure to build the wallet using the builder pattern.
-	BuildError(BuilderError),
 	/// I/O error during initialization.
 	IoError(io::Error),
 	/// Failure to build the LDK node.
@@ -482,12 +478,23 @@ impl fmt::Display for SingleUseReceiveUri {
 }
 
 impl Wallet {
-	/// Constructs a new Wallet.
+	/// Constructs a new Wallet
+	pub async fn new(config: WalletConfig) -> Result<Wallet, InitFailure> {
+		let rt = tokio::runtime::Builder::new_multi_thread()
+			.enable_all()
+			.build()
+			.map_err(|e| InitFailure::IoError(e.into()))?;
+
+		Self::new_with_runtime(Arc::new(rt), config).await
+	}
+	/// Constructs a new Wallet with a runtime.
 	///
 	/// `runtime` must be a reference to the running `tokio` runtime which we are currently
 	/// operating in.
 	// TODO: WOW that is a terrible API lol
-	pub async fn new(runtime: Arc<Runtime>, config: WalletConfig) -> Result<Wallet, InitFailure> {
+	pub async fn new_with_runtime(
+		runtime: Arc<Runtime>, config: WalletConfig,
+	) -> Result<Wallet, InitFailure> {
 		let tunables = config.tunables;
 		let network = config.network;
 		let logger = Arc::new(Logger::new(&config.log_file).expect("Failed to open log file"));
