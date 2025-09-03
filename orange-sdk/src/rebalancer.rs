@@ -283,6 +283,11 @@ impl graduated_rebalancer::EventHandler for OrangeRebalanceEventHandler {
 				trusted_rebalance_payment_id,
 				amount_msat,
 			} => {
+				let metadata = TxMetadata {
+					ty: TxType::PendingRebalance {},
+					time: SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap(),
+				};
+				self.tx_metadata.insert(PaymentId::Trusted(trusted_rebalance_payment_id), metadata);
 				if let Err(e) = self.event_queue.add_event(Event::RebalanceInitiated {
 					trigger_payment_id: PaymentId::Trusted(trigger_id),
 					trusted_rebalance_payment_id,
@@ -310,7 +315,7 @@ impl graduated_rebalancer::EventHandler for OrangeRebalanceEventHandler {
 					},
 					time: SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap(),
 				};
-				self.tx_metadata.insert(PaymentId::Trusted(rebalance_id), metadata);
+				self.tx_metadata.upsert(PaymentId::Trusted(rebalance_id), metadata);
 				self.tx_metadata.insert(PaymentId::Lightning(lightning_id), metadata);
 
 				if let Err(e) = self.event_queue.add_event(Event::RebalanceSuccessful {

@@ -509,6 +509,8 @@ impl Wallet {
 
 		let event_queue = Arc::new(EventQueue::new(Arc::clone(&store), Arc::clone(&logger)));
 
+		let tx_metadata = TxMetadataStore::new(Arc::clone(&store));
+
 		let trusted: Arc<Box<DynTrustedWalletInterface>> = match &config.extra_config {
 			#[cfg(feature = "spark")]
 			ExtraConfig::Spark(sp) => Arc::new(Box::new(
@@ -517,6 +519,7 @@ impl Wallet {
 					sp.clone(),
 					Arc::clone(&store),
 					Arc::clone(&event_queue),
+					tx_metadata.clone(),
 					Arc::clone(&logger),
 				)
 				.await?,
@@ -528,6 +531,7 @@ impl Wallet {
 					cashu.clone(),
 					Arc::clone(&store),
 					Arc::clone(&event_queue),
+					tx_metadata.clone(),
 					Arc::clone(&logger),
 				)
 				.await?,
@@ -538,6 +542,7 @@ impl Wallet {
 					cfg.uuid,
 					&cfg.lsp,
 					&cfg.bitcoind,
+					tx_metadata.clone(),
 					Arc::clone(&event_queue),
 					Arc::clone(&runtime),
 				)
@@ -555,8 +560,6 @@ impl Wallet {
 			)
 			.await?,
 		);
-
-		let tx_metadata = TxMetadataStore::new(Arc::clone(&store));
 
 		let wt = Arc::new(WalletTrusted(Arc::clone(&trusted)));
 
@@ -702,6 +705,10 @@ impl Wallet {
 							time_since_epoch: tx_metadata.time,
 						});
 					},
+					TxType::PendingRebalance { .. } => {
+						// Pending rebalances are not shown in the transaction list.
+						continue;
+					},
 				}
 			} else {
 				debug_assert!(
@@ -807,6 +814,10 @@ impl Wallet {
 						payment_type: (&payment).into(),
 						time_since_epoch: tx_metadata.time,
 					}),
+					TxType::PendingRebalance { .. } => {
+						// Pending rebalances are not shown in the transaction list.
+						continue;
+					},
 				}
 			} else {
 				debug_assert_ne!(

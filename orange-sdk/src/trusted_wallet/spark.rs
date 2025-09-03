@@ -2,7 +2,7 @@
 use crate::bitcoin::hex::FromHex;
 use crate::bitcoin::{Txid, io};
 use crate::logging::Logger;
-use crate::store::{PaymentId, StoreTransaction, TxStatus};
+use crate::store::{PaymentId, StoreTransaction, TxMetadataStore, TxStatus};
 use crate::trusted_wallet::{Payment, TrustedError, TrustedWalletInterface};
 use crate::{Event, EventQueue, InitFailure, PaymentType, Seed, WalletConfig};
 
@@ -40,6 +40,7 @@ pub(crate) struct Spark {
 	spark_wallet: Arc<SparkWallet<DefaultSigner>>,
 	store: Arc<dyn KVStore + Send + Sync>,
 	event_queue: Arc<EventQueue>,
+	tx_metadata: TxMetadataStore,
 	shutdown_sender: watch::Sender<()>,
 	shutdown_receiver: watch::Receiver<()>,
 	logger: Arc<Logger>,
@@ -194,12 +195,22 @@ impl TrustedWalletInterface for Spark {
 
 							let id = convert_from_transfer_id(uuid.into_bytes());
 
-							// Poll the payment status in the background
-							self.poll_lightning_payment(
-								pay.id,
-								id,
-								PaymentHash(invoice.payment_hash().to_byte_array()),
-							);
+							let payment_id = PaymentId::Trusted(id);
+							let is_rebalance = {
+								let map = self.tx_metadata.read();
+								map.get(&payment_id).is_some_and(|m| m.ty.is_rebalance())
+							};
+
+							// Poll the payment status in the background if it's not a rebalance
+							// as rebalances are internal and we don't need to notify the user
+							// about their status.
+							if !is_rebalance {
+								self.poll_lightning_payment(
+									pay.id,
+									id,
+									PaymentHash(invoice.payment_hash().to_byte_array()),
+								);
+							}
 
 							Ok(id)
 						} else {
@@ -212,6 +223,7 @@ impl TrustedWalletInterface for Spark {
 					},
 					PayLightningInvoiceResult::Transfer(transfer) => {
 						let id = convert_from_transfer_id(transfer.id.to_bytes());
+						// transfers will never be used for rebalances, so no need to check
 						// transfers just work, no need to poll
 						self.event_queue
 							.add_event(Event::PaymentSuccessful {
@@ -250,7 +262,8 @@ impl Spark {
 	/// Initialize a new Spark wallet instance with the given configuration.
 	pub(crate) async fn init(
 		config: &WalletConfig, spark_config: SparkWalletConfig,
-		store: Arc<dyn KVStore + Sync + Send>, event_queue: Arc<EventQueue>, logger: Arc<Logger>,
+		store: Arc<dyn KVStore + Sync + Send>, event_queue: Arc<EventQueue>,
+		tx_metadata: TxMetadataStore, logger: Arc<Logger>,
 	) -> Result<Self, InitFailure> {
 		if config.network != spark_config.network.into() {
 			Err(TrustedError::InvalidNetwork)?
@@ -381,7 +394,15 @@ impl Spark {
 			}
 		});
 
-		Ok(Spark { spark_wallet, store, event_queue, shutdown_sender, shutdown_receiver, logger })
+		Ok(Spark {
+			spark_wallet,
+			store,
+			event_queue,
+			tx_metadata,
+			shutdown_sender,
+			shutdown_receiver,
+			logger,
+		})
 	}
 
 	/// Synchronizes payments from transfers to persistent storage

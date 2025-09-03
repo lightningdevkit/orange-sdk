@@ -2,7 +2,7 @@
 
 use crate::EventQueue;
 use crate::bitcoin::hashes::Hash;
-use crate::store::{PaymentId, TxStatus};
+use crate::store::{PaymentId, TxMetadataStore, TxStatus};
 use crate::trusted_wallet::{Payment, TrustedError, TrustedWalletInterface};
 use bitcoin_payment_instructions::PaymentMethod;
 use bitcoin_payment_instructions::amount::Amount;
@@ -46,7 +46,8 @@ pub struct DummyTrustedWalletExtraConfig {
 impl DummyTrustedWallet {
 	/// Creates a new `DummyTrustedWallet` instance.
 	pub(crate) async fn new(
-		uuid: Uuid, lsp: &Node, bitcoind: &Bitcoind, event_queue: Arc<EventQueue>, rt: Arc<Runtime>,
+		uuid: Uuid, lsp: &Node, bitcoind: &Bitcoind, tx_metadata: TxMetadataStore,
+		event_queue: Arc<EventQueue>, rt: Arc<Runtime>,
 	) -> Self {
 		let mut builder = ldk_node::Builder::new();
 		builder.set_network(Network::Regtest);
@@ -102,15 +103,23 @@ impl DummyTrustedWallet {
 							}
 						}
 
-						// Send a PaymentSuccessful event
-						event_queue
-							.add_event(crate::Event::PaymentSuccessful {
-								payment_id: PaymentId::Trusted(id),
-								payment_hash,
-								payment_preimage: payment_preimage.unwrap(), // safe
-								fee_paid_msat,
-							})
-							.unwrap();
+						let payment_id = PaymentId::Trusted(id);
+						let is_rebalance = {
+							let map = tx_metadata.read();
+							map.get(&payment_id).is_some_and(|m| m.ty.is_rebalance())
+						};
+
+						// Send a PaymentSuccessful event if not a rebalance
+						if !is_rebalance {
+							event_queue
+								.add_event(crate::Event::PaymentSuccessful {
+									payment_id,
+									payment_hash,
+									payment_preimage: payment_preimage.unwrap(), // safe
+									fee_paid_msat,
+								})
+								.unwrap();
+						}
 					},
 					Event::PaymentFailed { payment_id, payment_hash, reason } => {
 						// convert id
@@ -124,14 +133,22 @@ impl DummyTrustedWallet {
 							bal.fetch_add(payment.amount.milli_sats(), Ordering::SeqCst);
 						}
 
-						// Send a PaymentFailed event
-						event_queue
-							.add_event(crate::Event::PaymentFailed {
-								payment_id: PaymentId::Trusted(id),
-								payment_hash,
-								reason,
-							})
-							.unwrap();
+						let payment_id = PaymentId::Trusted(id);
+						let is_rebalance = {
+							let map = tx_metadata.read();
+							map.get(&payment_id).is_some_and(|m| m.ty.is_rebalance())
+						};
+
+						// Send a PaymentFailed event if not a rebalance
+						if !is_rebalance {
+							event_queue
+								.add_event(crate::Event::PaymentFailed {
+									payment_id,
+									payment_hash,
+									reason,
+								})
+								.unwrap();
+						}
 					},
 					Event::PaymentReceived { payment_id, amount_msat, payment_hash, .. } => {
 						// convert id

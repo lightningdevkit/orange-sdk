@@ -1,7 +1,7 @@
 //! An implementation of `TrustedWalletInterface` using the Cashu (CDK) SDK.
 
 use crate::logging::Logger;
-use crate::store::{PaymentId, TxStatus};
+use crate::store::{PaymentId, TxMetadataStore, TxStatus};
 use crate::trusted_wallet::{Payment, TrustedError, TrustedWalletInterface};
 use crate::{Event, EventQueue, InitFailure, Seed, WalletConfig};
 
@@ -57,6 +57,7 @@ pub struct Cashu {
 	supports_bolt12: bool,
 	mint_quote_sender: mpsc::Sender<MintQuote>,
 	event_queue: Arc<EventQueue>,
+	tx_metadata: TxMetadataStore,
 }
 
 impl TrustedWalletInterface for Cashu {
@@ -257,14 +258,23 @@ impl TrustedWalletInterface for Cashu {
 			let cashu_wallet = Arc::clone(&self.cashu_wallet);
 			let logger = Arc::clone(&self.logger);
 			let event_queue = Arc::clone(&self.event_queue);
+			let tx_metadata = self.tx_metadata.clone();
 			let quote_id = quote.id.clone();
 			tokio::spawn(async move {
-				// todo react with events too
 				match cashu_wallet.melt(&quote_id).await {
 					Ok(res) => {
 						match res.state {
 							MeltQuoteState::Paid => {
 								log_info!(logger, "Successfully sent for quote: {quote_id}");
+
+								let payment_id = PaymentId::Trusted(payment_id);
+								let is_rebalance = {
+									let map = tx_metadata.read();
+									map.get(&payment_id).is_some_and(|m| m.ty.is_rebalance())
+								};
+								if is_rebalance {
+									return;
+								}
 
 								let preimage: Option<PaymentPreimage> = match &res.preimage {
 									Some(str) => match FromHex::from_hex(str) {
@@ -312,7 +322,7 @@ impl TrustedWalletInterface for Cashu {
 
 								let fee_paid_sat: u64 = res.fee_paid.into();
 								let _ = event_queue.add_event(Event::PaymentSuccessful {
-									payment_id: PaymentId::Trusted(payment_id),
+									payment_id,
 									payment_hash: hash,
 									payment_preimage: preimage
 										.unwrap_or(PaymentPreimage([0u8; 32])),
@@ -321,11 +331,19 @@ impl TrustedWalletInterface for Cashu {
 							},
 							MeltQuoteState::Failed => {
 								log_error!(logger, "Melt failed for quote: {quote_id}");
-								let _ = event_queue.add_event(Event::PaymentFailed {
-									payment_id: PaymentId::Trusted(payment_id),
-									payment_hash,
-									reason: None,
-								});
+								let payment_id = PaymentId::Trusted(payment_id);
+								let is_rebalance = {
+									let map = tx_metadata.read();
+									map.get(&payment_id).is_some_and(|m| m.ty.is_rebalance())
+								};
+
+								if !is_rebalance {
+									let _ = event_queue.add_event(Event::PaymentFailed {
+										payment_id,
+										payment_hash,
+										reason: None,
+									});
+								}
 							},
 							state => {
 								log_error!(
@@ -338,11 +356,19 @@ impl TrustedWalletInterface for Cashu {
 					},
 					Err(e) => {
 						log_error!(logger, "Failed to melt quote {quote_id}: {e}");
-						let _ = event_queue.add_event(Event::PaymentFailed {
-							payment_id: PaymentId::Trusted(payment_id),
-							payment_hash,
-							reason: None,
-						});
+						let payment_id = PaymentId::Trusted(payment_id);
+						let is_rebalance = {
+							let map = tx_metadata.read();
+							map.get(&payment_id).is_some_and(|m| m.ty.is_rebalance())
+						};
+
+						if !is_rebalance {
+							let _ = event_queue.add_event(Event::PaymentFailed {
+								payment_id,
+								payment_hash,
+								reason: None,
+							});
+						}
 					},
 				}
 			});
@@ -362,7 +388,7 @@ impl TrustedWalletInterface for Cashu {
 impl Cashu {
 	pub(crate) async fn init(
 		config: &WalletConfig, cashu_config: CashuConfig, store: Arc<dyn KVStore + Sync + Send>,
-		event_queue: Arc<EventQueue>, logger: Arc<Logger>,
+		event_queue: Arc<EventQueue>, tx_metadata: TxMetadataStore, logger: Arc<Logger>,
 	) -> Result<Self, InitFailure> {
 		// Create the seed from the configuration
 		let seed: [u8; 64] = match &config.seed {
@@ -460,6 +486,7 @@ impl Cashu {
 			supports_bolt12,
 			mint_quote_sender,
 			event_queue,
+			tx_metadata,
 		})
 	}
 

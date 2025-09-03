@@ -172,9 +172,8 @@ fn test_sweep_to_ln() {
 			_ => panic!("Expected RebalanceSuccessful event"),
 		}
 
-		// Trusted wallet should have swept to Lightning, todo we should probably not output this event
-		let event = wait_next_event(&wallet).await;
-		assert!(matches!(event, Event::PaymentSuccessful { .. }));
+		let event = wallet.next_event();
+		assert!(event.is_none(), "No more events expected, got {event:?}");
 	})
 }
 

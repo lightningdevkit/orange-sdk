@@ -227,7 +227,7 @@ impl_writeable_tlv_based_enum!(PaymentType,
 	(5, TrustedInternal) => { },
 );
 
-#[derive(Debug, Copy, Clone)]
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub(crate) enum TxType {
 	TrustedToLightning {
 		trusted_payment: [u8; 32],
@@ -246,6 +246,18 @@ pub(crate) enum TxType {
 	Payment {
 		ty: PaymentType,
 	},
+	PendingRebalance {},
+}
+
+impl TxType {
+	pub(crate) fn is_rebalance(&self) -> bool {
+		matches!(
+			self,
+			TxType::PendingRebalance {}
+				| TxType::TrustedToLightning { .. }
+				| TxType::OnchainToLightning { .. }
+		)
+	}
 }
 
 impl_writeable_tlv_based_enum!(TxType,
@@ -260,6 +272,7 @@ impl_writeable_tlv_based_enum!(TxType,
 	},
 	(2, PaymentTriggeringTransferLightning) => { (0, ty, required), },
 	(3, Payment) => { (0, ty, required), },
+	(4, PendingRebalance) => {},
 );
 
 #[derive(Debug, Copy, Clone)]
