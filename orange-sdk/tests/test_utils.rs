@@ -16,7 +16,7 @@ use ldk_node::payment::PaymentStatus;
 use ldk_node::{Node, bitcoin};
 #[cfg(not(feature = "_cashu-tests"))]
 use orange_sdk::trusted_wallet::dummy::DummyTrustedWalletExtraConfig;
-use orange_sdk::{ChainSource, ExtraConfig, Seed, StorageConfig, WalletBuilder};
+use orange_sdk::{ChainSource, ExtraConfig, Seed, StorageConfig, Tunables, Wallet, WalletConfig};
 use rand::RngCore;
 use std::env::temp_dir;
 use std::future::Future;
@@ -253,24 +253,24 @@ pub fn build_test_nodes() -> TestParams {
 
 		let rt_clone = Arc::clone(&rt);
 		let bitcoind_port = bitcoind.params.rpc_socket.port();
-		rt.block_on(async move {
-			WalletBuilder::new()
-				.runtime(rt_clone)
-				.storage_config(StorageConfig::LocalSQLite(tmp.to_str().unwrap().to_string()))
-				.log_file(tmp.join("orange.log"))
-				.chain_source(ChainSource::BitcoindRPC {
-					host: "127.0.0.1".to_string(),
-					port: bitcoind_port,
-					user: cookie.user,
-					password: cookie.password,
-				})
-				.lsp(lsp_node_id, lsp_listen, None)
-				.network(Network::Regtest)
-				.seed(Seed::Seed64(seed))
-				.build(ExtraConfig::Dummy(dummy_wallet_config))
-				.await
-				.unwrap()
-		})
+
+		let wallet_config = WalletConfig {
+			storage_config: StorageConfig::LocalSQLite(tmp.to_str().unwrap().to_string()),
+			log_file: tmp.join("orange.log"),
+			scorer_url: None,
+			tunables: Tunables::default(),
+			chain_source: ChainSource::BitcoindRPC {
+				host: "127.0.0.1".to_string(),
+				port: bitcoind_port,
+				user: cookie.user,
+				password: cookie.password,
+			},
+			lsp: (lsp_listen, lsp_node_id, None),
+			network: Network::Regtest,
+			seed: Seed::Seed64(seed),
+			extra_config: ExtraConfig::Dummy(dummy_wallet_config),
+		};
+		rt.block_on(async move { Wallet::new_with_runtime(rt_clone, wallet_config).await.unwrap() })
 	};
 
 	#[cfg(feature = "_cashu-tests")]
@@ -378,28 +378,31 @@ pub fn build_test_nodes() -> TestParams {
 		});
 
 		let rt_clone = Arc::clone(&rt);
-		let wallet = rt.block_on(async move {
-			let tmp = temp_dir().join(format!("orange-test-{test_id}/wallet"));
-			WalletBuilder::new()
-				.runtime(rt_clone)
-				.storage_config(StorageConfig::LocalSQLite(tmp.to_str().unwrap().to_string()))
-				.log_file(tmp.join("orange.log"))
-				.chain_source(ChainSource::BitcoindRPC {
-					host: "127.0.0.1".to_string(),
-					port: bitcoind_port,
-					user: cookie.user,
-					password: cookie.password,
-				})
-				.lsp(lsp_node_id, lsp_listen, None)
-				.network(Network::Regtest)
-				.seed(Seed::Seed64(seed))
-				.build(ExtraConfig::Cashu(orange_sdk::CashuConfig {
-					mint_url: format!("http://127.0.0.1:{}", mint_addr.port()),
-					unit: orange_sdk::CurrencyUnit::Sat,
-				}))
-				.await
-				.unwrap()
-		});
+
+		let tmp = temp_dir().join(format!("orange-test-{test_id}/wallet"));
+		let wallet_config = WalletConfig {
+			storage_config: StorageConfig::LocalSQLite(tmp.to_str().unwrap().to_string()),
+			log_file: tmp.join("orange.log"),
+			scorer_url: None,
+			tunables: Tunables::default(),
+			chain_source: ChainSource::BitcoindRPC {
+				host: "127.0.0.1".to_string(),
+				port: bitcoind_port,
+				user: cookie.user,
+				password: cookie.password,
+			},
+			lsp: (lsp_listen, lsp_node_id, None),
+			network: Network::Regtest,
+			seed: Seed::Seed64(seed),
+			extra_config: ExtraConfig::Cashu(orange_sdk::CashuConfig {
+				mint_url: format!("http://127.0.0.1:{}", mint_addr.port()),
+				unit: orange_sdk::CurrencyUnit::Sat,
+			}),
+		};
+		let wallet =
+			rt.block_on(
+				async move { Wallet::new_with_runtime(rt_clone, wallet_config).await.unwrap() },
+			);
 
 		return TestParams { wallet, lsp, third_party, bitcoind, rt, _mint: mint };
 	};
