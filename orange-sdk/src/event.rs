@@ -1,5 +1,5 @@
 use crate::logging::Logger;
-use crate::store::{self, PaymentId};
+use crate::store::{self, PaymentId, TxMetadataStore};
 
 use ldk_node::bitcoin::secp256k1::PublicKey;
 use ldk_node::bitcoin::{OutPoint, Txid};
@@ -308,6 +308,7 @@ impl Future for EventFuture {
 #[derive(Clone)]
 pub(crate) struct LdkEventHandler {
 	pub(crate) event_queue: Arc<EventQueue>,
+	pub(crate) tx_metadata: TxMetadataStore,
 	pub(crate) ldk_node: Arc<ldk_node::Node>,
 	pub(crate) payment_receipt_sender: watch::Sender<()>,
 	pub(crate) channel_pending_sender: watch::Sender<u128>,
@@ -357,15 +358,24 @@ impl LdkEventHandler {
 						None
 					}
 				});
-				if let Err(e) = self.event_queue.add_event(Event::PaymentReceived {
-					payment_id: PaymentId::Lightning(payment_id.0), // safe
-					payment_hash,
-					amount_msat,
-					custom_records,
-					lsp_fee_msats,
-				}) {
-					log_error!(self.logger, "Failed to add PaymentReceived event: {e:?}");
-					return;
+
+				let payment_id = PaymentId::Trusted(payment_id.0);
+				let is_rebalance = {
+					let map = self.tx_metadata.read();
+					map.get(&payment_id).is_some_and(|m| m.ty.is_rebalance())
+				};
+
+				// If this is a rebalance payment, we do not emit a PaymentReceived event.
+				if !is_rebalance {
+					if let Err(e) = self.event_queue.add_event(Event::PaymentReceived {
+						payment_id,
+						payment_hash,
+						amount_msat,
+						custom_records,
+						lsp_fee_msats,
+					}) {
+						log_error!(self.logger, "Failed to add PaymentReceived event: {e:?}");
+					}
 				}
 				let _ = self.payment_receipt_sender.send(());
 			},

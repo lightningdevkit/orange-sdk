@@ -1,7 +1,7 @@
 use crate::bitcoin::OutPoint;
 use crate::event::{EventQueue, LdkEventHandler};
 use crate::logging::Logger;
-use crate::store::TxStatus;
+use crate::store::{TxMetadataStore, TxStatus};
 use crate::{ChainSource, InitFailure, PaymentType, Seed, WalletConfig};
 
 use bitcoin_payment_instructions::PaymentMethod;
@@ -53,7 +53,7 @@ const DEFAULT_INVOICE_EXPIRY_SECS: u32 = 86_400; // 24 hours
 impl LightningWallet {
 	pub(super) async fn init(
 		runtime: Arc<Runtime>, config: WalletConfig, store: Arc<dyn KVStore + Sync + Send>,
-		event_queue: Arc<EventQueue>, logger: Arc<Logger>,
+		event_queue: Arc<EventQueue>, tx_metadata: TxMetadataStore, logger: Arc<Logger>,
 	) -> Result<Self, InitFailure> {
 		let anchor_channels_config = ldk_node::config::AnchorChannelsConfig {
 			trusted_peers_no_reserve: vec![config.lsp.1],
@@ -154,6 +154,7 @@ impl LightningWallet {
 			ldk_node: Arc::clone(&ldk_node),
 			payment_receipt_sender,
 			channel_pending_sender,
+			tx_metadata,
 			logger,
 		});
 		let inner = Arc::new(LightningWalletImpl {

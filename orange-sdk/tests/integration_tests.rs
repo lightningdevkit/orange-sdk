@@ -159,10 +159,6 @@ fn test_sweep_to_ln() {
 			_ => panic!("Expected ChannelOpened event"),
 		}
 
-		// LDK node receives the rebalance payment, todo we should probably not output this event
-		let event = wait_next_event(&wallet).await;
-		assert!(matches!(event, Event::PaymentReceived { .. }));
-
 		let event = wait_next_event(&wallet).await;
 		match event {
 			Event::RebalanceSuccessful { amount_msat, fee_msat, .. } => {
