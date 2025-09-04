@@ -1,4 +1,7 @@
-use crate::{impl_from_core_type, impl_into_core_type};
+use crate::{
+	PaymentInfo as OrangePaymentInfo, PaymentInfoBuildError as OrangePaymentInfoBuildError,
+	impl_from_core_type, impl_into_core_type,
+};
 use bitcoin_payment_instructions::amount::Amount as BPIAmount;
 use bitcoin_payment_instructions::{
 	ParseError as BPIParseError, PaymentInstructions as BPIPaymentInstructions,
@@ -214,3 +217,103 @@ impl PaymentInstructions {
 
 impl_from_core_type!(BPIPaymentInstructions, PaymentInstructions);
 impl_into_core_type!(PaymentInstructions, BPIPaymentInstructions);
+
+#[derive(Debug, uniffi::Error)]
+pub enum PaymentInfoBuildError {
+	AmountMismatch {
+		given: Arc<Amount>,
+		ln_amount: Option<Arc<Amount>>,
+		onchain_amount: Option<Arc<Amount>>,
+	},
+	MissingAmount,
+	AmountOutOfRange {
+		given: Arc<Amount>,
+		min: Option<Arc<Amount>>,
+		max: Option<Arc<Amount>>,
+	},
+}
+
+impl Display for PaymentInfoBuildError {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		match self {
+			PaymentInfoBuildError::AmountMismatch { given, ln_amount, onchain_amount } => {
+				write!(f, "Amount mismatch: given {}", given.milli_sats())?;
+				if let Some(ln) = ln_amount {
+					write!(f, ", lightning amount {}", ln.milli_sats())?;
+				}
+				if let Some(onchain) = onchain_amount {
+					write!(f, ", on-chain amount {}", onchain.milli_sats())?;
+				}
+				Ok(())
+			},
+			PaymentInfoBuildError::MissingAmount => {
+				write!(f, "Amount is required but was not provided")
+			},
+			PaymentInfoBuildError::AmountOutOfRange { given, min, max } => {
+				write!(f, "Amount {} is out of range", given.milli_sats())?;
+				if let Some(min_amt) = min {
+					write!(f, ", minimum {}", min_amt.milli_sats())?;
+				}
+				if let Some(max_amt) = max {
+					write!(f, ", maximum {}", max_amt.milli_sats())?;
+				}
+				Ok(())
+			},
+		}
+	}
+}
+
+impl From<OrangePaymentInfoBuildError> for PaymentInfoBuildError {
+	fn from(error: OrangePaymentInfoBuildError) -> Self {
+		match error {
+			OrangePaymentInfoBuildError::AmountMismatch { given, ln_amount, onchain_amount } => {
+				PaymentInfoBuildError::AmountMismatch {
+					given: Arc::new(given.into()),
+					ln_amount: ln_amount.map(|amt| Arc::new(amt.into())),
+					onchain_amount: onchain_amount.map(|amt| Arc::new(amt.into())),
+				}
+			},
+			OrangePaymentInfoBuildError::MissingAmount => PaymentInfoBuildError::MissingAmount,
+			OrangePaymentInfoBuildError::AmountOutOfRange { given, min, max } => {
+				PaymentInfoBuildError::AmountOutOfRange {
+					given: Arc::new(given.into()),
+					min: min.map(|amt| Arc::new(amt.into())),
+					max: max.map(|amt| Arc::new(amt.into())),
+				}
+			},
+		}
+	}
+}
+
+#[derive(Debug, Clone, uniffi::Object)]
+pub struct PaymentInfo(pub OrangePaymentInfo);
+
+#[uniffi::export]
+impl PaymentInfo {
+	/// Build a PaymentInfo from PaymentInstructions and an optional amount
+	///
+	/// For configurable amount instructions, an amount must be provided and must be within
+	/// any specified range. For fixed amount instructions, the amount is optional and must
+	/// match the fixed amount if provided.
+	#[uniffi::constructor]
+	pub fn build(
+		instructions: Arc<PaymentInstructions>, amount: Option<Arc<Amount>>,
+	) -> Result<Self, PaymentInfoBuildError> {
+		let orange_amount = amount.map(|amt| amt.0);
+		let result = OrangePaymentInfo::build(instructions.0.clone(), orange_amount)?;
+		Ok(PaymentInfo(result))
+	}
+
+	/// Get the payment instructions
+	pub fn instructions(&self) -> PaymentInstructions {
+		self.0.instructions.clone().into()
+	}
+
+	/// Get the payment amount
+	pub fn amount(&self) -> Amount {
+		self.0.amount.into()
+	}
+}
+
+impl_from_core_type!(OrangePaymentInfo, PaymentInfo);
+impl_into_core_type!(PaymentInfo, OrangePaymentInfo);
