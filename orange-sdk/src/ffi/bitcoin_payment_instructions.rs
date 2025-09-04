@@ -1,7 +1,7 @@
 use crate::{impl_from_core_type, impl_into_core_type};
 use bitcoin_payment_instructions::amount::Amount as BPIAmount;
-use std::sync::Arc;
 use std::fmt::Display;
+use std::sync::Arc;
 
 #[derive(Debug, uniffi::Error)]
 pub enum AmountError {
@@ -10,12 +10,16 @@ pub enum AmountError {
 }
 
 impl Display for AmountError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            AmountError::FractionalAmountOfSats(sats) => write!(f, "Not exactly a whole number of sats: {}", sats),
-            AmountError::MoreThanTwentyOneMillionBitcoin(sats) => write!(f, "More than 21 million bitcoin: {}", sats),
-        }
-    }
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		match self {
+			AmountError::FractionalAmountOfSats(sats) => {
+				write!(f, "Not exactly a whole number of sats: {}", sats)
+			},
+			AmountError::MoreThanTwentyOneMillionBitcoin(sats) => {
+				write!(f, "More than 21 million bitcoin: {}", sats)
+			},
+		}
+	}
 }
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, uniffi::Object)]

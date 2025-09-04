@@ -10,13 +10,15 @@ pub enum ConfigError {
 }
 
 impl Display for ConfigError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            ConfigError::InvalidEntropySize(size) => write!(f, "Invalid entropy size: {size}. Entropy must be 64 bytes."),
-            ConfigError::InvalidLspAddress(address) => write!(f, "Invalid LSP address: {address}"),
-            ConfigError::InvalidLspNodeId(node_id) => write!(f, "Invalid LSP node ID: {node_id}"),
-        }
-    }
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		match self {
+			ConfigError::InvalidEntropySize(size) => {
+				write!(f, "Invalid entropy size: {size}. Entropy must be 64 bytes.")
+			},
+			ConfigError::InvalidLspAddress(address) => write!(f, "Invalid LSP address: {address}"),
+			ConfigError::InvalidLspNodeId(node_id) => write!(f, "Invalid LSP node ID: {node_id}"),
+		}
+	}
 }
 
 /// Represents possible failures during wallet initialization.
@@ -34,15 +36,15 @@ pub enum InitFailure {
 }
 
 impl Display for InitFailure {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            InitFailure::IoError(e) => write!(f, "I/O error: {e}"),
-            InitFailure::ConfigError(e) => write!(f, "Config error: {e}"),
-            InitFailure::LdkNodeBuildFailure(e) => write!(f, "Failed to build the LDK node: {e}"),
-            InitFailure::LdkNodeStartFailure(e) => write!(f, "Failed to start the LDK node: {e}"),
-            InitFailure::TrustedFailure => write!(f, "Failed to create the trusted wallet"),
-        }
-    }
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		match self {
+			InitFailure::IoError(e) => write!(f, "I/O error: {e}"),
+			InitFailure::ConfigError(e) => write!(f, "Config error: {e}"),
+			InitFailure::LdkNodeBuildFailure(e) => write!(f, "Failed to build the LDK node: {e}"),
+			InitFailure::LdkNodeStartFailure(e) => write!(f, "Failed to start the LDK node: {e}"),
+			InitFailure::TrustedFailure => write!(f, "Failed to create the trusted wallet"),
+		}
+	}
 }
 
 impl From<std::io::Error> for InitFailure {
@@ -82,12 +84,12 @@ pub enum WalletError {
 }
 
 impl Display for WalletError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            WalletError::LdkNodeFailure(e) => write!(f, "Failure from LDK node: {e}"),
-            WalletError::TrustedFailure => write!(f, "Failure from trusted wallet"),
-        }
-    }
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		match self {
+			WalletError::LdkNodeFailure(e) => write!(f, "Failure from LDK node: {e}"),
+			WalletError::TrustedFailure => write!(f, "Failure from trusted wallet"),
+		}
+	}
 }
 
 impl From<OrangeWalletError> for WalletError {

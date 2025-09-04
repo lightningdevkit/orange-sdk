@@ -125,6 +125,9 @@ impl From<Transaction> for StoreTransaction {
 	}
 }
 
+/// A PaymentId is a unique identifier for a payment. It can be either a Lightning payment or a
+/// Trusted payment. It is used to track the state of a payment and to provide information about
+/// the payment to the user.
 #[derive(Debug, Copy, Clone, Hash, PartialEq, Eq)]
 pub enum PaymentId {
 	Lightning([u8; 32]),
