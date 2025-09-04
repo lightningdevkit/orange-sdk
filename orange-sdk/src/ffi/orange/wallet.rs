@@ -4,7 +4,9 @@ use crate::PaymentInstructions as OrangePaymentInstructions;
 use crate::SingleUseReceiveUri as OrangeSingleUseReceiveUri;
 use crate::Wallet as OrangeWallet;
 use crate::WalletConfig as OrangeWalletConfig;
-use crate::ffi::bitcoin_payment_instructions::{Amount, ParseError, PaymentInstructions};
+use crate::ffi::bitcoin_payment_instructions::{
+	Amount, ParseError, PaymentInfo, PaymentInstructions,
+};
 use crate::ffi::orange::config::WalletConfig;
 use crate::ffi::orange::error::{InitFailure, WalletError};
 use crate::{impl_from_core_type, impl_into_core_type};
@@ -163,6 +165,19 @@ impl Wallet {
 	) -> Result<PaymentInstructions, ParseError> {
 		let result = self.inner.parse_payment_instructions(&instructions).await?;
 		Ok(result.into())
+	}
+
+	/// Initiate a payment using the provided PaymentInfo
+	///
+	/// This will attempt to pay from the trusted wallet if possible, otherwise it will pay
+	/// from the lightning wallet. The function will also initiate automatic rebalancing
+	/// from trusted to lightning wallet based on the resulting balance and configured tunables.
+	///
+	/// Returns once the payment is pending. This does not mean the payment has completed -
+	/// it may still fail. Use event handlers or transaction listing to monitor payment status.
+	pub async fn pay(&self, payment_info: Arc<PaymentInfo>) -> Result<(), WalletError> {
+		self.inner.pay(&payment_info.0).await?;
+		Ok(())
 	}
 
 	pub async fn stop(&self) {
