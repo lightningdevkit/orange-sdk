@@ -75,4 +75,29 @@ impl Wallet {
 		let balance = self.inner.get_balance().await?;
 		Ok(balance.into())
 	}
+
+	pub async fn is_connected_to_lsp(&self) -> bool {
+		self.inner.is_connected_to_lsp()
+	}
+
+	/// Sets whether the wallet should automatically rebalance from trusted/onchain to lightning.
+	pub fn set_rebalance_enabled(&self, value: bool) {
+		self.inner.set_rebalance_enabled(value)
+	}
+
+	/// Whether the wallet should automatically rebalance from trusted/onchain to lightning.
+	pub fn get_rebalance_enabled(&self) -> bool {
+		self.inner.get_rebalance_enabled()
+	}
+
+	pub async fn list_transactions(
+		&self,
+	) -> Result<Vec<std::sync::Arc<crate::ffi::orange::Transaction>>, WalletError> {
+		let transactions = self.inner.list_transactions().await?;
+		Ok(transactions.into_iter().map(|tx| std::sync::Arc::new(tx.into())).collect())
+	}
+
+	pub async fn stop(&self) {
+		self.inner.stop().await
+	}
 }
