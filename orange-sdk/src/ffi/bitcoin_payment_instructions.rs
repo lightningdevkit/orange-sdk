@@ -1,5 +1,8 @@
 use crate::{impl_from_core_type, impl_into_core_type};
 use bitcoin_payment_instructions::amount::Amount as BPIAmount;
+use bitcoin_payment_instructions::{
+	ParseError as BPIParseError, PaymentInstructions as BPIPaymentInstructions,
+};
 use std::fmt::Display;
 use std::sync::Arc;
 
@@ -66,3 +69,148 @@ impl Amount {
 
 impl_from_core_type!(BPIAmount, Amount);
 impl_into_core_type!(Amount, BPIAmount);
+
+#[derive(Debug, uniffi::Error)]
+pub enum ParseError {
+	InvalidBolt11(String),
+	InvalidBolt12(String),
+	InvalidOnChain(String),
+	WrongNetwork,
+	InconsistentInstructions(String),
+	InvalidInstructions(String),
+	UnknownPaymentInstructions,
+	UnknownRequiredParameter,
+	HrnResolutionError(String),
+	InstructionsExpired,
+}
+
+impl Display for ParseError {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		match self {
+			ParseError::InvalidBolt11(e) => write!(f, "Invalid BOLT 11 invoice: {}", e),
+			ParseError::InvalidBolt12(e) => write!(f, "Invalid BOLT 12 offer: {}", e),
+			ParseError::InvalidOnChain(e) => write!(f, "Invalid on-chain address: {}", e),
+			ParseError::WrongNetwork => write!(f, "Wrong network for payment instructions"),
+			ParseError::InconsistentInstructions(e) => {
+				write!(f, "Inconsistent payment instructions: {}", e)
+			},
+			ParseError::InvalidInstructions(e) => write!(f, "Invalid payment instructions: {}", e),
+			ParseError::UnknownPaymentInstructions => {
+				write!(f, "Unknown payment instruction format")
+			},
+			ParseError::UnknownRequiredParameter => {
+				write!(f, "Unknown required parameter in BIP 21 URI")
+			},
+			ParseError::HrnResolutionError(e) => {
+				write!(f, "Human readable name resolution error: {}", e)
+			},
+			ParseError::InstructionsExpired => write!(f, "Payment instructions have expired"),
+		}
+	}
+}
+
+impl From<BPIParseError> for ParseError {
+	fn from(error: BPIParseError) -> Self {
+		match error {
+			BPIParseError::InvalidBolt11(e) => ParseError::InvalidBolt11(format!("{:?}", e)),
+			BPIParseError::InvalidBolt12(e) => ParseError::InvalidBolt12(format!("{:?}", e)),
+			BPIParseError::InvalidOnChain(e) => ParseError::InvalidOnChain(format!("{:?}", e)),
+			BPIParseError::WrongNetwork => ParseError::WrongNetwork,
+			BPIParseError::InconsistentInstructions(msg) => {
+				ParseError::InconsistentInstructions(msg.to_string())
+			},
+			BPIParseError::InvalidInstructions(msg) => {
+				ParseError::InvalidInstructions(msg.to_string())
+			},
+			BPIParseError::UnknownPaymentInstructions => ParseError::UnknownPaymentInstructions,
+			BPIParseError::UnknownRequiredParameter => ParseError::UnknownRequiredParameter,
+			BPIParseError::HrnResolutionError(msg) => {
+				ParseError::HrnResolutionError(msg.to_string())
+			},
+			BPIParseError::InstructionsExpired => ParseError::InstructionsExpired,
+		}
+	}
+}
+
+#[derive(Debug, Clone, uniffi::Object)]
+pub struct PaymentInstructions(pub BPIPaymentInstructions);
+
+#[uniffi::export]
+impl PaymentInstructions {
+	/// Check if these are configurable amount payment instructions
+	pub fn is_configurable_amount(&self) -> bool {
+		matches!(self.0, BPIPaymentInstructions::ConfigurableAmount(_))
+	}
+
+	/// Check if these are fixed amount payment instructions  
+	pub fn is_fixed_amount(&self) -> bool {
+		matches!(self.0, BPIPaymentInstructions::FixedAmount(_))
+	}
+
+	/// Get the recipient-provided description of the payment instructions
+	pub fn recipient_description(&self) -> Option<String> {
+		self.0.recipient_description().map(|s| s.to_string())
+	}
+
+	/// Get the proof-of-payment callback URI if available
+	pub fn pop_callback(&self) -> Option<String> {
+		self.0.pop_callback().map(|s| s.to_string())
+	}
+
+	/// Get the minimum amount for configurable amount payment instructions
+	///
+	/// Returns the minimum amount the recipient will accept, if specified.
+	/// Only applies to configurable amount payment instructions.
+	pub fn min_amount(&self) -> Option<Arc<Amount>> {
+		match &self.0 {
+			BPIPaymentInstructions::ConfigurableAmount(conf) => {
+				conf.min_amt().map(|amt| Arc::new(amt.into()))
+			},
+			BPIPaymentInstructions::FixedAmount(_) => None,
+		}
+	}
+
+	/// Get the maximum amount for payment instructions
+	///
+	/// For configurable amount instructions, returns the maximum allowed amount.
+	/// For fixed amount instructions, returns the fixed payment amount.
+	pub fn max_amount(&self) -> Option<Arc<Amount>> {
+		match &self.0 {
+			BPIPaymentInstructions::ConfigurableAmount(conf) => {
+				conf.max_amt().map(|amt| Arc::new(amt.into()))
+			},
+			BPIPaymentInstructions::FixedAmount(fixed) => {
+				fixed.max_amount().map(|amt| Arc::new(amt.into()))
+			},
+		}
+	}
+
+	/// Get the lightning payment amount for fixed amount instructions
+	///
+	/// Returns the specific amount required for lightning payments.
+	/// Only applies to fixed amount payment instructions.
+	pub fn ln_payment_amount(&self) -> Option<Arc<Amount>> {
+		match &self.0 {
+			BPIPaymentInstructions::ConfigurableAmount(_) => None,
+			BPIPaymentInstructions::FixedAmount(fixed) => {
+				fixed.ln_payment_amount().map(|amt| Arc::new(amt.into()))
+			},
+		}
+	}
+
+	/// Get the on-chain payment amount for fixed amount instructions
+	///
+	/// Returns the specific amount required for on-chain payments.
+	/// Only applies to fixed amount payment instructions.
+	pub fn onchain_payment_amount(&self) -> Option<Arc<Amount>> {
+		match &self.0 {
+			BPIPaymentInstructions::ConfigurableAmount(_) => None,
+			BPIPaymentInstructions::FixedAmount(fixed) => {
+				fixed.onchain_payment_amount().map(|amt| Arc::new(amt.into()))
+			},
+		}
+	}
+}
+
+impl_from_core_type!(BPIPaymentInstructions, PaymentInstructions);
+impl_into_core_type!(PaymentInstructions, BPIPaymentInstructions);

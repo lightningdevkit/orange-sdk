@@ -4,7 +4,7 @@ use crate::PaymentInstructions as OrangePaymentInstructions;
 use crate::SingleUseReceiveUri as OrangeSingleUseReceiveUri;
 use crate::Wallet as OrangeWallet;
 use crate::WalletConfig as OrangeWalletConfig;
-use crate::ffi::bitcoin_payment_instructions::Amount;
+use crate::ffi::bitcoin_payment_instructions::{Amount, ParseError, PaymentInstructions};
 use crate::ffi::orange::config::WalletConfig;
 use crate::ffi::orange::error::{InitFailure, WalletError};
 use crate::{impl_from_core_type, impl_into_core_type};
@@ -149,6 +149,20 @@ impl Wallet {
 	) -> Result<Vec<std::sync::Arc<crate::ffi::orange::Transaction>>, WalletError> {
 		let transactions = self.inner.list_transactions().await?;
 		Ok(transactions.into_iter().map(|tx| std::sync::Arc::new(tx.into())).collect())
+	}
+
+	/// Parse payment instructions from a string (e.g., BOLT 11 invoice, BOLT 12 offer, on-chain address)
+	///
+	/// This method supports parsing various payment instruction formats including:
+	/// - Lightning BOLT 11 invoices
+	/// - Lightning BOLT 12 offers
+	/// - On-chain Bitcoin addresses
+	/// - BIP 21 URIs
+	pub async fn parse_payment_instructions(
+		&self, instructions: String,
+	) -> Result<PaymentInstructions, ParseError> {
+		let result = self.inner.parse_payment_instructions(&instructions).await?;
+		Ok(result.into())
 	}
 
 	pub async fn stop(&self) {
