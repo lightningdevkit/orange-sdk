@@ -52,6 +52,7 @@ pub struct CashuConfig {
 #[derive(Clone)]
 pub struct Cashu {
 	cashu_wallet: Arc<Wallet>,
+	unit: CurrencyUnit,
 	shutdown_sender: watch::Sender<()>,
 	logger: Arc<Logger>,
 	supports_bolt12: bool,
@@ -69,7 +70,7 @@ impl TrustedWalletInterface for Cashu {
 				TrustedError::WalletOperationFailed(format!("Failed to get balance: {e}"))
 			})?;
 
-			Amount::from_sats(balance.into()).map_err(|_| TrustedError::AmountError)
+			convert_amount(balance, &self.unit)
 		})
 	}
 
@@ -152,7 +153,7 @@ impl TrustedWalletInterface for Cashu {
 			// Convert CDK Transaction to Payment
 			let payments = transactions
 				.into_iter()
-				.map(Self::convert_transaction_to_payment)
+				.map(|t| Self::convert_transaction_to_payment(t, &self.unit))
 				.collect::<Result<Vec<_>, _>>()?;
 
 			Ok(payments)
@@ -180,8 +181,7 @@ impl TrustedWalletInterface for Cashu {
 						})?;
 
 					// The fee is in the quote
-					let fee_sats: u64 = quote.fee_reserve.into();
-					Amount::from_sats(fee_sats).map_err(|_| TrustedError::AmountError)
+					convert_amount(quote.fee_reserve, &self.unit)
 				},
 				PaymentMethod::LightningBolt12(offer) => {
 					let quote = self
@@ -195,8 +195,7 @@ impl TrustedWalletInterface for Cashu {
 						})?;
 
 					// The fee is in the quote
-					let fee_sats: u64 = quote.fee_reserve.into();
-					Amount::from_sats(fee_sats).map_err(|_| TrustedError::AmountError)
+					convert_amount(quote.fee_reserve, &self.unit)
 				},
 				PaymentMethod::OnChain(_) => Err(TrustedError::UnsupportedOperation(
 					"Cashu mint does not support onchain".to_owned(),
@@ -390,6 +389,15 @@ impl Cashu {
 		config: &WalletConfig, cashu_config: CashuConfig, store: Arc<dyn KVStore + Sync + Send>,
 		event_queue: Arc<EventQueue>, tx_metadata: TxMetadataStore, logger: Arc<Logger>,
 	) -> Result<Self, InitFailure> {
+		match &cashu_config.unit {
+			CurrencyUnit::Sat | CurrencyUnit::Msat => {},
+			unit => {
+				return Err(InitFailure::TrustedFailure(TrustedError::Other(format!(
+					"Unsupported currency unit {unit} for Cashu wallet"
+				))));
+			},
+		}
+
 		// Create the seed from the configuration
 		let seed: [u8; 64] = match &config.seed {
 			Seed::Seed64(bytes) => {
@@ -415,13 +423,12 @@ impl Cashu {
 
 		// Create the Cashu wallet
 		let cashu_wallet = Arc::new(
-			Wallet::new(&cashu_config.mint_url, cashu_config.unit, db, seed, None).map_err(
-				|e| {
+			Wallet::new(&cashu_config.mint_url, cashu_config.unit.clone(), db, seed, None)
+				.map_err(|e| {
 					InitFailure::TrustedFailure(TrustedError::Other(format!(
 						"Failed to create Cashu wallet: {e}"
 					)))
-				},
-			)?,
+				})?,
 		);
 
 		let supports_bolt12 = cashu_wallet
@@ -481,6 +488,7 @@ impl Cashu {
 
 		Ok(Cashu {
 			cashu_wallet,
+			unit: cashu_config.unit,
 			shutdown_sender,
 			logger,
 			supports_bolt12,
@@ -503,15 +511,15 @@ impl Cashu {
 	}
 
 	/// Convert a CDK Transaction to a Payment struct
-	fn convert_transaction_to_payment(transaction: Transaction) -> Result<Payment, TrustedError> {
+	fn convert_transaction_to_payment(
+		transaction: Transaction, unit: &CurrencyUnit,
+	) -> Result<Payment, TrustedError> {
 		// Convert transaction ID to a 32-byte array
 		let payment_id = Self::id_to_32_byte_array(&transaction.id().to_string());
 
 		// Convert amounts - CDK amounts are u64 representing sats
-		let amount =
-			Amount::from_sats(transaction.amount.into()).map_err(|_| TrustedError::AmountError)?;
-		let fee =
-			Amount::from_sats(transaction.fee.into()).map_err(|_| TrustedError::AmountError)?;
+		let amount = convert_amount(transaction.amount, unit)?;
+		let fee = convert_amount(transaction.fee, unit)?;
 
 		let outbound = transaction.direction == TransactionDirection::Outgoing;
 
@@ -564,5 +572,19 @@ impl Cashu {
 			log_info!(logger, "Sent PaymentReceived event for mint quote: {}", mint_quote.id);
 		}
 		Ok(())
+	}
+}
+
+fn convert_amount(cdk_amount: CdkAmount, unit: &CurrencyUnit) -> Result<Amount, TrustedError> {
+	match unit {
+		CurrencyUnit::Sat => {
+			Amount::from_sats(cdk_amount.into()).map_err(|_| TrustedError::AmountError)
+		},
+		CurrencyUnit::Msat => {
+			Amount::from_milli_sats(cdk_amount.into()).map_err(|_| TrustedError::AmountError)
+		},
+		unit => {
+			Err(TrustedError::Other(format!("Unsupported currency unit {unit} for Cashu wallet")))
+		},
 	}
 }
