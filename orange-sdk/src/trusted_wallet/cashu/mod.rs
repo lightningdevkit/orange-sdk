@@ -216,15 +216,32 @@ impl TrustedWalletInterface for Cashu {
 
 			let quote = match method {
 				PaymentMethod::LightningBolt11(invoice) => {
-					payment_hash = Some(PaymentHash(*invoice.payment_hash().as_byte_array()));
-					// Create a melt quote
-					self.cashu_wallet.melt_quote(invoice.to_string(), melt_options).await.map_err(
-						|e| {
-							TrustedError::WalletOperationFailed(format!(
-								"Failed to create melt quote: {e}"
-							))
-						},
-					)?
+					payment_hash = Some(PaymentHash(invoice.payment_hash().to_byte_array()));
+
+					// if we have an active quote for this invoice, use it
+					// otherwise create a new one
+					// this is to avoid creating multiple quotes for the same invoice and can cause database errors
+					// this typically happens when we estimate the fee first and then pay
+					let quotes = self.cashu_wallet.get_active_melt_quotes().await.map_err(|e| {
+						TrustedError::WalletOperationFailed(format!(
+							"Failed to get active melt quotes: {e}"
+						))
+					})?;
+					let active_quote =
+						quotes.into_iter().find(|q| q.request == invoice.to_string());
+
+					match active_quote {
+						Some(q) => q,
+						None => self
+							.cashu_wallet
+							.melt_quote(invoice.to_string(), melt_options)
+							.await
+							.map_err(|e| {
+								TrustedError::WalletOperationFailed(format!(
+									"Failed to create melt quote: {e}"
+								))
+							})?,
+					}
 				},
 				PaymentMethod::LightningBolt12(offer) => {
 					if !self.supports_bolt12 {
@@ -232,6 +249,8 @@ impl TrustedWalletInterface for Cashu {
 							"Cashu mint does not support BOLT 12".to_owned(),
 						));
 					}
+
+					// todo probably should check for existing active quote here as well
 
 					self.cashu_wallet
 						.melt_bolt12_quote(offer.to_string(), melt_options)
