@@ -32,6 +32,7 @@ use std::pin::Pin;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
+use tokio::runtime::Runtime;
 use uuid::Uuid;
 
 /// A wallet implementation using the Breez Spark SDK.
@@ -44,6 +45,7 @@ pub(crate) struct Spark {
 	shutdown_sender: watch::Sender<()>,
 	shutdown_receiver: watch::Receiver<()>,
 	logger: Arc<Logger>,
+	runtime: Arc<Runtime>,
 }
 
 impl TrustedWalletInterface for Spark {
@@ -263,7 +265,7 @@ impl Spark {
 	pub(crate) async fn init(
 		config: &WalletConfig, spark_config: SparkWalletConfig,
 		store: Arc<dyn KVStore + Sync + Send>, event_queue: Arc<EventQueue>,
-		tx_metadata: TxMetadataStore, logger: Arc<Logger>,
+		tx_metadata: TxMetadataStore, logger: Arc<Logger>, runtime: Arc<Runtime>,
 	) -> Result<Self, InitFailure> {
 		if config.network != spark_config.network.into() {
 			Err(TrustedError::InvalidNetwork)?
@@ -303,7 +305,7 @@ impl Spark {
 		let s = Arc::clone(&store);
 		let eq = Arc::clone(&event_queue);
 		let mut shutdown_recv = shutdown_receiver.clone();
-		tokio::spawn(async move {
+		runtime.spawn(async move {
 			loop {
 				tokio::select! {
 					_ = shutdown_recv.changed() => {
@@ -402,6 +404,7 @@ impl Spark {
 			shutdown_sender,
 			shutdown_receiver,
 			logger,
+			runtime,
 		})
 	}
 
@@ -506,7 +509,7 @@ impl Spark {
 		let spark_wallet = Arc::clone(&self.spark_wallet);
 		let event_queue = Arc::clone(&self.event_queue);
 		let logger = Arc::clone(&self.logger);
-		tokio::spawn(async move {
+		self.runtime.spawn(async move {
 			for i in 0..MAX_POLL_ATTEMPTS {
 				log_info!(logger, "Polling lightning send payment {spark_id} attempt {i}",);
 				tokio::select! {

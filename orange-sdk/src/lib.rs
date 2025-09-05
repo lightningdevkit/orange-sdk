@@ -123,6 +123,8 @@ struct WalletImpl {
 	store: Arc<dyn KVStore + Send + Sync>,
 	/// Logger for logging wallet operations.
 	logger: Arc<Logger>,
+	/// The Tokio runtime for asynchronous operations.
+	runtime: Arc<Runtime>,
 }
 
 // todo better doc, include examples, etc
@@ -521,6 +523,7 @@ impl Wallet {
 					Arc::clone(&event_queue),
 					tx_metadata.clone(),
 					Arc::clone(&logger),
+					Arc::clone(&runtime),
 				)
 				.await?,
 			)),
@@ -533,6 +536,7 @@ impl Wallet {
 					Arc::clone(&event_queue),
 					tx_metadata.clone(),
 					Arc::clone(&logger),
+					Arc::clone(&runtime),
 				)
 				.await?,
 			)),
@@ -588,26 +592,28 @@ impl Wallet {
 			Arc::clone(&logger),
 		));
 
+		// Spawn a background thread that every second, we see if we should initiate a rebalance
+		// This will withdraw from the trusted balance to our LN balance, possibly opening a channel.
+		let rb = Arc::clone(&rebalancer);
+		runtime.spawn(async move {
+			loop {
+				rb.do_rebalance_if_needed().await;
+
+				tokio::time::sleep(Duration::from_secs(1)).await;
+			}
+		});
+
 		let inner = Arc::new(WalletImpl {
 			trusted,
 			ln_wallet,
 			event_queue,
 			network,
 			tunables,
-			rebalancer: Arc::clone(&rebalancer),
+			rebalancer,
 			tx_metadata,
 			store,
 			logger,
-		});
-
-		// Spawn a background thread that every second, we see if we should initiate a rebalance
-		// This will withdraw from the trusted balance to our LN balance, possibly opening a channel.
-		runtime.spawn(async move {
-			loop {
-				rebalancer.do_rebalance_if_needed().await;
-
-				tokio::time::sleep(Duration::from_secs(1)).await;
-			}
+			runtime,
 		});
 
 		Ok(Wallet { inner })
@@ -1088,7 +1094,7 @@ impl Wallet {
 									},
 								);
 								let inner_ref = Arc::clone(&self.inner);
-								tokio::spawn(async move {
+								self.inner.runtime.spawn(async move {
 									inner_ref.rebalancer.do_rebalance_if_needed().await;
 								});
 								return Ok(());

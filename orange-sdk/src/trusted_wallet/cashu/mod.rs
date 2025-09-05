@@ -33,6 +33,7 @@ use std::pin::Pin;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::runtime::Runtime;
 
 /// Cashu KV store implementation
 pub mod cashu_store;
@@ -59,6 +60,7 @@ pub struct Cashu {
 	mint_quote_sender: mpsc::Sender<MintQuote>,
 	event_queue: Arc<EventQueue>,
 	tx_metadata: TxMetadataStore,
+	runtime: Arc<Runtime>,
 }
 
 impl TrustedWalletInterface for Cashu {
@@ -278,7 +280,7 @@ impl TrustedWalletInterface for Cashu {
 			let event_queue = Arc::clone(&self.event_queue);
 			let tx_metadata = self.tx_metadata.clone();
 			let quote_id = quote.id.clone();
-			tokio::spawn(async move {
+			self.runtime.spawn(async move {
 				match cashu_wallet.melt(&quote_id).await {
 					Ok(res) => {
 						match res.state {
@@ -407,6 +409,7 @@ impl Cashu {
 	pub(crate) async fn init(
 		config: &WalletConfig, cashu_config: CashuConfig, store: Arc<dyn KVStore + Sync + Send>,
 		event_queue: Arc<EventQueue>, tx_metadata: TxMetadataStore, logger: Arc<Logger>,
+		runtime: Arc<Runtime>,
 	) -> Result<Self, InitFailure> {
 		match &cashu_config.unit {
 			CurrencyUnit::Sat | CurrencyUnit::Msat => {},
@@ -469,7 +472,8 @@ impl Cashu {
 		let wallet_for_monitoring = Arc::clone(&cashu_wallet);
 		let logger_for_monitoring = Arc::clone(&logger);
 		let eq_for_monitoring = Arc::clone(&event_queue);
-		tokio::spawn(async move {
+		let rt_for_monitoring = Arc::clone(&runtime);
+		runtime.spawn(async move {
 			loop {
 				tokio::select! {
 					_ = shutdown_receiver.changed() => {
@@ -483,7 +487,7 @@ impl Cashu {
 						let wallet = Arc::clone(&wallet_for_monitoring);
 						let event_queue = Arc::clone(&eq_for_monitoring);
 						let logger = Arc::clone(&logger_for_monitoring);
-						tokio::spawn(async move {
+						rt_for_monitoring.spawn(async move {
 							if let Err(e) = Self::monitor_mint_quote(wallet, event_queue, &logger, mint_quote).await {
 								log_error!(logger, "Failed to monitor mint quote: {e:?}");
 							}
@@ -514,6 +518,7 @@ impl Cashu {
 			mint_quote_sender,
 			event_queue,
 			tx_metadata,
+			runtime,
 		})
 	}
 
