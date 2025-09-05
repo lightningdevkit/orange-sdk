@@ -1,5 +1,6 @@
 use crate::Balances as OrangeBalances;
 
+use crate::PaymentInstructions as OrangePaymentInstructions;
 use crate::SingleUseReceiveUri as OrangeSingleUseReceiveUri;
 use crate::Wallet as OrangeWallet;
 use crate::WalletConfig as OrangeWalletConfig;
@@ -83,6 +84,24 @@ impl_from_core_type!(OrangeSingleUseReceiveUri, SingleUseReceiveUri);
 impl_into_core_type!(SingleUseReceiveUri, OrangeSingleUseReceiveUri);
 
 #[derive(Clone, uniffi::Object)]
+pub struct PaymentInstructions(pub OrangePaymentInstructions);
+
+#[uniffi::export]
+impl PaymentInstructions {
+	pub fn amount(&self) -> Option<Arc<Amount>> {
+		match &self.0 {
+			OrangePaymentInstructions::ConfigurableAmount(_) => None,
+			OrangePaymentInstructions::FixedAmount(fixed) => {
+				fixed.max_amount().map(|a| Arc::new(a.into()))
+			},
+		}
+	}
+}
+
+impl_from_core_type!(OrangePaymentInstructions, PaymentInstructions);
+impl_into_core_type!(PaymentInstructions, OrangePaymentInstructions);
+
+#[derive(Clone, uniffi::Object)]
 pub struct Wallet {
 	inner: Arc<OrangeWallet>,
 }
@@ -141,5 +160,20 @@ impl Wallet {
 	) -> Result<SingleUseReceiveUri, WalletError> {
 		let uri = self.inner.get_single_use_receive_uri(amount.map(|a| a.0)).await?;
 		Ok(uri.into())
+	}
+
+	pub async fn parse_payment_instructions(
+		&self, instructions: String,
+	) -> Result<PaymentInstructions, WalletError> {
+		let instructions = self.inner.parse_payment_instructions(instructions.as_str()).await?;
+		Ok(instructions.into())
+	}
+
+	pub async fn pay(
+		&self, instructions: Arc<PaymentInstructions>, amount: Option<Arc<Amount>>,
+	) -> Result<(), WalletError> {
+		let payment_info = crate::PaymentInfo::build(instructions.0.clone(), amount.map(|a| a.0))?;
+		let _ = self.inner.pay(&payment_info).await?;
+		Ok(())
 	}
 }
