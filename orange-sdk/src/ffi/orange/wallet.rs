@@ -1,5 +1,6 @@
 use crate::Balances as OrangeBalances;
 
+use crate::SingleUseReceiveUri as OrangeSingleUseReceiveUri;
 use crate::Wallet as OrangeWallet;
 use crate::WalletConfig as OrangeWalletConfig;
 use crate::ffi::bitcoin_payment_instructions::Amount;
@@ -46,6 +47,40 @@ impl Balances {
 
 impl_from_core_type!(OrangeBalances, Balances);
 impl_into_core_type!(Balances, OrangeBalances);
+
+/// Represents a single-use Bitcoin URI for receiving payments.
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Object)]
+pub struct SingleUseReceiveUri(pub OrangeSingleUseReceiveUri);
+
+#[uniffi::export]
+impl SingleUseReceiveUri {
+	pub fn address(&self) -> Option<String> {
+		self.0.address.clone().map(|a| a.to_string())
+	}
+
+	pub fn invoice(&self) -> String {
+		self.0.invoice.to_string()
+	}
+
+	pub fn amount(&self) -> Option<Arc<Amount>> {
+		self.0.amount.map(|a| Arc::new(a.into()))
+	}
+
+	pub fn from_trusted(&self) -> bool {
+		self.0.from_trusted
+	}
+
+	pub fn bip21_uri(&self) -> String {
+		self.0.to_string()
+	}
+
+	pub fn payment_hash(&self) -> String {
+		self.0.invoice.payment_hash().to_string()
+	}
+}
+
+impl_from_core_type!(OrangeSingleUseReceiveUri, SingleUseReceiveUri);
+impl_into_core_type!(SingleUseReceiveUri, OrangeSingleUseReceiveUri);
 
 #[derive(Clone, uniffi::Object)]
 pub struct Wallet {
@@ -99,5 +134,12 @@ impl Wallet {
 
 	pub async fn stop(&self) {
 		self.inner.stop().await
+	}
+
+	pub async fn get_single_use_receive_uri(
+		&self, amount: Option<Arc<Amount>>,
+	) -> Result<SingleUseReceiveUri, WalletError> {
+		let uri = self.inner.get_single_use_receive_uri(amount.map(|a| a.0)).await?;
+		Ok(uri.into())
 	}
 }
