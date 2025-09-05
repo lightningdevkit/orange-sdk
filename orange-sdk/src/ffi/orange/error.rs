@@ -81,6 +81,10 @@ pub enum WalletError {
 	LdkNodeFailure(String),
 	/// Failure in the trusted wallet implementation.
 	TrustedFailure,
+	/// Failure to parse payment instructions.
+	PaymentInstructionsParseError,
+	/// Failure to build payment info.
+	PaymentInfoBuildError,
 }
 
 impl Display for WalletError {
@@ -88,6 +92,10 @@ impl Display for WalletError {
 		match self {
 			WalletError::LdkNodeFailure(e) => write!(f, "Failure from LDK node: {e}"),
 			WalletError::TrustedFailure => write!(f, "Failure from trusted wallet"),
+			WalletError::PaymentInstructionsParseError => {
+				write!(f, "Failure to parse payment instructions")
+			},
+			WalletError::PaymentInfoBuildError => write!(f, "Failure to build payment info"),
 		}
 	}
 }
@@ -98,5 +106,17 @@ impl From<OrangeWalletError> for WalletError {
 			OrangeWalletError::LdkNodeFailure(e) => WalletError::LdkNodeFailure(e.to_string()),
 			OrangeWalletError::TrustedFailure(_e) => WalletError::TrustedFailure,
 		}
+	}
+}
+
+impl From<bitcoin_payment_instructions::ParseError> for WalletError {
+	fn from(_e: bitcoin_payment_instructions::ParseError) -> Self {
+		WalletError::PaymentInstructionsParseError
+	}
+}
+
+impl From<crate::PaymentInfoBuildError> for WalletError {
+	fn from(_e: crate::PaymentInfoBuildError) -> Self {
+		WalletError::PaymentInfoBuildError
 	}
 }
