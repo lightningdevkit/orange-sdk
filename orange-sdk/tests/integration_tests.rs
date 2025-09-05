@@ -165,11 +165,68 @@ fn test_sweep_to_ln() {
 				assert!(fee_msat > 0);
 				assert_eq!(amount_msat, intermediate_amt.saturating_add(recv_amt).milli_sats());
 			},
-			_ => panic!("Expected RebalanceSuccessful event"),
+			e => panic!("Expected RebalanceSuccessful event, got {e:?}"),
 		}
 
 		let event = wallet.next_event();
 		assert!(event.is_none(), "No more events expected, got {event:?}");
+
+		// Verify transaction list has correct amounts
+		let txs = wallet.list_transactions().await.unwrap();
+
+		// Should have 2 incoming payments (the two receives) - rebalances should not appear as transactions
+		let incoming_txs: Vec<_> = txs.into_iter().filter(|tx| !tx.outbound).collect();
+		assert_eq!(incoming_txs.len(), 2, "Should have exactly 2 incoming transactions");
+
+		// First transaction should be the smaller amount (intermediate_amt)
+		let first_tx = &incoming_txs[0];
+		assert_eq!(
+			first_tx.amount,
+			Some(intermediate_amt),
+			"First transaction should be the intermediate amount"
+		);
+		assert!(!first_tx.outbound, "First transaction should be incoming");
+		assert_eq!(first_tx.status, TxStatus::Completed, "First transaction should be completed");
+		assert_eq!(
+			first_tx.payment_type,
+			PaymentType::IncomingLightning {},
+			"First transaction should be IncomingLightning"
+		);
+		assert_eq!(
+			first_tx.fee,
+			Some(Amount::ZERO),
+			"First transaction should have zero fee (trusted wallet)"
+		);
+
+		// Second transaction should be the larger amount (recv_amt) but may have fees if it went through Lightning
+		let second_tx = &incoming_txs[1];
+		assert_eq!(
+			second_tx.amount,
+			Some(recv_amt),
+			"Second transaction should be the received amount"
+		);
+		assert!(!second_tx.outbound, "Second transaction should be incoming");
+		assert_eq!(second_tx.status, TxStatus::Completed, "Second transaction should be completed");
+		assert_eq!(
+			second_tx.payment_type,
+			PaymentType::IncomingLightning {},
+			"Second transaction should be IncomingLightning"
+		);
+		// The second payment triggers rebalance and should have a fee
+		assert!(
+			second_tx.fee.is_some_and(|a| a > Amount::ZERO),
+			"Second transaction should have fee greater than 0"
+		);
+
+		// Verify total amounts match expected
+		let total_tx_amount = first_tx.amount.unwrap().saturating_add(second_tx.amount.unwrap());
+		let expected_total = intermediate_amt.saturating_add(recv_amt);
+		assert_eq!(
+			total_tx_amount,
+			expected_total,
+			"Total transaction amounts should match expected total: {} msat",
+			expected_total.milli_sats()
+		);
 	})
 }
 
