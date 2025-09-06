@@ -116,7 +116,18 @@ impl TrustedWalletInterface for Cashu {
 					"Cashu does not support amount-less invoices".to_owned(),
 				)),
 				Some(a) => {
-					let cdk_amount = CdkAmount::from(a.sats_rounding_up());
+					let cdk_amount = match self.unit {
+						CurrencyUnit::Sat => {
+							CdkAmount::from(a.sats().map_err(|()| TrustedError::AmountError)?)
+						},
+						CurrencyUnit::Msat => CdkAmount::from(a.milli_sats()),
+						_ => {
+							return Err(TrustedError::Other(format!(
+								"Unsupported currency unit {:?} for Cashu wallet",
+								self.unit
+							)));
+						},
+					};
 					let quote =
 						self.cashu_wallet.mint_quote(cdk_amount, None).await.map_err(|e| {
 							TrustedError::WalletOperationFailed(format!(
