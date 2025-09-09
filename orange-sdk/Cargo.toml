@@ -18,8 +18,8 @@ _cashu-tests = ["_test-utils", "cdk-ldk-node", "cdk/mint", "cdk-sqlite", "cdk-ax
 [dependencies]
 graduated-rebalancer = { path = "../graduated-rebalancer", version = "0.1.0" }
 
-ldk-node = { path = "../../ldk-node" }
-bitcoin-payment-instructions = { path = "../../bitcoin-payment-instructions", features = ["http"] }
+ldk-node = { git = "https://github.com/benthecarman/ldk-node.git", branch = "esplora-auth" }
+bitcoin-payment-instructions = { workspace = true }
 chrono = { version = "0.4", default-features = false }
 rand = { version = "0.8.5", optional = true }
 reqwest = { version = "0.12.23", default-features = false, features = ["rustls-tls"] }

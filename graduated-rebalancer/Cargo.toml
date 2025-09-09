@@ -6,10 +6,10 @@ description = "A library for managing graduated rebalancing between trusted and 
 license = "MIT OR Apache-2.0"
 
 [dependencies]
-bitcoin-payment-instructions = { path = "../../bitcoin-payment-instructions", features = ["http"] }
+bitcoin-payment-instructions = { workspace = true }
+lightning = { workspace = true }
+lightning-invoice = { workspace = true }
 tokio = { version = "1", features = ["time", "rt", "macros"] }
-lightning-invoice = { git = "https://github.com/tnull/rust-lightning", branch = "2025-08-bump-electrum-client-0.1", features = ["std"] }
-lightning = { git = "https://github.com/tnull/rust-lightning", branch = "2025-08-bump-electrum-client-0.1", features = ["dnssec"] }
 
 
 
