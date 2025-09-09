@@ -36,7 +36,7 @@ cdk-sqlite = { git = "https://github.com/benthecarman/cdk.git", branch = "orange
 cdk-axum = { git = "https://github.com/benthecarman/cdk.git", branch = "orange-fork", optional = true }
 axum = { version = "0.8.1", optional = true }
 
-uniffi = { version = "0.29", features = ["cli"], optional = true }
+uniffi = { version = "0.29", features = ["cli", "tokio"], optional = true }
 
 [dev-dependencies]
 rustls = "0.23.26"

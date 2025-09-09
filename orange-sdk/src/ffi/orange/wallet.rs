@@ -89,7 +89,7 @@ pub struct Wallet {
 	inner: Arc<OrangeWallet>,
 }
 
-#[uniffi::export]
+#[uniffi::export(async_runtime = "tokio")]
 impl Wallet {
 	#[uniffi::constructor]
 	pub fn new(config: WalletConfig) -> Result<Self, InitFailure> {
