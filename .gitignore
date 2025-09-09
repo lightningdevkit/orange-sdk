@@ -2,6 +2,8 @@
 Cargo.lock
 /.claude
 /bindings/uniffi-bindgen/target
+maven-central-package
+*.so
 
 # Ignore generated swift related files
 .swiftpm/
