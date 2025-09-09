@@ -23,7 +23,7 @@ bitcoin-payment-instructions = { workspace = true }
 chrono = { version = "0.4", default-features = false }
 rand = { version = "0.8.5", optional = true }
 reqwest = { version = "0.12.23", default-features = false, features = ["rustls-tls"] }
-spark-wallet = { git = "https://github.com/breez/spark-sdk.git", rev = "8b787473a5df61892712e90a01288640d77045a8", optional = true }
+spark-wallet = { git = "https://github.com/breez/spark-sdk.git", rev = "9e38cbf8fc21ea74a0bbbb805311155acbffce9c", optional = true }
 tokio = { version = "1.0", default-features = false, features = ["rt-multi-thread", "sync"] }
 uuid = { version = "1.0", default-features = false, optional = true }
 cdk = { git = "https://github.com/benthecarman/cdk.git", branch = "orange-fork", default-features = false, features = ["wallet"], optional = true }
