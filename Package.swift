@@ -17,7 +17,8 @@ let package = Package(
     targets: [
         .target(
             name: "OrangeSDK",
-            dependencies: ["OrangeSDKFFI"]
+            dependencies: ["OrangeSDKFFI"],
+            path: "bindings/swift/Sources/OrangeSDK"
         ),
         .binaryTarget(
             name: "OrangeSDKFFI",
