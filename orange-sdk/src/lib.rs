@@ -463,24 +463,21 @@ pub struct SingleUseReceiveUri {
 
 impl fmt::Display for SingleUseReceiveUri {
 	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-		let mut uri = "BITCOIN:".to_owned();
 		match &self.address {
 			Some(address) => {
-				write!(&mut uri, "{address}")?;
+				let mut uri = format!("BITCOIN:{address}");
 				if let Some(amt) = self.amount {
 					write!(&mut uri, "?AMOUNT={}&", amt.btc_decimal_rounding_up_to_sats())?;
 				} else {
 					write!(&mut uri, "?")?;
 				}
-			},
-			None => {
-				write!(&mut uri, "?")?;
-			},
-		}
-		write!(&mut uri, "LIGHTNING={}", self.invoice)?;
+				write!(&mut uri, "LIGHTNING={}", self.invoice)?;
 
-		let res = uri.to_ascii_uppercase();
-		write!(f, "{}", res)
+				let res = uri.to_ascii_uppercase();
+				write!(f, "{}", res)
+			},
+			None => write!(f, "LIGHTNING:{}", self.invoice.to_string().to_ascii_uppercase()),
+		}
 	}
 }
 
