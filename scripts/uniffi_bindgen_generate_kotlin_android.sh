@@ -48,3 +48,5 @@ mkdir -p $JNI_LIB_DIR/arm64-v8a || exit 1
 cp $TARGET_DIR/x86_64-linux-android/release-smaller/liborange_sdk.so $JNI_LIB_DIR/x86_64/ || exit 1
 cp $TARGET_DIR/armv7-linux-androideabi/release-smaller/liborange_sdk.so $JNI_LIB_DIR/armeabi-v7a/ || exit 1
 cp $TARGET_DIR/aarch64-linux-android/release-smaller/liborange_sdk.so $JNI_LIB_DIR/arm64-v8a/ || exit 1
+
+echo 'Kotlin Android bindings generated successfully.'

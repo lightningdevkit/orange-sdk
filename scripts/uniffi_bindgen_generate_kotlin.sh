@@ -32,3 +32,5 @@ mkdir -p "$BINDINGS_DIR"/"$PROJECT_DIR"/lib/src/main/kotlin/"$PACKAGE_DIR" || ex
 $UNIFFI_BINDGEN_BIN generate --config uniffi.toml --library $DYNAMIC_LIB_PATH --language kotlin -o "$TARGET_DIR" || exit 1
 
 cp "$TARGET_DIR"/"$PACKAGE_DIR"/orange_sdk.kt "$BINDINGS_DIR"/"$PROJECT_DIR"/lib/src/main/kotlin/"$PACKAGE_DIR"/ || exit 1
+
+echo 'Kotlin JVM bindings generated successfully.'

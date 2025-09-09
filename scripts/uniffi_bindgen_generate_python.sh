@@ -13,3 +13,5 @@ $UNIFFI_BINDGEN_BIN generate --config uniffi.toml --library "$DYNAMIC_LIB_PATH" 
 
 mkdir -p $BINDINGS_DIR
 cp "$DYNAMIC_LIB_PATH" "$BINDINGS_DIR" || exit 1
+
+echo 'Python bindings generated successfully.'
