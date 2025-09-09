@@ -2,6 +2,7 @@
 
 use crate::EventQueue;
 use crate::bitcoin::hashes::Hash;
+use crate::runtime::Runtime;
 use crate::store::{PaymentId, TxMetadataStore, TxStatus};
 use crate::trusted_wallet::{Payment, TrustedError, TrustedWalletInterface};
 use bitcoin_payment_instructions::PaymentMethod;
@@ -17,7 +18,6 @@ use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
-use tokio::runtime::Runtime;
 use uuid::Uuid;
 
 /// A dummy implementation of `TrustedWalletInterface` for testing purposes.
@@ -39,8 +39,6 @@ pub struct DummyTrustedWalletExtraConfig {
 	pub lsp: Arc<Node>,
 	/// The Bitcoind node to connect to
 	pub bitcoind: Arc<Bitcoind>,
-	/// The runtime to use for async tasks
-	pub rt: Arc<Runtime>,
 }
 
 impl DummyTrustedWallet {
@@ -73,7 +71,7 @@ impl DummyTrustedWallet {
 
 		let ldk_node = Arc::new(builder.build().unwrap());
 
-		ldk_node.start_with_runtime(Arc::clone(&rt)).unwrap();
+		ldk_node.start().expect("failed to start node");
 
 		let current_bal_msats = Arc::new(AtomicU64::new(0));
 		let payments: Arc<RwLock<Vec<Payment>>> = Arc::new(RwLock::new(vec![]));

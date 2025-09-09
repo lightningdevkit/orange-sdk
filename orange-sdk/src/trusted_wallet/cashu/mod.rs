@@ -1,6 +1,7 @@
 //! An implementation of `TrustedWalletInterface` using the Cashu (CDK) SDK.
 
 use crate::logging::Logger;
+use crate::runtime::Runtime;
 use crate::store::{PaymentId, TxMetadataStore, TxStatus};
 use crate::trusted_wallet::{Payment, TrustedError, TrustedWalletInterface};
 use crate::{Event, EventQueue, InitFailure, Seed, WalletConfig};
@@ -33,7 +34,6 @@ use std::pin::Pin;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::runtime::Runtime;
 
 /// Cashu KV store implementation
 pub mod cashu_store;

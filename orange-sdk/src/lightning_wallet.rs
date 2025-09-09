@@ -1,6 +1,7 @@
 use crate::bitcoin::OutPoint;
 use crate::event::{EventQueue, LdkEventHandler};
 use crate::logging::Logger;
+use crate::runtime::Runtime;
 use crate::store::{TxMetadataStore, TxStatus};
 use crate::{ChainSource, InitFailure, PaymentType, Seed, WalletConfig};
 
@@ -10,7 +11,7 @@ use bitcoin_payment_instructions::amount::Amount;
 use ldk_node::bitcoin::base64::Engine;
 use ldk_node::bitcoin::base64::prelude::BASE64_STANDARD;
 use ldk_node::bitcoin::secp256k1::PublicKey;
-use ldk_node::bitcoin::{Address, Network, Script};
+use ldk_node::bitcoin::{Address, Network};
 use ldk_node::lightning::ln::channelmanager::PaymentId;
 use ldk_node::lightning::ln::msgs::SocketAddress;
 use ldk_node::lightning::util::logger::Logger as _;
@@ -27,7 +28,6 @@ use std::fmt::Debug;
 use std::pin::Pin;
 use std::sync::Arc;
 
-use tokio::runtime::Runtime;
 use tokio::sync::watch;
 
 #[derive(Debug, Clone, Copy)]
@@ -165,7 +165,7 @@ impl LightningWallet {
 			lsp_socket_addr,
 		});
 
-		inner.ldk_node.start_with_runtime(Arc::clone(&runtime))?;
+		inner.ldk_node.start()?;
 
 		runtime.spawn(async move {
 			loop {
@@ -284,19 +284,13 @@ impl LightningWallet {
 	pub(crate) async fn open_channel_with_lsp(&self) -> Result<UserChannelId, NodeError> {
 		let bal = self.inner.ldk_node.list_balances().spendable_onchain_balance_sats;
 
-		// need a dummy p2wsh address to estimate the fee, p2wsh is used for LN channels
-		let fake_addr = Address::p2wsh(Script::new(), self.inner.ldk_node.config().network);
-
-		let fee = self
-			.inner
-			.ldk_node
-			.onchain_payment()
-			.estimate_send_all_to_address(&fake_addr, true, None)?;
+		// just mark fee at 1000 sats for now
+		let fee_sats = 1_000;
 
 		let id = self.inner.ldk_node.open_channel(
 			self.inner.lsp_node_id,
 			self.inner.lsp_socket_addr.clone(),
-			bal - fee.to_sat(),
+			bal - fee_sats,
 			None,
 			None,
 		)?;

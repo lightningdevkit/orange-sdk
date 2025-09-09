@@ -13,10 +13,9 @@ _cashu-tests = ["_test-utils", "cdk-ldk-node", "cdk/mint", "cdk-sqlite", "cdk-ax
 [dependencies]
 graduated-rebalancer = { path = "../graduated-rebalancer", version = "0.1.0" }
 
-ldk-node = { git = "https://github.com/benthecarman/ldk-node.git", branch = "esplora-auth" }
-bitcoin-payment-instructions = { version = "0.4.0", features = ["http"] }
+ldk-node = { git = "https://github.com/benthecarman/ldk-node.git", branch = "orange-fork" }
+bitcoin-payment-instructions = { workspace = true }
 chrono = { version = "0.4", default-features = false }
-rand = { version = "0.8.5", optional = true }
 reqwest = { version = "0.12.23", default-features = false, features = ["rustls-tls"] }
 spark-wallet = { git = "https://github.com/breez/spark-sdk.git", rev = "8b787473a5df61892712e90a01288640d77045a8", optional = true }
 tokio = { version = "1.0", default-features = false, features = ["rt-multi-thread", "sync"] }
@@ -30,3 +29,4 @@ cdk-ldk-node = { version = "0.12.0", optional = true }
 cdk-sqlite = { version = "0.12.0", optional = true }
 cdk-axum = { version = "0.12.0", optional = true }
 axum = { version = "0.8.1", optional = true }
+rand = { version = "0.8.5", optional = true }

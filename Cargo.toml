@@ -6,3 +6,8 @@ members = [
 ]
 default-members = ["orange-sdk"]
 resolver = "2"
+
+[workspace.dependencies]
+bitcoin-payment-instructions = { git = "https://github.com/benthecarman/bitcoin-payment-instructions.git", branch = "orange-fork", features = ["http"] }
+lightning = { git = "https://github.com/tnull/rust-lightning", branch = "2025-08-bump-electrum-client-0.1" }
+lightning-invoice = { git = "https://github.com/tnull/rust-lightning", branch = "2025-08-bump-electrum-client-0.1" }

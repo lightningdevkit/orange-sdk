@@ -2,6 +2,7 @@
 use crate::bitcoin::hex::FromHex;
 use crate::bitcoin::{Txid, io};
 use crate::logging::Logger;
+use crate::runtime::Runtime;
 use crate::store::{PaymentId, StoreTransaction, TxMetadataStore, TxStatus};
 use crate::trusted_wallet::{Payment, TrustedError, TrustedWalletInterface};
 use crate::{Event, EventQueue, InitFailure, PaymentType, Seed, WalletConfig};
@@ -32,7 +33,6 @@ use std::pin::Pin;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
-use tokio::runtime::Runtime;
 use uuid::Uuid;
 
 /// A wallet implementation using the Breez Spark SDK.

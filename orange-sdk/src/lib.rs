@@ -20,6 +20,7 @@ pub use bitcoin_payment_instructions::PaymentMethod;
 use bitcoin_payment_instructions::amount::Amount;
 
 use crate::rebalancer::{OrangeRebalanceEventHandler, OrangeTrigger};
+use crate::runtime::Runtime;
 use crate::store::{PaymentId, TxMetadata, TxMetadataStore, TxType};
 #[cfg(feature = "cashu")]
 use crate::trusted_wallet::cashu::Cashu;
@@ -42,8 +43,6 @@ use ldk_node::lightning_invoice::Bolt11Invoice;
 use ldk_node::payment::PaymentKind;
 use ldk_node::{BuildError, ChannelDetails, NodeError};
 
-use tokio::runtime::Runtime;
-
 use std::collections::HashMap;
 use std::fmt::{self, Debug, Write};
 use std::path::PathBuf;
@@ -54,6 +53,7 @@ mod event;
 mod lightning_wallet;
 pub(crate) mod logging;
 mod rebalancer;
+mod runtime;
 mod store;
 pub mod trusted_wallet;
 
@@ -394,6 +394,8 @@ pub enum InitFailure {
 	LdkNodeStartFailure(NodeError),
 	/// Failure in the trusted wallet implementation.
 	TrustedFailure(TrustedError),
+	/// Failure to set up the runtime.
+	RuntimeSetupFailure(std::io::Error),
 }
 
 impl From<io::Error> for InitFailure {
@@ -480,28 +482,21 @@ impl fmt::Display for SingleUseReceiveUri {
 }
 
 impl Wallet {
-	/// Constructs a new Wallet
-	pub async fn new(config: WalletConfig) -> Result<Wallet, InitFailure> {
-		let rt = tokio::runtime::Builder::new_multi_thread()
-			.enable_all()
-			.build()
-			.map_err(|e| InitFailure::IoError(e.into()))?;
-
-		Self::new_with_runtime(Arc::new(rt), config).await
-	}
-	/// Constructs a new Wallet with a runtime.
+	/// Constructs a new Wallet.
 	///
-	/// `runtime` must be a reference to the running `tokio` runtime which we are currently
-	/// operating in.
-	// TODO: WOW that is a terrible API lol
-	pub async fn new_with_runtime(
-		runtime: Arc<Runtime>, config: WalletConfig,
-	) -> Result<Wallet, InitFailure> {
+	/// This will try to auto-detect an outer pre-existing runtime, e.g., to avoid stacking Tokio
+	/// runtime contexts. Note we require the outer runtime to be of the `multithreaded` flavor.
+	pub async fn new(config: WalletConfig) -> Result<Wallet, InitFailure> {
 		let tunables = config.tunables;
 		let network = config.network;
 		let logger = Arc::new(Logger::new(&config.log_file).expect("Failed to open log file"));
 
 		log_info!(logger, "Initializing orange on network: {network}");
+
+		let runtime = Arc::new(Runtime::new().map_err(|e| {
+			log_error!(logger, "Failed to set up tokio runtime: {e}");
+			InitFailure::RuntimeSetupFailure(e)
+		})?);
 
 		let store: Arc<dyn KVStore + Send + Sync> = match &config.storage_config {
 			StorageConfig::LocalSQLite(path) => {
@@ -1232,7 +1227,7 @@ impl Wallet {
 
 	/// Returns the next event in the event queue, if currently available.
 	///
-	/// Will return `Some(..)` if an event is available and `None` otherwise.
+	/// Will return `Some(...)` if an event is available and `None` otherwise.
 	///
 	/// **Note:** this will always return the same event until handling is confirmed via [`Wallet::event_handled`].
 	///
