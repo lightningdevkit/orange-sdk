@@ -20,4 +20,4 @@ cargo clippy --features _test-utils -- -D warnings \
 	`# TODO eventually remove this` \
 	-A dead-code
 
-# todo bring back RUSTDOCFLAGS="-D warnings" cargo doc --all --all-features --no-deps
+RUSTDOCFLAGS="-D warnings" cargo doc --all --all-features --no-deps

@@ -1732,15 +1732,19 @@ fn test_extreme_amount_handling() {
 
 		// Test 4: Milli-satoshi precision (if supported)
 		// Note: Bitcoin addresses can't handle milli-satoshi precision, only Lightning can
-		let msat_amount = Amount::from_milli_sats(1500).unwrap(); // 1.5 sats
-		let uri_result = wallet.get_single_use_receive_uri(Some(msat_amount)).await;
-		assert!(uri_result.is_ok(), "Should handle milli-satoshi amounts");
+		// Note: Cashu does not support msat precision
+		#[cfg(not(feature = "_cashu-tests"))]
+		{
+			let msat_amount = Amount::from_milli_sats(1500).unwrap(); // 1.5 sats
+			let uri_result = wallet.get_single_use_receive_uri(Some(msat_amount)).await;
+			assert!(uri_result.is_ok(), "Should handle milli-satoshi amounts");
 
-		let uri = uri_result.unwrap();
-		assert!(
-			uri.invoice.amount_milli_satoshis().is_some(),
-			"Milli-satoshi amount should have Lightning invoice"
-		);
+			let uri = uri_result.unwrap();
+			assert!(
+				uri.invoice.amount_milli_satoshis().is_some(),
+				"Milli-satoshi amount should have Lightning invoice"
+			);
+		}
 		// On-chain address depends on threshold, not msat precision
 	})
 }
