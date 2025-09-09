@@ -1,4 +1,4 @@
-﻿#![deny(missing_docs)]
+#![deny(missing_docs)]
 
 //! A library implementing the full backend for a modern, highly usable, Bitcoin wallet focusing on
 //! maximizing security and self-custody without trading off user experience.
@@ -51,6 +51,8 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 mod event;
+#[cfg(feature = "uniffi")]
+mod ffi;
 mod lightning_wallet;
 pub(crate) mod logging;
 mod rebalancer;
@@ -74,6 +76,9 @@ pub use ldk_node::payment::ConfirmationStatus;
 pub use spark_wallet::{OperatorPoolConfig, ServiceProviderConfig, SparkWalletConfig};
 pub use store::{PaymentType, Transaction, TxStatus};
 pub use trusted_wallet::ExtraConfig;
+
+#[cfg(feature = "uniffi")]
+uniffi::setup_scaffolding!();
 
 type Rebalancer = GraduatedRebalancer<
 	WalletTrusted<DynTrustedWalletInterface>,
@@ -1015,7 +1020,7 @@ impl Wallet {
 		let mut last_trusted_err = None;
 		let mut last_lightning_err = None;
 
-		let mut pay_trusted = async |method: PaymentMethod, ty: &dyn Fn() -> PaymentType| {
+		let mut pay_trusted = async |method: PaymentMethod, ty: fn() -> PaymentType| {
 			if instructions.amount <= trusted_balance {
 				// attempt to estimate the fee for the trusted payment
 				// if we fail to estimate the fee, just assume it is zero and try to pay
@@ -1066,7 +1071,7 @@ impl Wallet {
 			Err(())
 		};
 
-		let mut pay_lightning = async |method, ty: &dyn Fn() -> PaymentType| {
+		let mut pay_lightning = async |method, ty: fn() -> PaymentType| {
 			let typ = ty();
 			let balance = if matches!(typ, PaymentType::OutgoingOnChain { .. }) {
 				ln_balance.onchain
@@ -1130,7 +1135,7 @@ impl Wallet {
 		for method in methods.clone() {
 			match method {
 				PaymentMethod::LightningBolt11(_) => {
-					if pay_trusted(method, &|| PaymentType::OutgoingLightningBolt11 {
+					if pay_trusted(method, || PaymentType::OutgoingLightningBolt11 {
 						payment_preimage: None,
 					})
 					.await
@@ -1140,7 +1145,7 @@ impl Wallet {
 					};
 				},
 				PaymentMethod::LightningBolt12(_) => {
-					if pay_trusted(method, &|| PaymentType::OutgoingLightningBolt12 {
+					if pay_trusted(method, || PaymentType::OutgoingLightningBolt12 {
 						payment_preimage: None,
 					})
 					.await
@@ -1158,7 +1163,7 @@ impl Wallet {
 		for method in &methods {
 			match method {
 				PaymentMethod::LightningBolt11(_) => {
-					if pay_lightning(method, &|| PaymentType::OutgoingLightningBolt11 {
+					if pay_lightning(method, || PaymentType::OutgoingLightningBolt11 {
 						payment_preimage: None,
 					})
 					.await
@@ -1168,7 +1173,7 @@ impl Wallet {
 					}
 				},
 				PaymentMethod::LightningBolt12(_) => {
-					if pay_lightning(method, &|| PaymentType::OutgoingLightningBolt12 {
+					if pay_lightning(method, || PaymentType::OutgoingLightningBolt12 {
 						payment_preimage: None,
 					})
 					.await
@@ -1186,9 +1191,7 @@ impl Wallet {
 		// Finally, try trusted on-chain first,
 		for method in methods.clone() {
 			if let PaymentMethod::OnChain { .. } = method {
-				if pay_trusted(method, &|| PaymentType::OutgoingOnChain { txid: None })
-					.await
-					.is_ok()
+				if pay_trusted(method, || PaymentType::OutgoingOnChain { txid: None }).await.is_ok()
 				{
 					return Ok(());
 				};
@@ -1198,7 +1201,7 @@ impl Wallet {
 		// then pay on-chain out of the lightning wallet
 		for method in &methods {
 			if let PaymentMethod::OnChain { .. } = method {
-				if pay_lightning(method, &|| PaymentType::OutgoingOnChain { txid: None })
+				if pay_lightning(method, || PaymentType::OutgoingOnChain { txid: None })
 					.await
 					.is_ok()
 				{

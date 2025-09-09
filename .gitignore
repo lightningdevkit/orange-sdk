@@ -1,3 +1,24 @@
 /target
 Cargo.lock
 /.claude
+/bindings/uniffi-bindgen/target
+
+# Ignore generated swift related files
+.swiftpm/
+OrangeSDKFFI.*
+orange_sdk.swift
+liborange_sdk.dylib
+OrangeSDK.swift
+OrangeSDK.swiftmodule
+swift.swiftsourceinfo
+swift.abi.json
+swift.swiftdoc
+
+# Ignore OrangeSDKFFI.xcframework files
+/bindings/swift/OrangeSDKFFI.xcframework
+/bindings/kotlin/orange-sdk-android/lib/src/main/jniLibs
+/bindings/kotlin/orange-sdk-android/lib/src/main/kotlin/org/lightningdevkit/orangesdk/orange_sdk.kt
+/bindings/kotlin/orange-sdk-jvm/lib/src/main/kotlin/org/lightningdevkit/orangesdk/orange_sdk.kt
+/bindings/kotlin/orange-sdk-jvm/lib/src/main/resources/
+
+/bindings/python/src/orange_sdk/orange_sdk.py

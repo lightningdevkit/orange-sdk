@@ -6,10 +6,11 @@ description = "A library for managing graduated rebalancing between trusted and 
 license = "MIT OR Apache-2.0"
 
 [dependencies]
-bitcoin-payment-instructions = { version = "0.4.0", features = ["http"] }
+bitcoin-payment-instructions = { workspace = true }
+lightning = { workspace = true }
+lightning-invoice = { workspace = true }
 tokio = { version = "1", features = ["time", "rt", "macros"] }
-lightning = { version = "0.1.5" }
-lightning-invoice = { version = "0.33.2" }
+
 
 
 [dev-dependencies]
