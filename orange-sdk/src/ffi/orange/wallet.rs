@@ -6,6 +6,7 @@ use crate::WalletConfig as OrangeWalletConfig;
 use crate::ffi::bitcoin_payment_instructions::{
 	Amount, ParseError, PaymentInfo, PaymentInstructions,
 };
+use crate::ffi::ldk_node::ChannelDetails;
 use crate::ffi::orange::config::WalletConfig;
 use crate::ffi::orange::error::{InitFailure, WalletError};
 use crate::{impl_from_core_type, impl_into_core_type};
@@ -170,5 +171,10 @@ impl Wallet {
 	) -> Result<SingleUseReceiveUri, WalletError> {
 		let uri = self.inner.get_single_use_receive_uri(amount.map(|a| a.0)).await?;
 		Ok(uri.into())
+	}
+
+	/// List our current channels
+	pub fn list_channels(&self) -> Vec<Arc<ChannelDetails>> {
+		self.inner.channels().into_iter().map(|ch| Arc::new(ch.into())).collect()
 	}
 }
