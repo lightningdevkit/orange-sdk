@@ -254,7 +254,7 @@ pub fn build_test_nodes() -> TestParams {
 	third_party.open_channel(lsp.node_id(), lsp_listen.clone(), 10_000_000, None, None).unwrap();
 	// wait for tx to broadcast
 	std::thread::sleep(Duration::from_secs(1)); // Keep short sleep for broadcast
-	generate_blocks(&bitcoind, 10);
+	generate_blocks(&bitcoind, 6);
 
 	// wait for channel ready (needs blocking wait as we are not in async context here)
 	let third_party_clone = Arc::clone(&third_party);
@@ -406,7 +406,7 @@ pub fn build_test_nodes() -> TestParams {
 				.unwrap();
 			// wait for tx to broadcast
 			tokio::time::sleep(Duration::from_secs(1)).await;
-			generate_blocks(&bitcoind_clone, 10);
+			generate_blocks(&bitcoind_clone, 6);
 
 			// wait for sync/channel ready
 			wait_for_condition("cdk channel to become usable", || {
