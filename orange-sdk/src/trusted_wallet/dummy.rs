@@ -64,7 +64,7 @@ impl DummyTrustedWallet {
 			cookie.password,
 		);
 
-		let tmp = temp_dir().join(format!("orange-test-{uuid}-dummy-ldk"));
+		let tmp = temp_dir().join(format!("orange-test-{uuid}/dummy-ldk"));
 		builder.set_storage_dir_path(tmp.to_str().unwrap().to_string());
 
 		let port = get_available_port().unwrap();

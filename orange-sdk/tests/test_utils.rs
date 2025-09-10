@@ -60,10 +60,11 @@ pub async fn wait_next_event(wallet: &orange_sdk::Wallet) -> orange_sdk::Event {
 	event
 }
 
-fn create_bitcoind() -> Bitcoind {
+fn create_bitcoind(uuid: Uuid) -> Bitcoind {
 	let mut conf = Conf::default();
 	conf.args.push("-txindex");
 	conf.args.push("-rpcworkqueue=100");
+	conf.staticdir = Some(temp_dir().join(format!("orange-test-{uuid}/bitcoind")));
 	let bitcoind = Bitcoind::with_conf(corepc_node::downloaded_exe_path().unwrap(), &conf).unwrap();
 
 	// Wait for bitcoind to be ready before returning
@@ -126,7 +127,7 @@ fn create_lsp(rt: Arc<Runtime>, uuid: Uuid, bitcoind: &Bitcoind) -> Arc<Node> {
 		cookie.password,
 	);
 
-	let tmp = temp_dir().join(format!("orange-test-{uuid}-lsp"));
+	let tmp = temp_dir().join(format!("orange-test-{uuid}/lsp"));
 	builder.set_storage_dir_path(tmp.to_str().unwrap().to_string());
 
 	let lsps2_service_config = LSPS2ServiceConfig {
@@ -183,7 +184,7 @@ fn create_third_party(rt: Arc<Runtime>, uuid: Uuid, bitcoind: &Bitcoind) -> Arc<
 		cookie.password,
 	);
 
-	let tmp = temp_dir().join(format!("orange-test-{uuid}-payer"));
+	let tmp = temp_dir().join(format!("orange-test-{uuid}/payer"));
 	builder.set_storage_dir_path(tmp.to_str().unwrap().to_string());
 
 	let port = get_available_port().unwrap();
@@ -226,11 +227,10 @@ pub struct TestParams {
 }
 
 pub fn build_test_nodes() -> TestParams {
-	let bitcoind = Arc::new(create_bitcoind());
+	let test_id = Uuid::now_v7();
+	let bitcoind = Arc::new(create_bitcoind(test_id));
 
 	let rt = Arc::new(tokio::runtime::Builder::new_multi_thread().enable_all().build().unwrap());
-
-	let test_id = Uuid::now_v7();
 
 	let lsp = create_lsp(Arc::clone(&rt), test_id, &bitcoind);
 	fund_node(&lsp, &bitcoind);
