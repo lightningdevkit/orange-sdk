@@ -60,12 +60,41 @@ fn create_bitcoind() -> Bitcoind {
 	let mut conf = Conf::default();
 	conf.args.push("-txindex");
 	conf.args.push("-rpcworkqueue=100");
-	Bitcoind::with_conf(corepc_node::downloaded_exe_path().unwrap(), &conf).unwrap()
+	let bitcoind = Bitcoind::with_conf(corepc_node::downloaded_exe_path().unwrap(), &conf).unwrap();
+
+	// Wait for bitcoind to be ready before returning
+	wait_for_bitcoind_ready(&bitcoind);
+
+	bitcoind
+}
+
+fn wait_for_bitcoind_ready(bitcoind: &Bitcoind) {
+	let max_attempts = 30;
+	let delay = Duration::from_millis(500);
+
+	for attempt in 0..max_attempts {
+		match bitcoind.client.get_blockchain_info() {
+			Ok(_) => {
+				println!("bitcoind ready after {attempt} attempts");
+				return;
+			},
+			Err(e) => {
+				if attempt == max_attempts {
+					panic!("bitcoind failed to become ready after {max_attempts} attempts: {e}");
+				}
+				println!("bitcoind not ready, attempt {attempt}/{max_attempts}: {e}");
+				std::thread::sleep(delay);
+			},
+		}
+	}
 }
 
 pub fn generate_blocks(bitcoind: &Bitcoind, num: usize) {
 	let address = bitcoind.client.new_address().unwrap();
-	let _block_hashes = bitcoind.client.generate_to_address(num, &address).unwrap();
+	let _block_hashes = bitcoind
+		.client
+		.generate_to_address(num, &address)
+		.expect(&format!("failed to generate {num} blocks"));
 }
 
 fn create_lsp(rt: Arc<Runtime>, uuid: Uuid, bitcoind: &Bitcoind) -> Arc<Node> {
