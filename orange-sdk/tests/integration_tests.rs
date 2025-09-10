@@ -813,6 +813,10 @@ fn test_threshold_boundary_trusted_balance_limit() {
 	let TestParams { wallet, third_party, rt, .. } = build_test_nodes();
 
 	rt.block_on(async move {
+		// we're not testing rebalancing here, so disable it to keep things simple
+		// on slow CI this can cause tests to fail if rebalancing kicks in
+		wallet.set_rebalance_enabled(false);
+
 		let tunables = wallet.get_tunables();
 
 		// Test 1: Payment exactly at the trusted balance limit should use trusted wallet
