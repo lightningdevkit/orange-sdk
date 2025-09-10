@@ -115,7 +115,10 @@ fn test_pay_from_trusted() {
 		let bal = wallet.get_balance().await.unwrap();
 
 		let event = wait_next_event(&wallet).await;
-		assert!(matches!(event, Event::PaymentReceived { .. }));
+		match event {
+			Event::PaymentReceived { .. } => {},
+			e => panic!("Expected PaymentReceived event, got {e:?}"),
+		}
 
 		let desc = Bolt11InvoiceDescription::Direct(Description::empty());
 		let amount = Amount::from_sats(10).unwrap();
@@ -168,7 +171,10 @@ fn test_sweep_to_ln() {
 		.await;
 
 		let event = wait_next_event(&wallet).await;
-		assert!(matches!(event, Event::PaymentReceived { .. }));
+		match event {
+			Event::PaymentReceived { .. } => {},
+			e => panic!("Expected PaymentReceived event, got {e:?}"),
+		}
 
 		let intermediate_amt = wallet.get_balance().await.unwrap().available_balance();
 
@@ -186,7 +192,10 @@ fn test_sweep_to_ln() {
 
 		// receive to trusted wallet
 		let event = wait_next_event(&wallet).await;
-		assert!(matches!(event, Event::PaymentReceived { .. }));
+		match event {
+			Event::PaymentReceived { .. } => {},
+			e => panic!("Expected PaymentReceived event, got {e:?}"),
+		}
 
 		let event = wait_next_event(&wallet).await;
 		assert!(
@@ -461,7 +470,10 @@ fn run_test_pay_lightning_from_self_custody(amountless: bool) {
 		wallet.pay(&info).await.unwrap();
 
 		let event = wait_next_event(&wallet).await;
-		assert!(matches!(event, Event::PaymentSuccessful { .. }));
+		assert!(
+			matches!(event, Event::PaymentSuccessful { .. }),
+			"Expected PaymentSuccessful event but got {event:?}"
+		);
 		assert_eq!(wallet.next_event(), None);
 
 		// check the payment is correct
@@ -541,7 +553,10 @@ fn run_test_pay_bolt12_from_self_custody(amountless: bool) {
 		wallet.pay(&info).await.unwrap();
 
 		let event = wait_next_event(&wallet).await;
-		assert!(matches!(event, Event::PaymentSuccessful { .. }));
+		assert!(
+			matches!(event, Event::PaymentSuccessful { .. }),
+			"Expected PaymentSuccessful event but got {event:?}"
+		);
 		assert_eq!(wallet.next_event(), None);
 
 		// check the payment is correct
@@ -798,7 +813,10 @@ fn test_threshold_boundary_trusted_balance_limit() {
 
 		// receive to trusted wallet
 		let event = wait_next_event(&wallet).await;
-		assert!(matches!(event, Event::PaymentReceived { .. }));
+		assert!(
+			matches!(event, Event::PaymentReceived { .. }),
+			"Expected PaymentReceived event but got {event:?}"
+		);
 
 		let txs = wallet.list_transactions().await.unwrap();
 		assert_eq!(txs.len(), 1);
@@ -827,16 +845,21 @@ fn test_threshold_boundary_trusted_balance_limit() {
 
 		// Should have received a ChannelOpened event
 		let event = wait_next_event(&wallet).await;
-		assert!(
-			matches!(event, Event::ChannelOpened { .. }),
-			"Payment above limit should trigger channel opening, got {event:?}"
-		);
+		match event {
+			Event::ChannelOpened { .. } => {},
+			e => panic!("Expected ChannelOpened event, got {e:?}"),
+		}
 
 		let event = wait_next_event(&wallet).await;
-		assert!(
-			matches!(event, Event::PaymentReceived { .. }),
-			"Should receive payment through Lightning"
-		);
+		match event {
+			Event::PaymentReceived { amount_msat, lsp_fee_msats, .. } => {
+				assert_eq!(
+					amount_msat + lsp_fee_msats.unwrap_or(0),
+					above_limit_amount.milli_sats()
+				);
+			},
+			e => panic!("Expected PaymentReceived event, got {e:?}"),
+		}
 
 		let txs = wallet.list_transactions().await.unwrap();
 		let lightning_tx = txs.iter().find(|tx| tx.fee.is_some_and(|f| f > Amount::ZERO)).unwrap();
@@ -1222,7 +1245,10 @@ fn test_concurrent_payments() {
 			wallet.get_single_use_receive_uri(Some(Amount::from_sats(150).unwrap())).await.unwrap();
 		third_party.bolt11_payment().send(&uri.invoice, None).unwrap();
 		let ev = wait_next_event(&wallet).await;
-		assert!(matches!(ev, Event::PaymentReceived { .. }), "Expected PaymentReceived event");
+		match ev {
+			Event::PaymentReceived { .. } => {},
+			e => panic!("Expected PaymentReceived event, got {e:?}"),
+		}
 
 		// Verify we have sufficient balance for multiple outgoing payments
 		let initial_balance = wallet.get_balance().await.unwrap();
@@ -1809,7 +1835,10 @@ fn test_lsp_connectivity_fallback() {
 
 		// Wait for the payment to be processed
 		let event = wait_next_event(&wallet).await;
-		assert!(matches!(event, Event::PaymentSuccessful { .. }));
+		match event {
+			Event::PaymentSuccessful { .. } => {},
+			e => panic!("Expected PaymentSuccessful event, got: {e:?}"),
+		}
 
 		// Get the wallet's tunables to find the trusted balance limit
 		let tunables = wallet.get_tunables();
