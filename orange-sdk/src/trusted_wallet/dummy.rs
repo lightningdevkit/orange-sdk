@@ -211,7 +211,13 @@ impl DummyTrustedWallet {
 		lsp.open_channel(ldk_node.node_id(), socket_addr, 1_000_000, Some(500_000_000), None)
 			.unwrap();
 		// wait for channel to be broadcast
-		tokio::time::sleep(Duration::from_secs(1)).await;
+		for _ in 0..iterations {
+			let num_txs = bitcoind.client.get_mempool_info().unwrap().size;
+			if num_txs > 0 {
+				break;
+			}
+			tokio::time::sleep(Duration::from_millis(250)).await;
+		}
 		// confirm channel
 		let addr = bitcoind.client.new_address().unwrap();
 		bitcoind.client.generate_to_address(6, &addr).unwrap();

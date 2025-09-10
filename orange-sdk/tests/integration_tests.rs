@@ -451,7 +451,14 @@ fn run_test_pay_lightning_from_self_custody(amountless: bool) {
 
 		// wait for sync
 		generate_blocks(&bitcoind, 6);
-		tokio::time::sleep(Duration::from_secs(5)).await;
+		test_utils::wait_for_condition("wallet sync after channel open", || async {
+			wallet.channels().iter().any(|a| a.confirmations.is_some_and(|c| c > 0) && a.is_usable)
+				&& third_party
+					.list_channels()
+					.iter()
+					.any(|a| a.confirmations.is_some_and(|c| c > 0) && a.is_usable)
+		})
+		.await;
 
 		let starting_bal = wallet.get_balance().await.unwrap();
 
@@ -535,7 +542,14 @@ fn run_test_pay_bolt12_from_self_custody(amountless: bool) {
 
 		// wait for sync
 		generate_blocks(&bitcoind, 6);
-		tokio::time::sleep(Duration::from_secs(5)).await;
+		test_utils::wait_for_condition("wallet sync after channel open", || async {
+			wallet.channels().iter().any(|a| a.confirmations.is_some_and(|c| c > 0) && a.is_usable)
+				&& third_party
+					.list_channels()
+					.iter()
+					.any(|a| a.confirmations.is_some_and(|c| c > 0) && a.is_usable)
+		})
+		.await;
 
 		let starting_bal = wallet.get_balance().await.unwrap();
 
@@ -1238,7 +1252,14 @@ fn test_concurrent_payments() {
 
 		// Wait for sync
 		generate_blocks(&bitcoind, 6);
-		tokio::time::sleep(Duration::from_secs(5)).await;
+		test_utils::wait_for_condition("wallet sync after channel open", || async {
+			wallet.channels().iter().any(|a| a.confirmations.is_some_and(|c| c > 0) && a.is_usable)
+				&& third_party
+					.list_channels()
+					.iter()
+					.any(|a| a.confirmations.is_some_and(|c| c > 0) && a.is_usable)
+		})
+		.await;
 
 		// receive to trusted wallet as well
 		let uri =
@@ -1817,7 +1838,14 @@ fn test_lsp_connectivity_fallback() {
 
 		// confirm channel
 		generate_blocks(&bitcoind, 6);
-		tokio::time::sleep(Duration::from_secs(5)).await;
+		test_utils::wait_for_condition("wallet sync after channel open", || async {
+			wallet.channels().iter().any(|a| a.confirmations.is_some_and(|c| c > 0) && a.is_usable)
+				&& third_party
+					.list_channels()
+					.iter()
+					.any(|a| a.confirmations.is_some_and(|c| c > 0) && a.is_usable)
+		})
+		.await;
 
 		// spend some of the balance so we have some inbound capacity
 		let amount = Amount::from_sats(10_000).unwrap();
