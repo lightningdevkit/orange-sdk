@@ -226,6 +226,8 @@ pub struct WalletConfig {
 	/// scorer from a remote server instead of having to probe and find optimal routes
 	/// locally.
 	pub scorer_url: Option<String>,
+	/// URL to Rapid Gossip Sync server to get gossip data from.
+	pub rgs_url: Option<String>,
 	/// The Bitcoin network the wallet operates on.
 	pub network: Network,
 	/// The seed used for wallet generation.

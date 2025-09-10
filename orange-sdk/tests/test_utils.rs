@@ -392,6 +392,7 @@ pub fn build_test_nodes() -> TestParams {
 				password: cookie.password,
 			},
 			lsp: (lsp_listen, lsp_node_id, None),
+			rgs_url: None,
 			network: Network::Regtest,
 			seed: Seed::Seed64(seed),
 			extra_config: ExtraConfig::Cashu(orange_sdk::CashuConfig {

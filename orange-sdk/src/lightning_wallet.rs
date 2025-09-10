@@ -73,24 +73,33 @@ impl LightningWallet {
 				builder.set_entropy_bip39_mnemonic(mnemonic, passphrase);
 			},
 		}
-		match config.network {
-			Network::Bitcoin => {
-				builder.set_gossip_source_rgs(
-					"https://rapidsync.lightningdevkit.org/snapshot".to_string(),
-				);
+
+		match config.rgs_url {
+			Some(url) => {
+				builder.set_gossip_source_rgs(url);
 			},
-			Network::Testnet => {
-				builder.set_gossip_source_rgs(
-					"https://rapidsync.lightningdevkit.org/testnet/snapshot".to_string(),
-				);
-			},
-			Network::Testnet4 => {},
-			Network::Signet => {},
-			Network::Regtest => {
-				// We don't want to run an RGS server in tests so just enable p2p gossip
-				builder.set_gossip_source_p2p();
+			None => {
+				match config.network {
+					Network::Bitcoin => {
+						builder.set_gossip_source_rgs(
+							"https://rapidsync.lightningdevkit.org/snapshot".to_string(),
+						);
+					},
+					Network::Testnet => {
+						builder.set_gossip_source_rgs(
+							"https://rapidsync.lightningdevkit.org/testnet/snapshot".to_string(),
+						);
+					},
+					Network::Testnet4 => {},
+					Network::Signet => {},
+					Network::Regtest => {
+						// We don't want to run an RGS server in tests so just enable p2p gossip
+						builder.set_gossip_source_p2p();
+					},
+				}
 			},
 		}
+
 		let (lsp_socket_addr, lsp_node_id, lsp_token) = config.lsp;
 		builder.set_liquidity_source_lsps2(lsp_node_id, lsp_socket_addr.clone(), lsp_token);
 		match config.chain_source {
