@@ -65,7 +65,8 @@ fn create_bitcoind(uuid: Uuid) -> Bitcoind {
 	conf.args.push("-txindex");
 	conf.args.push("-rpcworkqueue=100");
 	conf.staticdir = Some(temp_dir().join(format!("orange-test-{uuid}/bitcoind")));
-	let bitcoind = Bitcoind::with_conf(corepc_node::downloaded_exe_path().unwrap(), &conf).unwrap();
+	let bitcoind = Bitcoind::with_conf(corepc_node::downloaded_exe_path().unwrap(), &conf)
+		.expect(&format!("Failed to start bitcoind for test {uuid}"));
 
 	// Wait for bitcoind to be ready before returning
 	wait_for_bitcoind_ready(&bitcoind);
