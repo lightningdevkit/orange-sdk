@@ -30,28 +30,32 @@ use tokio::runtime::Runtime;
 use uuid::Uuid;
 
 /// Waits for an async condition to be true, polling at a specified interval until a timeout.
-pub async fn wait_for_condition<F, Fut>(
-	interval: Duration, iterations: usize, condition_name: &str, mut condition: F,
-) where
+pub async fn wait_for_condition<F, Fut>(condition_name: &str, mut condition: F)
+where
 	F: FnMut() -> Fut,
 	Fut: Future<Output = bool>,
 {
+	// longer timeout if running in CI as things can be slower there
+	let iterations = if std::env::var("CI").is_ok() { 120 } else { 20 };
 	for _ in 0..iterations {
 		if condition().await {
 			return;
 		}
-		tokio::time::sleep(interval).await;
+		tokio::time::sleep(Duration::from_secs(1)).await;
 	}
 	panic!("Timeout waiting for condition: {condition_name}");
 }
 
-/// Waits for the next event from the wallet, polling every second for up to 10 seconds.
+/// Waits for the next event from the wallet, polling every second for up to 20 seconds.
 /// If no event is received within this time, it panics.
 /// This is useful for testing purposes to ensure that the wallet is responsive and events are being processed.
 /// Otherwise, we can have the test hang indefinitely.
 pub async fn wait_next_event(wallet: &orange_sdk::Wallet) -> orange_sdk::Event {
-	let event =
-		tokio::time::timeout(Duration::from_secs(20), wallet.next_event_async()).await.unwrap();
+	// longer timeout if running in CI as things can be slower there
+	let timeout = if std::env::var("CI").is_ok() { 60 } else { 20 };
+	let event = tokio::time::timeout(Duration::from_secs(timeout), wallet.next_event_async())
+		.await
+		.unwrap();
 	wallet.event_handled().unwrap();
 	event
 }
@@ -237,15 +241,10 @@ pub fn build_test_nodes() -> TestParams {
 	// wait for node to sync (needs blocking wait as we are not in async context here)
 	let third = Arc::clone(&third_party);
 	rt.block_on(async move {
-		wait_for_condition(
-			Duration::from_secs(1),
-			10,
-			"third_party node sync after funding",
-			|| {
-				let res = third.list_balances().total_onchain_balance_sats > start_bal;
-				async move { res }
-			},
-		)
+		wait_for_condition("third_party node sync after funding", || {
+			let res = third.list_balances().total_onchain_balance_sats > start_bal;
+			async move { res }
+		})
 		.await;
 	});
 
@@ -260,7 +259,7 @@ pub fn build_test_nodes() -> TestParams {
 	// wait for channel ready (needs blocking wait as we are not in async context here)
 	let third_party_clone = Arc::clone(&third_party);
 	rt.block_on(async move {
-		wait_for_condition(Duration::from_secs(1), 10, "channel to become usable", || {
+		wait_for_condition("channel to become usable", || {
 			let res = third_party_clone.list_channels().first().is_some_and(|c| c.is_usable);
 			async move { res }
 		})
@@ -394,7 +393,14 @@ pub fn build_test_nodes() -> TestParams {
 				.send_to_address(&addr, bitcoin::Amount::from_btc(1.0).unwrap())
 				.unwrap();
 			generate_blocks(&bitcoind_clone, 6);
-			tokio::time::sleep(Duration::from_secs(5)).await; // wait for sync
+
+			// wait for cdk node to sync
+			wait_for_condition("cdk node sync after funding", || {
+				let res = cdk.node().list_balances().total_onchain_balance_sats > 0;
+				async move { res }
+			})
+			.await;
+
 			cdk.node()
 				.open_channel(lsp_node_id, lsp_listen_clone, 10_000_000, Some(5_000_000_000), None)
 				.unwrap();
@@ -403,12 +409,11 @@ pub fn build_test_nodes() -> TestParams {
 			generate_blocks(&bitcoind_clone, 10);
 
 			// wait for sync/channel ready
-			for _ in 0..10 {
-				if cdk.node().list_channels().first().is_some_and(|c| c.is_usable) {
-					break;
-				}
-				tokio::time::sleep(Duration::from_secs(1)).await;
-			}
+			wait_for_condition("cdk channel to become usable", || {
+				let res = cdk.node().list_channels().first().is_some_and(|c| c.is_usable);
+				async move { res }
+			})
+			.await;
 
 			mint
 		});
@@ -460,22 +465,16 @@ pub async fn open_channel_from_lsp(wallet: &orange_sdk::Wallet, payer: Arc<Node>
 
 	// wait for payment success from payer side
 	let p = Arc::clone(&payer);
-	wait_for_condition(Duration::from_secs(1), 10, "payer payment success", || {
+	wait_for_condition("payer payment success", || {
 		let res = p.payment(&payment_id).is_some_and(|p| p.status == PaymentStatus::Succeeded);
 		async move { res }
 	})
 	.await;
 
 	// check we received with a channel, wait for balance update on wallet side
-	wait_for_condition(
-		Duration::from_secs(1),
-		10,
-		"wallet balance update after channel open",
-		|| async {
-			wallet.get_balance().await.unwrap().available_balance()
-				> starting_bal.available_balance()
-		},
-	)
+	wait_for_condition("wallet balance update after channel open", || async {
+		wallet.get_balance().await.unwrap().available_balance() > starting_bal.available_balance()
+	})
 	.await;
 
 	let event = wait_next_event(&wallet).await;

@@ -199,7 +199,8 @@ impl DummyTrustedWallet {
 		});
 
 		// wait for ldk to be ready
-		for _ in 0..10 {
+		let iterations = if std::env::var("CI").is_ok() { 120 } else { 10 };
+		for _ in 0..iterations {
 			if ldk_node.status().is_listening {
 				break;
 			}
@@ -216,7 +217,7 @@ impl DummyTrustedWallet {
 		bitcoind.client.generate_to_address(6, &addr).unwrap();
 
 		// wait for sync/channel ready
-		for _ in 0..10 {
+		for _ in 0..iterations {
 			if ldk_node.list_channels().first().is_some_and(|c| c.is_usable) {
 				break;
 			}
