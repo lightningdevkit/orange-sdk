@@ -762,7 +762,7 @@ impl Wallet {
 						.saturating_add(lightning_receive_fee.unwrap_or(Amount::ZERO)),
 				),
 			};
-			if let Some(tx_metadata) = tx_metadata.get(&PaymentId::Lightning(payment.id.0)) {
+			if let Some(tx_metadata) = tx_metadata.get(&PaymentId::SelfCustodial(payment.id.0)) {
 				match &tx_metadata.ty {
 					TxType::TrustedToLightning {
 						trusted_payment: _,
@@ -781,7 +781,7 @@ impl Wallet {
 					},
 					TxType::OnchainToLightning { channel_txid, triggering_txid } => {
 						let entry = internal_transfers
-							.entry(PaymentId::Lightning(triggering_txid.to_byte_array()))
+							.entry(PaymentId::SelfCustodial(triggering_txid.to_byte_array()))
 							.or_insert(InternalTransfer::default());
 						if &payment.id.0 == channel_txid.as_byte_array() {
 							debug_assert!(entry.send_fee.is_none());
@@ -794,7 +794,7 @@ impl Wallet {
 					},
 					TxType::PaymentTriggeringTransferLightning { ty: _ } => {
 						let entry = internal_transfers
-							.entry(PaymentId::Lightning(payment.id.0))
+							.entry(PaymentId::SelfCustodial(payment.id.0))
 							.or_insert(InternalTransfer {
 								receive_fee: lightning_receive_fee,
 								send_fee: None,
@@ -803,7 +803,7 @@ impl Wallet {
 						debug_assert!(entry.transaction.is_none());
 
 						entry.transaction = Some(Transaction {
-							id: PaymentId::Lightning(payment.id.0),
+							id: PaymentId::SelfCustodial(payment.id.0),
 							status: payment.status.into(),
 							outbound: payment.direction == PaymentDirection::Outbound,
 							amount: payment
@@ -815,7 +815,7 @@ impl Wallet {
 						});
 					},
 					TxType::Payment { ty: _ } => res.push(Transaction {
-						id: PaymentId::Lightning(payment.id.0),
+						id: PaymentId::SelfCustodial(payment.id.0),
 						status: payment.status.into(),
 						outbound: payment.direction == PaymentDirection::Outbound,
 						amount: payment
@@ -846,7 +846,7 @@ impl Wallet {
 					continue;
 				}
 				res.push(Transaction {
-					id: PaymentId::Lightning(payment.id.0),
+					id: PaymentId::SelfCustodial(payment.id.0),
 					status,
 					outbound: payment.direction == PaymentDirection::Outbound,
 					amount: payment.amount_msat.map(|a| Amount::from_milli_sats(a).unwrap()),
@@ -1089,7 +1089,7 @@ impl Wallet {
 								// it fails, then we attempt to pay the same (BOLT 11) invoice
 								// again.
 								self.inner.tx_metadata.upsert(
-									PaymentId::Lightning(id.0),
+									PaymentId::SelfCustodial(id.0),
 									TxMetadata {
 										ty: TxType::Payment { ty: typ },
 										time: SystemTime::now()

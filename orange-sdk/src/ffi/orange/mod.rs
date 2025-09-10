@@ -68,7 +68,7 @@ pub enum PaymentId {
 impl From<OrangePaymentId> for PaymentId {
 	fn from(id: OrangePaymentId) -> Self {
 		match id {
-			OrangePaymentId::Lightning(hash) => Self::Lightning(hash.to_vec()),
+			OrangePaymentId::SelfCustodial(hash) => Self::Lightning(hash.to_vec()),
 			OrangePaymentId::Trusted(hash) => Self::Trusted(hash.to_vec()),
 		}
 	}

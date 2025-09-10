@@ -170,7 +170,7 @@ impl RebalanceTrigger for OrangeTrigger {
 
 				// now create events for these payments
 				for payment in new_recvs {
-					let payment_id = PaymentId::Lightning(payment.id.0);
+					let payment_id = PaymentId::SelfCustodial(payment.id.0);
 					let (txid, status) = match payment.kind {
 						PaymentKind::Onchain { txid, status } => (txid, status),
 						_ => continue,
@@ -209,7 +209,7 @@ impl RebalanceTrigger for OrangeTrigger {
 						Some(new) => {
 							if let PaymentKind::Onchain { txid, .. } = new.kind {
 								// make sure we have a metadata entry for the triggering transaction
-								let trigger = PaymentId::Lightning(txid.to_byte_array());
+								let trigger = PaymentId::SelfCustodial(txid.to_byte_array());
 								if self.tx_metadata.read().get(&trigger).is_none() {
 									self.tx_metadata.insert(
 										trigger,
@@ -316,7 +316,7 @@ impl graduated_rebalancer::EventHandler for OrangeRebalanceEventHandler {
 					time: SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap(),
 				};
 				self.tx_metadata.upsert(PaymentId::Trusted(rebalance_id), metadata);
-				self.tx_metadata.insert(PaymentId::Lightning(lightning_id), metadata);
+				self.tx_metadata.insert(PaymentId::SelfCustodial(lightning_id), metadata);
 
 				if let Err(e) = self.event_queue.add_event(Event::RebalanceSuccessful {
 					trigger_payment_id: triggering_transaction_id,
@@ -335,7 +335,7 @@ impl graduated_rebalancer::EventHandler for OrangeRebalanceEventHandler {
 			} => {
 				let chan_txid = channel_outpoint.txid;
 				let triggering_txid = Txid::from_byte_array(trigger_id);
-				let trigger_id = PaymentId::Lightning(triggering_txid.to_byte_array());
+				let trigger_id = PaymentId::SelfCustodial(triggering_txid.to_byte_array());
 				self.tx_metadata
 					.set_tx_caused_rebalance(&trigger_id)
 					.expect("Failed to write metadata for onchain rebalance transaction");
@@ -343,7 +343,8 @@ impl graduated_rebalancer::EventHandler for OrangeRebalanceEventHandler {
 					ty: TxType::OnchainToLightning { channel_txid: chan_txid, triggering_txid },
 					time: SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap(),
 				};
-				self.tx_metadata.insert(PaymentId::Lightning(chan_txid.to_byte_array()), metadata);
+				self.tx_metadata
+					.insert(PaymentId::SelfCustodial(chan_txid.to_byte_array()), metadata);
 			},
 		}
 	}
