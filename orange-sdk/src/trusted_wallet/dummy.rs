@@ -64,7 +64,7 @@ impl DummyTrustedWallet {
 			cookie.password,
 		);
 
-		let tmp = temp_dir().join(format!("orange-test-{uuid}-dummy-ldk"));
+		let tmp = temp_dir().join(format!("orange-test-{uuid}/dummy-ldk"));
 		builder.set_storage_dir_path(tmp.to_str().unwrap().to_string());
 
 		let port = get_available_port().unwrap();
@@ -199,7 +199,8 @@ impl DummyTrustedWallet {
 		});
 
 		// wait for ldk to be ready
-		for _ in 0..10 {
+		let iterations = if std::env::var("CI").is_ok() { 120 } else { 10 };
+		for _ in 0..iterations {
 			if ldk_node.status().is_listening {
 				break;
 			}
@@ -210,13 +211,19 @@ impl DummyTrustedWallet {
 		lsp.open_channel(ldk_node.node_id(), socket_addr, 1_000_000, Some(500_000_000), None)
 			.unwrap();
 		// wait for channel to be broadcast
-		tokio::time::sleep(Duration::from_secs(1)).await;
+		for _ in 0..iterations {
+			let num_txs = bitcoind.client.get_mempool_info().unwrap().size;
+			if num_txs > 0 {
+				break;
+			}
+			tokio::time::sleep(Duration::from_millis(250)).await;
+		}
 		// confirm channel
 		let addr = bitcoind.client.new_address().unwrap();
 		bitcoind.client.generate_to_address(6, &addr).unwrap();
 
 		// wait for sync/channel ready
-		for _ in 0..10 {
+		for _ in 0..iterations {
 			if ldk_node.list_channels().first().is_some_and(|c| c.is_usable) {
 				break;
 			}

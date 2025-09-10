@@ -30,42 +30,84 @@ use tokio::runtime::Runtime;
 use uuid::Uuid;
 
 /// Waits for an async condition to be true, polling at a specified interval until a timeout.
-pub async fn wait_for_condition<F, Fut>(
-	interval: Duration, iterations: usize, condition_name: &str, mut condition: F,
-) where
+pub async fn wait_for_condition<F, Fut>(condition_name: &str, mut condition: F)
+where
 	F: FnMut() -> Fut,
 	Fut: Future<Output = bool>,
 {
+	// longer timeout if running in CI as things can be slower there
+	let iterations = if std::env::var("CI").is_ok() { 120 } else { 20 };
 	for _ in 0..iterations {
 		if condition().await {
 			return;
 		}
-		tokio::time::sleep(interval).await;
+		tokio::time::sleep(Duration::from_secs(1)).await;
 	}
 	panic!("Timeout waiting for condition: {condition_name}");
 }
 
-/// Waits for the next event from the wallet, polling every second for up to 10 seconds.
+/// Waits for the next event from the wallet, polling every second for up to 20 seconds.
 /// If no event is received within this time, it panics.
 /// This is useful for testing purposes to ensure that the wallet is responsive and events are being processed.
 /// Otherwise, we can have the test hang indefinitely.
 pub async fn wait_next_event(wallet: &orange_sdk::Wallet) -> orange_sdk::Event {
-	let event =
-		tokio::time::timeout(Duration::from_secs(20), wallet.next_event_async()).await.unwrap();
+	// longer timeout if running in CI as things can be slower there
+	let timeout = if std::env::var("CI").is_ok() { 60 } else { 20 };
+	let event = tokio::time::timeout(Duration::from_secs(timeout), wallet.next_event_async())
+		.await
+		.unwrap();
 	wallet.event_handled().unwrap();
 	event
 }
 
-fn create_bitcoind() -> Bitcoind {
+fn create_bitcoind(uuid: Uuid) -> Bitcoind {
 	let mut conf = Conf::default();
 	conf.args.push("-txindex");
 	conf.args.push("-rpcworkqueue=100");
-	Bitcoind::with_conf(corepc_node::downloaded_exe_path().unwrap(), &conf).unwrap()
+	conf.staticdir = Some(temp_dir().join(format!("orange-test-{uuid}/bitcoind")));
+	let bitcoind = Bitcoind::with_conf(corepc_node::downloaded_exe_path().unwrap(), &conf)
+		.expect(&format!("Failed to start bitcoind for test {uuid}"));
+
+	// Wait for bitcoind to be ready before returning
+	wait_for_bitcoind_ready(&bitcoind);
+
+	// mine 101 blocks to get some spendable funds, split it up into multiple calls
+	// to avoid potentially hitting RPC timeouts on slower CI systems
+	let address = bitcoind.client.new_address().unwrap();
+	for _ in 0..101 {
+		let _block_hashes = bitcoind.client.generate_to_address(1, &address).unwrap();
+	}
+
+	bitcoind
+}
+
+fn wait_for_bitcoind_ready(bitcoind: &Bitcoind) {
+	let max_attempts = 30;
+	let delay = Duration::from_millis(500);
+
+	for attempt in 0..max_attempts {
+		match bitcoind.client.get_blockchain_info() {
+			Ok(_) => {
+				println!("bitcoind ready after {attempt} attempts");
+				return;
+			},
+			Err(e) => {
+				if attempt == max_attempts {
+					panic!("bitcoind failed to become ready after {max_attempts} attempts: {e}");
+				}
+				println!("bitcoind not ready, attempt {attempt}/{max_attempts}: {e}");
+				std::thread::sleep(delay);
+			},
+		}
+	}
 }
 
 pub fn generate_blocks(bitcoind: &Bitcoind, num: usize) {
 	let address = bitcoind.client.new_address().unwrap();
-	let _block_hashes = bitcoind.client.generate_to_address(num, &address).unwrap();
+	let _block_hashes = bitcoind
+		.client
+		.generate_to_address(num, &address)
+		.expect(&format!("failed to generate {num} blocks"));
 }
 
 fn create_lsp(rt: Arc<Runtime>, uuid: Uuid, bitcoind: &Bitcoind) -> Arc<Node> {
@@ -86,7 +128,7 @@ fn create_lsp(rt: Arc<Runtime>, uuid: Uuid, bitcoind: &Bitcoind) -> Arc<Node> {
 		cookie.password,
 	);
 
-	let tmp = temp_dir().join(format!("orange-test-{uuid}-lsp"));
+	let tmp = temp_dir().join(format!("orange-test-{uuid}/lsp"));
 	builder.set_storage_dir_path(tmp.to_str().unwrap().to_string());
 
 	let lsps2_service_config = LSPS2ServiceConfig {
@@ -143,7 +185,7 @@ fn create_third_party(rt: Arc<Runtime>, uuid: Uuid, bitcoind: &Bitcoind) -> Arc<
 		cookie.password,
 	);
 
-	let tmp = temp_dir().join(format!("orange-test-{uuid}-payer"));
+	let tmp = temp_dir().join(format!("orange-test-{uuid}/payer"));
 	builder.set_storage_dir_path(tmp.to_str().unwrap().to_string());
 
 	let port = get_available_port().unwrap();
@@ -186,12 +228,10 @@ pub struct TestParams {
 }
 
 pub fn build_test_nodes() -> TestParams {
-	let bitcoind = Arc::new(create_bitcoind());
-	generate_blocks(&bitcoind, 101);
+	let test_id = Uuid::now_v7();
+	let bitcoind = Arc::new(create_bitcoind(test_id));
 
 	let rt = Arc::new(tokio::runtime::Builder::new_multi_thread().enable_all().build().unwrap());
-
-	let test_id = Uuid::now_v7();
 
 	let lsp = create_lsp(Arc::clone(&rt), test_id, &bitcoind);
 	fund_node(&lsp, &bitcoind);
@@ -202,15 +242,10 @@ pub fn build_test_nodes() -> TestParams {
 	// wait for node to sync (needs blocking wait as we are not in async context here)
 	let third = Arc::clone(&third_party);
 	rt.block_on(async move {
-		wait_for_condition(
-			Duration::from_secs(1),
-			10,
-			"third_party node sync after funding",
-			|| {
-				let res = third.list_balances().total_onchain_balance_sats > start_bal;
-				async move { res }
-			},
-		)
+		wait_for_condition("third_party node sync after funding", || {
+			let res = third.list_balances().total_onchain_balance_sats > start_bal;
+			async move { res }
+		})
 		.await;
 	});
 
@@ -218,14 +253,13 @@ pub fn build_test_nodes() -> TestParams {
 
 	// open a channel from payer to LSP
 	third_party.open_channel(lsp.node_id(), lsp_listen.clone(), 10_000_000, None, None).unwrap();
-	// wait for tx to broadcast
-	std::thread::sleep(Duration::from_secs(1)); // Keep short sleep for broadcast
-	generate_blocks(&bitcoind, 10);
+	wait_for_tx_broadcast(&bitcoind);
+	generate_blocks(&bitcoind, 6);
 
 	// wait for channel ready (needs blocking wait as we are not in async context here)
 	let third_party_clone = Arc::clone(&third_party);
 	rt.block_on(async move {
-		wait_for_condition(Duration::from_secs(1), 10, "channel to become usable", || {
+		wait_for_condition("channel to become usable", || {
 			let res = third_party_clone.list_channels().first().is_some_and(|c| c.is_usable);
 			async move { res }
 		})
@@ -359,21 +393,26 @@ pub fn build_test_nodes() -> TestParams {
 				.send_to_address(&addr, bitcoin::Amount::from_btc(1.0).unwrap())
 				.unwrap();
 			generate_blocks(&bitcoind_clone, 6);
-			tokio::time::sleep(Duration::from_secs(5)).await; // wait for sync
+
+			// wait for cdk node to sync
+			wait_for_condition("cdk node sync after funding", || {
+				let res = cdk.node().list_balances().total_onchain_balance_sats > 0;
+				async move { res }
+			})
+			.await;
+
 			cdk.node()
 				.open_channel(lsp_node_id, lsp_listen_clone, 10_000_000, Some(5_000_000_000), None)
 				.unwrap();
-			// wait for tx to broadcast
-			tokio::time::sleep(Duration::from_secs(1)).await;
-			generate_blocks(&bitcoind_clone, 10);
+			wait_for_tx_broadcast(&bitcoind_clone);
+			generate_blocks(&bitcoind_clone, 6);
 
 			// wait for sync/channel ready
-			for _ in 0..10 {
-				if cdk.node().list_channels().first().is_some_and(|c| c.is_usable) {
-					break;
-				}
-				tokio::time::sleep(Duration::from_secs(1)).await;
-			}
+			wait_for_condition("cdk channel to become usable", || {
+				let res = cdk.node().list_channels().first().is_some_and(|c| c.is_usable);
+				async move { res }
+			})
+			.await;
 
 			mint
 		});
@@ -425,22 +464,16 @@ pub async fn open_channel_from_lsp(wallet: &orange_sdk::Wallet, payer: Arc<Node>
 
 	// wait for payment success from payer side
 	let p = Arc::clone(&payer);
-	wait_for_condition(Duration::from_secs(1), 10, "payer payment success", || {
+	wait_for_condition("payer payment success", || {
 		let res = p.payment(&payment_id).is_some_and(|p| p.status == PaymentStatus::Succeeded);
 		async move { res }
 	})
 	.await;
 
 	// check we received with a channel, wait for balance update on wallet side
-	wait_for_condition(
-		Duration::from_secs(1),
-		10,
-		"wallet balance update after channel open",
-		|| async {
-			wallet.get_balance().await.unwrap().available_balance()
-				> starting_bal.available_balance()
-		},
-	)
+	wait_for_condition("wallet balance update after channel open", || async {
+		wallet.get_balance().await.unwrap().available_balance() > starting_bal.available_balance()
+	})
 	.await;
 
 	let event = wait_next_event(&wallet).await;
@@ -459,4 +492,15 @@ pub async fn open_channel_from_lsp(wallet: &orange_sdk::Wallet, payer: Arc<Node>
 	assert_eq!(wallet.next_event(), None);
 
 	recv_amt
+}
+
+fn wait_for_tx_broadcast(bitcoind: &Bitcoind) {
+	let iterations = if std::env::var("CI").is_ok() { 120 } else { 10 };
+	for _ in 0..iterations {
+		let num_txs = bitcoind.client.get_mempool_info().unwrap().size;
+		if num_txs > 0 {
+			break;
+		}
+		std::thread::sleep(Duration::from_millis(250));
+	}
 }

@@ -47,19 +47,16 @@ fn test_receive_to_trusted() {
 
 		// wait for payment success from payer side
 		let p = Arc::clone(&third_party);
-		test_utils::wait_for_condition(Duration::from_secs(1), 10, "payer payment success", || {
+		test_utils::wait_for_condition("payer payment success", || {
 			let res = p.payment(&payment_id).is_some_and(|p| p.status == PaymentStatus::Succeeded);
 			async move { res }
 		})
 		.await;
 
 		// wait for balance update on wallet side
-		test_utils::wait_for_condition(
-			Duration::from_secs(1),
-			10,
-			"wallet balance update after receive",
-			|| async { wallet.get_balance().await.unwrap().available_balance() > Amount::ZERO },
-		)
+		test_utils::wait_for_condition("wallet balance update after receive", || async {
+			wallet.get_balance().await.unwrap().available_balance() > Amount::ZERO
+		})
 		.await;
 
 		let txs = wallet.list_transactions().await.unwrap();
@@ -103,25 +100,25 @@ fn test_pay_from_trusted() {
 
 		// wait for payment success from payer side
 		let p = Arc::clone(&third_party);
-		test_utils::wait_for_condition(Duration::from_secs(1), 10, "payer payment success", || {
+		test_utils::wait_for_condition("payer payment success", || {
 			let res = p.payment(&payment_id).is_some_and(|p| p.status == PaymentStatus::Succeeded);
 			async move { res }
 		})
 		.await;
 
 		// wait for balance update on wallet side
-		test_utils::wait_for_condition(
-			Duration::from_secs(1),
-			10,
-			"wallet balance update after receive",
-			|| async { wallet.get_balance().await.unwrap().trusted > Amount::ZERO },
-		)
+		test_utils::wait_for_condition("wallet balance update after receive", || async {
+			wallet.get_balance().await.unwrap().trusted > Amount::ZERO
+		})
 		.await;
 
 		let bal = wallet.get_balance().await.unwrap();
 
 		let event = wait_next_event(&wallet).await;
-		assert!(matches!(event, Event::PaymentReceived { .. }));
+		match event {
+			Event::PaymentReceived { .. } => {},
+			e => panic!("Expected PaymentReceived event, got {e:?}"),
+		}
 
 		let desc = Bolt11InvoiceDescription::Direct(Description::empty());
 		let amount = Amount::from_sats(10).unwrap();
@@ -141,12 +138,9 @@ fn test_pay_from_trusted() {
 		}
 
 		// wait for balance update on wallet side
-		test_utils::wait_for_condition(
-			Duration::from_secs(1),
-			10,
-			"wallet balance update after send",
-			|| async { wallet.get_balance().await.unwrap().trusted < bal.trusted },
-		)
+		test_utils::wait_for_condition("wallet balance update after send", || async {
+			wallet.get_balance().await.unwrap().trusted < bal.trusted
+		})
 		.await;
 	})
 }
@@ -171,16 +165,16 @@ fn test_sweep_to_ln() {
 		third_party.bolt11_payment().send(&uri.invoice, None).unwrap();
 
 		// wait for balance update on wallet side
-		test_utils::wait_for_condition(
-			Duration::from_secs(1),
-			10,
-			"wallet balance update after receive",
-			|| async { wallet.get_balance().await.unwrap().available_balance() > Amount::ZERO },
-		)
+		test_utils::wait_for_condition("wallet balance update after receive", || async {
+			wallet.get_balance().await.unwrap().available_balance() > Amount::ZERO
+		})
 		.await;
 
 		let event = wait_next_event(&wallet).await;
-		assert!(matches!(event, Event::PaymentReceived { .. }));
+		match event {
+			Event::PaymentReceived { .. } => {},
+			e => panic!("Expected PaymentReceived event, got {e:?}"),
+		}
 
 		let intermediate_amt = wallet.get_balance().await.unwrap().available_balance();
 
@@ -191,17 +185,17 @@ fn test_sweep_to_ln() {
 		third_party.bolt11_payment().send(&uri.invoice, None).unwrap();
 
 		// wait for balance update on wallet side
-		test_utils::wait_for_condition(
-			Duration::from_secs(1),
-			10,
-			"wallet balance update after receive",
-			|| async { wallet.get_balance().await.unwrap().available_balance() > intermediate_amt },
-		)
+		test_utils::wait_for_condition("wallet balance update after receive", || async {
+			wallet.get_balance().await.unwrap().available_balance() > intermediate_amt
+		})
 		.await;
 
 		// receive to trusted wallet
 		let event = wait_next_event(&wallet).await;
-		assert!(matches!(event, Event::PaymentReceived { .. }));
+		match event {
+			Event::PaymentReceived { .. } => {},
+			e => panic!("Expected PaymentReceived event, got {e:?}"),
+		}
 
 		let event = wait_next_event(&wallet).await;
 		assert!(
@@ -210,12 +204,9 @@ fn test_sweep_to_ln() {
 		);
 
 		// wait for rebalance
-		test_utils::wait_for_condition(
-			Duration::from_secs(1),
-			10,
-			"wait for new channel to be opened",
-			|| async { starting_lsp_channels.len() < lsp.list_channels().len() },
-		)
+		test_utils::wait_for_condition("wait for new channel to be opened", || async {
+			starting_lsp_channels.len() < lsp.list_channels().len()
+		})
 		.await;
 
 		// wait for payment received
@@ -367,15 +358,10 @@ fn test_receive_to_onchain() {
 
 		// check we received on-chain, should be pending
 		// wait for payment success
-		test_utils::wait_for_condition(
-			Duration::from_secs(1),
-			10,
-			"pending balance to update",
-			|| async {
-				// onchain balance is always listed as pending until we splice it into the channel.
-				wallet.get_balance().await.unwrap().pending_balance == recv_amt
-			},
-		)
+		test_utils::wait_for_condition("pending balance to update", || async {
+			// onchain balance is always listed as pending until we splice it into the channel.
+			wallet.get_balance().await.unwrap().pending_balance == recv_amt
+		})
 		.await;
 
 		let event = wait_next_event(&wallet).await;
@@ -465,7 +451,14 @@ fn run_test_pay_lightning_from_self_custody(amountless: bool) {
 
 		// wait for sync
 		generate_blocks(&bitcoind, 6);
-		tokio::time::sleep(Duration::from_secs(5)).await;
+		test_utils::wait_for_condition("wallet sync after channel open", || async {
+			wallet.channels().iter().any(|a| a.confirmations.is_some_and(|c| c > 0) && a.is_usable)
+				&& third_party
+					.list_channels()
+					.iter()
+					.any(|a| a.confirmations.is_some_and(|c| c > 0) && a.is_usable)
+		})
+		.await;
 
 		let starting_bal = wallet.get_balance().await.unwrap();
 
@@ -484,7 +477,10 @@ fn run_test_pay_lightning_from_self_custody(amountless: bool) {
 		wallet.pay(&info).await.unwrap();
 
 		let event = wait_next_event(&wallet).await;
-		assert!(matches!(event, Event::PaymentSuccessful { .. }));
+		assert!(
+			matches!(event, Event::PaymentSuccessful { .. }),
+			"Expected PaymentSuccessful event but got {event:?}"
+		);
 		assert_eq!(wallet.next_event(), None);
 
 		// check the payment is correct
@@ -546,7 +542,14 @@ fn run_test_pay_bolt12_from_self_custody(amountless: bool) {
 
 		// wait for sync
 		generate_blocks(&bitcoind, 6);
-		tokio::time::sleep(Duration::from_secs(5)).await;
+		test_utils::wait_for_condition("wallet sync after channel open", || async {
+			wallet.channels().iter().any(|a| a.confirmations.is_some_and(|c| c > 0) && a.is_usable)
+				&& third_party
+					.list_channels()
+					.iter()
+					.any(|a| a.confirmations.is_some_and(|c| c > 0) && a.is_usable)
+		})
+		.await;
 
 		let starting_bal = wallet.get_balance().await.unwrap();
 
@@ -564,7 +567,10 @@ fn run_test_pay_bolt12_from_self_custody(amountless: bool) {
 		wallet.pay(&info).await.unwrap();
 
 		let event = wait_next_event(&wallet).await;
-		assert!(matches!(event, Event::PaymentSuccessful { .. }));
+		assert!(
+			matches!(event, Event::PaymentSuccessful { .. }),
+			"Expected PaymentSuccessful event but got {event:?}"
+		);
 		assert_eq!(wallet.next_event(), None);
 
 		// check the payment is correct
@@ -644,14 +650,9 @@ fn test_pay_onchain_from_self_custody() {
 		generate_blocks(&bitcoind, 6);
 
 		// wait for node to sync and see the balance update
-		test_utils::wait_for_condition(
-			Duration::from_secs(1),
-			10,
-			"wallet sync after on-chain receive",
-			|| async {
-				wallet.get_balance().await.unwrap().pending_balance > starting_bal.pending_balance
-			},
-		)
+		test_utils::wait_for_condition("wallet sync after on-chain receive", || async {
+			wallet.get_balance().await.unwrap().pending_balance > starting_bal.pending_balance
+		})
 		.await;
 
 		// get address from third party node
@@ -666,19 +667,14 @@ fn test_pay_onchain_from_self_custody() {
 		generate_blocks(&bitcoind, 6);
 
 		// wait for payment to complete
-		test_utils::wait_for_condition(
-			Duration::from_secs(1),
-			10,
-			"on-chain payment completion",
-			|| async {
-				let payments = wallet.list_transactions().await.unwrap();
-				let payment = payments.into_iter().find(|p| p.outbound);
-				if payment.as_ref().is_some_and(|p| p.status == TxStatus::Failed) {
-					panic!("Payment failed");
-				}
-				payment.is_some_and(|p| p.status == TxStatus::Completed)
-			},
-		)
+		test_utils::wait_for_condition("on-chain payment completion", || async {
+			let payments = wallet.list_transactions().await.unwrap();
+			let payment = payments.into_iter().find(|p| p.outbound);
+			if payment.as_ref().is_some_and(|p| p.status == TxStatus::Failed) {
+				panic!("Payment failed");
+			}
+			payment.is_some_and(|p| p.status == TxStatus::Completed)
+		})
 		.await;
 
 		// check the payment is correct
@@ -720,19 +716,14 @@ fn test_pay_onchain_from_self_custody() {
 		);
 
 		// Wait for third party node to receive it
-		test_utils::wait_for_condition(
-			Duration::from_secs(1),
-			10,
-			"on-chain payment received",
-			|| async {
-				let payments = third_party.list_payments();
-				payments.iter().any(|p| {
-					p.status == PaymentStatus::Succeeded
-						&& p.direction == PaymentDirection::Inbound
-						&& p.amount_msat == Some(send_amount.milli_sats())
-				})
-			},
-		)
+		test_utils::wait_for_condition("on-chain payment received", || async {
+			let payments = third_party.list_payments();
+			payments.iter().any(|p| {
+				p.status == PaymentStatus::Succeeded
+					&& p.direction == PaymentDirection::Inbound
+					&& p.amount_msat == Some(send_amount.milli_sats())
+			})
+		})
 		.await;
 	})
 }
@@ -822,6 +813,10 @@ fn test_threshold_boundary_trusted_balance_limit() {
 	let TestParams { wallet, third_party, rt, .. } = build_test_nodes();
 
 	rt.block_on(async move {
+		// we're not testing rebalancing here, so disable it to keep things simple
+		// on slow CI this can cause tests to fail if rebalancing kicks in
+		wallet.set_rebalance_enabled(false);
+
 		let tunables = wallet.get_tunables();
 
 		// Test 1: Payment exactly at the trusted balance limit should use trusted wallet
@@ -829,19 +824,17 @@ fn test_threshold_boundary_trusted_balance_limit() {
 		let uri = wallet.get_single_use_receive_uri(Some(exact_limit_amount)).await.unwrap();
 		third_party.bolt11_payment().send(&uri.invoice, None).unwrap();
 
-		test_utils::wait_for_condition(
-			Duration::from_secs(1),
-			10,
-			"exact limit payment",
-			|| async {
-				wallet.get_balance().await.unwrap().available_balance() >= exact_limit_amount
-			},
-		)
+		test_utils::wait_for_condition("exact limit payment", || async {
+			wallet.get_balance().await.unwrap().available_balance() >= exact_limit_amount
+		})
 		.await;
 
 		// receive to trusted wallet
 		let event = wait_next_event(&wallet).await;
-		assert!(matches!(event, Event::PaymentReceived { .. }));
+		assert!(
+			matches!(event, Event::PaymentReceived { .. }),
+			"Expected PaymentReceived event but got {event:?}"
+		);
 
 		let txs = wallet.list_transactions().await.unwrap();
 		assert_eq!(txs.len(), 1);
@@ -859,32 +852,32 @@ fn test_threshold_boundary_trusted_balance_limit() {
 		third_party.bolt11_payment().send(&uri.invoice, None).unwrap();
 
 		// Wait for channel to be opened and payment to complete
-		test_utils::wait_for_condition(
-			Duration::from_secs(1),
-			15,
-			"above limit payment with channel",
-			|| async {
-				let balance = wallet.get_balance().await.unwrap().available_balance();
-				balance
-					>= exact_limit_amount.saturating_add(
-						above_limit_amount.saturating_sub(Amount::from_sats(50000).unwrap()),
-					)
-			},
-		)
+		test_utils::wait_for_condition("above limit payment with channel", || async {
+			let balance = wallet.get_balance().await.unwrap().available_balance();
+			balance
+				>= exact_limit_amount.saturating_add(
+					above_limit_amount.saturating_sub(Amount::from_sats(50000).unwrap()),
+				)
+		})
 		.await;
 
 		// Should have received a ChannelOpened event
 		let event = wait_next_event(&wallet).await;
-		assert!(
-			matches!(event, Event::ChannelOpened { .. }),
-			"Payment above limit should trigger channel opening, got {event:?}"
-		);
+		match event {
+			Event::ChannelOpened { .. } => {},
+			e => panic!("Expected ChannelOpened event, got {e:?}"),
+		}
 
 		let event = wait_next_event(&wallet).await;
-		assert!(
-			matches!(event, Event::PaymentReceived { .. }),
-			"Should receive payment through Lightning"
-		);
+		match event {
+			Event::PaymentReceived { amount_msat, lsp_fee_msats, .. } => {
+				assert_eq!(
+					amount_msat + lsp_fee_msats.unwrap_or(0),
+					above_limit_amount.milli_sats()
+				);
+			},
+			e => panic!("Expected PaymentReceived event, got {e:?}"),
+		}
 
 		let txs = wallet.list_transactions().await.unwrap();
 		let lightning_tx = txs.iter().find(|tx| tx.fee.is_some_and(|f| f > Amount::ZERO)).unwrap();
@@ -910,23 +903,15 @@ fn test_threshold_boundary_rebalance_min() {
 		let uri = wallet.get_single_use_receive_uri(Some(below_rebalance)).await.unwrap();
 		third_party.bolt11_payment().send(&uri.invoice, None).unwrap();
 
-		test_utils::wait_for_condition(
-			Duration::from_secs(1),
-			10,
-			"below rebalance min payment",
-			|| async {
-				wallet.get_balance().await.unwrap().available_balance()
-					>= starting_bal.available_balance()
-			},
-		)
+		test_utils::wait_for_condition("below rebalance min payment", || async {
+			wallet.get_balance().await.unwrap().available_balance()
+				>= starting_bal.available_balance()
+		})
 		.await;
 
-		test_utils::wait_for_condition(
-			Duration::from_secs(1),
-			10,
-			"wait for transaction",
-			|| async { wallet.list_transactions().await.unwrap().len() >= 1 },
-		)
+		test_utils::wait_for_condition("wait for transaction", || async {
+			wallet.list_transactions().await.unwrap().len() >= 1
+		})
 		.await;
 
 		let txs = wallet.list_transactions().await.unwrap();
@@ -944,15 +929,10 @@ fn test_threshold_boundary_rebalance_min() {
 		let uri = wallet.get_single_use_receive_uri(Some(exact_rebalance)).await.unwrap();
 		third_party.bolt11_payment().send(&uri.invoice, None).unwrap();
 
-		test_utils::wait_for_condition(
-			Duration::from_secs(1),
-			10,
-			"exact rebalance min payment",
-			|| async {
-				let balance = wallet.get_balance().await.unwrap().available_balance();
-				balance >= below_rebalance.saturating_add(exact_rebalance)
-			},
-		)
+		test_utils::wait_for_condition("exact rebalance min payment", || async {
+			let balance = wallet.get_balance().await.unwrap().available_balance();
+			balance >= below_rebalance.saturating_add(exact_rebalance)
+		})
 		.await;
 
 		let txs = wallet.list_transactions().await.unwrap();
@@ -1191,12 +1171,9 @@ fn test_payment_with_expired_invoice() {
 		third_party.bolt11_payment().send(&uri.invoice, None).unwrap();
 
 		// Wait for balance update
-		test_utils::wait_for_condition(
-			Duration::from_secs(1),
-			10,
-			"wallet balance update",
-			|| async { wallet.get_balance().await.unwrap().available_balance() > Amount::ZERO },
-		)
+		test_utils::wait_for_condition("wallet balance update", || async {
+			wallet.get_balance().await.unwrap().available_balance() > Amount::ZERO
+		})
 		.await;
 
 		// Create an invoice with very short expiry
@@ -1235,12 +1212,9 @@ fn test_payment_network_mismatch() {
 
 		// confirm tx
 		generate_blocks(&bitcoind, 6);
-		test_utils::wait_for_condition(
-			Duration::from_secs(1),
-			10,
-			"wallet sync after on-chain receive",
-			|| async { wallet.get_balance().await.unwrap().pending_balance >= recv_amount },
-		)
+		test_utils::wait_for_condition("wallet sync after on-chain receive", || async {
+			wallet.get_balance().await.unwrap().pending_balance >= recv_amount
+		})
 		.await;
 
 		// Test 1: Mainnet invoice on regtest wallet (if we can construct one)
@@ -1282,14 +1256,24 @@ fn test_concurrent_payments() {
 
 		// Wait for sync
 		generate_blocks(&bitcoind, 6);
-		tokio::time::sleep(Duration::from_secs(5)).await;
+		test_utils::wait_for_condition("wallet sync after channel open", || async {
+			wallet.channels().iter().any(|a| a.confirmations.is_some_and(|c| c > 0) && a.is_usable)
+				&& third_party
+					.list_channels()
+					.iter()
+					.any(|a| a.confirmations.is_some_and(|c| c > 0) && a.is_usable)
+		})
+		.await;
 
 		// receive to trusted wallet as well
 		let uri =
 			wallet.get_single_use_receive_uri(Some(Amount::from_sats(150).unwrap())).await.unwrap();
 		third_party.bolt11_payment().send(&uri.invoice, None).unwrap();
 		let ev = wait_next_event(&wallet).await;
-		assert!(matches!(ev, Event::PaymentReceived { .. }), "Expected PaymentReceived event");
+		match ev {
+			Event::PaymentReceived { .. } => {},
+			e => panic!("Expected PaymentReceived event, got {e:?}"),
+		}
 
 		// Verify we have sufficient balance for multiple outgoing payments
 		let initial_balance = wallet.get_balance().await.unwrap();
@@ -1385,23 +1369,18 @@ fn test_concurrent_payments() {
 		assert!(outgoing_txs.len() >= 3, "Should have at least 3 outgoing transactions");
 
 		// Verify all payments reached the third party
-		test_utils::wait_for_condition(
-			Duration::from_secs(1),
-			10,
-			"third party to receive all payments",
-			|| async {
-				let current_payments = third_party.list_payments();
-				let successful_payments = current_payments
-					.iter()
-					.filter(|p| {
-						p.status == PaymentStatus::Succeeded
-							&& p.direction == PaymentDirection::Inbound
-							&& p.amount_msat == Some(payment_amount.milli_sats())
-					})
-					.count();
-				successful_payments >= 3
-			},
-		)
+		test_utils::wait_for_condition("third party to receive all payments", || async {
+			let current_payments = third_party.list_payments();
+			let successful_payments = current_payments
+				.iter()
+				.filter(|p| {
+					p.status == PaymentStatus::Succeeded
+						&& p.direction == PaymentDirection::Inbound
+						&& p.amount_msat == Some(payment_amount.milli_sats())
+				})
+				.count();
+			successful_payments >= 3
+		})
 		.await;
 
 		// Verify final balance state (the main test is that concurrent payments succeeded)
@@ -1485,44 +1464,29 @@ fn test_concurrent_receive_operations() {
 		let payment_id_1 = third_party.bolt11_payment().send(&uris.0.invoice, None).unwrap();
 
 		// Wait for first payment to complete
-		test_utils::wait_for_condition(
-			Duration::from_secs(1),
-			15,
-			"first payment to succeed",
-			|| async {
-				third_party
-					.payment(&payment_id_1)
-					.map_or(false, |p| p.status == PaymentStatus::Succeeded)
-			},
-		)
+		test_utils::wait_for_condition("first payment to succeed", || async {
+			third_party
+				.payment(&payment_id_1)
+				.map_or(false, |p| p.status == PaymentStatus::Succeeded)
+		})
 		.await;
 
 		// Send second payment
 		let payment_id_2 = third_party.bolt11_payment().send(&uris.1.invoice, None).unwrap();
 
 		// Wait for second payment to complete
-		test_utils::wait_for_condition(
-			Duration::from_secs(1),
-			15,
-			"second payment to succeed",
-			|| async {
-				third_party
-					.payment(&payment_id_2)
-					.map_or(false, |p| p.status == PaymentStatus::Succeeded)
-			},
-		)
+		test_utils::wait_for_condition("second payment to succeed", || async {
+			third_party
+				.payment(&payment_id_2)
+				.map_or(false, |p| p.status == PaymentStatus::Succeeded)
+		})
 		.await;
 
 		// Wait for wallet balance to reflect both payments
-		test_utils::wait_for_condition(
-			Duration::from_secs(1),
-			10,
-			"wallet balance to update",
-			|| async {
-				let balance = wallet.get_balance().await.unwrap().available_balance();
-				balance >= amount.saturating_add(amount)
-			},
-		)
+		test_utils::wait_for_condition("wallet balance to update", || async {
+			let balance = wallet.get_balance().await.unwrap().available_balance();
+			balance >= amount.saturating_add(amount)
+		})
 		.await;
 
 		// Verify transactions were recorded
@@ -1545,7 +1509,7 @@ fn test_balance_consistency_under_load() {
 		let uri = wallet.get_single_use_receive_uri(Some(initial_amount)).await.unwrap();
 		third_party.bolt11_payment().send(&uri.invoice, None).unwrap();
 
-		test_utils::wait_for_condition(Duration::from_secs(1), 10, "initial balance", || async {
+		test_utils::wait_for_condition("initial balance", || async {
 			wallet.get_balance().await.unwrap().available_balance() >= initial_amount
 		})
 		.await;
@@ -1878,7 +1842,14 @@ fn test_lsp_connectivity_fallback() {
 
 		// confirm channel
 		generate_blocks(&bitcoind, 6);
-		tokio::time::sleep(Duration::from_secs(5)).await;
+		test_utils::wait_for_condition("wallet sync after channel open", || async {
+			wallet.channels().iter().any(|a| a.confirmations.is_some_and(|c| c > 0) && a.is_usable)
+				&& third_party
+					.list_channels()
+					.iter()
+					.any(|a| a.confirmations.is_some_and(|c| c > 0) && a.is_usable)
+		})
+		.await;
 
 		// spend some of the balance so we have some inbound capacity
 		let amount = Amount::from_sats(10_000).unwrap();
@@ -1896,7 +1867,10 @@ fn test_lsp_connectivity_fallback() {
 
 		// Wait for the payment to be processed
 		let event = wait_next_event(&wallet).await;
-		assert!(matches!(event, Event::PaymentSuccessful { .. }));
+		match event {
+			Event::PaymentSuccessful { .. } => {},
+			e => panic!("Expected PaymentSuccessful event, got: {e:?}"),
+		}
 
 		// Get the wallet's tunables to find the trusted balance limit
 		let tunables = wallet.get_tunables();
