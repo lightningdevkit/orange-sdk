@@ -258,6 +258,7 @@ pub fn build_test_nodes() -> TestParams {
 			storage_config: StorageConfig::LocalSQLite(tmp.to_str().unwrap().to_string()),
 			log_file: tmp.join("orange.log"),
 			scorer_url: None,
+			rgs_url: None,
 			tunables: Tunables::default(),
 			chain_source: ChainSource::BitcoindRPC {
 				host: "127.0.0.1".to_string(),
