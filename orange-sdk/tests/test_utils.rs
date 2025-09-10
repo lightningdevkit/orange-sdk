@@ -65,6 +65,13 @@ fn create_bitcoind() -> Bitcoind {
 	// Wait for bitcoind to be ready before returning
 	wait_for_bitcoind_ready(&bitcoind);
 
+	// mine 101 blocks to get some spendable funds, split it up into multiple calls
+	// to avoid potentially hitting RPC timeouts on slower CI systems
+	let address = bitcoind.client.new_address().unwrap();
+	for _ in 0..101 {
+		let _block_hashes = bitcoind.client.generate_to_address(1, &address).unwrap();
+	}
+
 	bitcoind
 }
 
@@ -216,7 +223,6 @@ pub struct TestParams {
 
 pub fn build_test_nodes() -> TestParams {
 	let bitcoind = Arc::new(create_bitcoind());
-	generate_blocks(&bitcoind, 101);
 
 	let rt = Arc::new(tokio::runtime::Builder::new_multi_thread().enable_all().build().unwrap());
 
