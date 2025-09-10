@@ -252,8 +252,7 @@ pub fn build_test_nodes() -> TestParams {
 
 	// open a channel from payer to LSP
 	third_party.open_channel(lsp.node_id(), lsp_listen.clone(), 10_000_000, None, None).unwrap();
-	// wait for tx to broadcast
-	std::thread::sleep(Duration::from_secs(1)); // Keep short sleep for broadcast
+	wait_for_tx_broadcast(&bitcoind);
 	generate_blocks(&bitcoind, 6);
 
 	// wait for channel ready (needs blocking wait as we are not in async context here)
@@ -404,8 +403,7 @@ pub fn build_test_nodes() -> TestParams {
 			cdk.node()
 				.open_channel(lsp_node_id, lsp_listen_clone, 10_000_000, Some(5_000_000_000), None)
 				.unwrap();
-			// wait for tx to broadcast
-			tokio::time::sleep(Duration::from_secs(1)).await;
+			wait_for_tx_broadcast(&bitcoind_clone);
 			generate_blocks(&bitcoind_clone, 6);
 
 			// wait for sync/channel ready
@@ -493,4 +491,15 @@ pub async fn open_channel_from_lsp(wallet: &orange_sdk::Wallet, payer: Arc<Node>
 	assert_eq!(wallet.next_event(), None);
 
 	recv_amt
+}
+
+fn wait_for_tx_broadcast(bitcoind: &Bitcoind) {
+	let iterations = if std::env::var("CI").is_ok() { 120 } else { 10 };
+	for _ in 0..iterations {
+		let num_txs = bitcoind.client.get_mempool_info().unwrap().size;
+		if num_txs > 0 {
+			break;
+		}
+		std::thread::sleep(Duration::from_millis(250));
+	}
 }
