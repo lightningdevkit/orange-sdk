@@ -47,7 +47,7 @@ jobs:
         run: cargo check -p orange-cli
 
       - name: Run tests
-        run: cargo test --features _test-utils
+        run: cargo test --features _test-utils -- --test-threads=2
 
       - name: Run cashu tests
-        run: cargo test --features _cashu-tests
+        run: cargo test --features _cashu-tests -- --test-threads=2
