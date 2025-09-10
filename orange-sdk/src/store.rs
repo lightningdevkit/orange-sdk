@@ -130,14 +130,14 @@ impl From<Transaction> for StoreTransaction {
 /// the payment to the user.
 #[derive(Debug, Copy, Clone, Hash, PartialEq, Eq)]
 pub enum PaymentId {
-	Lightning([u8; 32]),
+	SelfCustodial([u8; 32]),
 	Trusted([u8; 32]),
 }
 
 impl fmt::Display for PaymentId {
 	fn fmt(&self, fmt: &mut fmt::Formatter) -> Result<(), fmt::Error> {
 		match self {
-			PaymentId::Lightning(bytes) => write!(fmt, "LN-{}", bytes.as_hex()),
+			PaymentId::SelfCustodial(bytes) => write!(fmt, "SC-{}", bytes.as_hex()),
 			PaymentId::Trusted(s) => write!(fmt, "TR-{}", s.as_hex()),
 		}
 	}
@@ -150,9 +150,9 @@ impl FromStr for PaymentId {
 			return Err(());
 		}
 		match &s[..3] {
-			"LN-" => {
+			"SC-" => {
 				let id = FromHex::from_hex(&s[3..]).map_err(|_| ())?;
-				Ok(PaymentId::Lightning(id))
+				Ok(PaymentId::SelfCustodial(id))
 			},
 			"TR-" => {
 				let id = FromHex::from_hex(&s[3..]).map_err(|_| ())?;
@@ -164,7 +164,7 @@ impl FromStr for PaymentId {
 }
 
 impl_writeable_tlv_based_enum!(PaymentId,
-	{0, Lightning} => (),
+	{0, SelfCustodial} => (),
 	{1, Trusted} => (),
 );
 
@@ -395,7 +395,7 @@ mod tests {
 			1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24,
 			25, 26, 27, 28, 29, 30, 31, 32,
 		];
-		let ln_id = PaymentId::Lightning(ln_id_bytes);
+		let ln_id = PaymentId::SelfCustodial(ln_id_bytes);
 		let ln_id_str = ln_id.to_string();
 		assert_eq!(
 			ln_id_str,

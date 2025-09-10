@@ -325,7 +325,7 @@ impl LdkEventHandler {
 				fee_paid_msat,
 			} => {
 				if let Err(e) = self.event_queue.add_event(Event::PaymentSuccessful {
-					payment_id: PaymentId::Lightning(payment_id.unwrap().0), // safe
+					payment_id: PaymentId::SelfCustodial(payment_id.unwrap().0), // safe
 					payment_hash,
 					payment_preimage: payment_preimage.unwrap(), // safe
 					fee_paid_msat,
@@ -336,7 +336,7 @@ impl LdkEventHandler {
 			},
 			ldk_node::Event::PaymentFailed { payment_id, payment_hash, reason } => {
 				if let Err(e) = self.event_queue.add_event(Event::PaymentFailed {
-					payment_id: PaymentId::Lightning(payment_id.unwrap().0), // safe
+					payment_id: PaymentId::SelfCustodial(payment_id.unwrap().0), // safe
 					payment_hash,
 					reason,
 				}) {
