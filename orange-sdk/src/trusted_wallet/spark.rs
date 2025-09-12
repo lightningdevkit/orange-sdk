@@ -671,8 +671,6 @@ impl TryFrom<&SspUserRequest> for PaymentType {
 
 fn get_id_from_wallet_transfer(transfer: &WalletTransfer) -> Result<String, TrustedError> {
 	match &transfer.user_request {
-		// Some(SspUserRequest::LeavesSwapRequest(_)) => PaymentType::TrustedInternal {},
-		// Some(SspUserRequest::LightningReceiveRequest(_)) => PaymentType::IncomingLightning {},
 		Some(SspUserRequest::LightningSendRequest(request)) => {
 			// Spark uses UUIDs for payment IDs, so we need to convert them
 			// to our format. Spark uses a UUID in the format `SparkLightningSendRequest:<uuid>`
