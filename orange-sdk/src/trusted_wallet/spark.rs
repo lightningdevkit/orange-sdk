@@ -11,7 +11,7 @@ use ldk_node::bitcoin::hashes::sha256::Hash as Sha256;
 use ldk_node::lightning::util::logger::Logger as _;
 use ldk_node::lightning::util::persist::KVStore;
 use ldk_node::lightning::util::ser::{Readable, Writeable};
-use ldk_node::lightning::{log_debug, log_error, log_info};
+use ldk_node::lightning::{log_debug, log_error, log_info, log_trace};
 use ldk_node::lightning_invoice::Bolt11Invoice;
 use ldk_node::lightning_types::payment::{PaymentHash, PaymentPreimage};
 use ldk_node::payment::ConfirmationStatus;
@@ -522,6 +522,7 @@ impl Spark {
 		let mut shutdown = self.shutdown_receiver.clone();
 		let spark_wallet = Arc::clone(&self.spark_wallet);
 		let event_queue = Arc::clone(&self.event_queue);
+		let store = Arc::clone(&self.store);
 		let logger = Arc::clone(&self.logger);
 		self.runtime.spawn(async move {
 			for i in 0..MAX_POLL_ATTEMPTS {
@@ -533,14 +534,17 @@ impl Spark {
 					},
 					p = spark_wallet.fetch_lightning_send_payment(&spark_id) => {
 						if let Ok(Some(p)) = p {
-							let status: TxStatus = p.status.into();
+							let status: TxStatus = p.status.clone().into();
 							match status {
-								TxStatus::Pending => {} // do nothing / wait
+								TxStatus::Pending => {
+									// do nothing / wait
+									log_trace!(logger, "Polling payment still pending, status: {:?}, preimage: {:?}", p.status, p.payment_preimage);
+								}
 								TxStatus::Completed => {
 									// wait for preimage
-									if p.payment_preimage.is_some() {
+									if p.payment_preimage.is_some() || i == MAX_POLL_ATTEMPTS - 1 {
 										log_info!(logger, "Polling payment preimage found");
-										let preimage: [u8; 32] = FromHex::from_hex(&p.payment_preimage.unwrap()).unwrap();
+										let preimage: [u8; 32] = p.payment_preimage.as_ref().map(|p| FromHex::from_hex(p).unwrap()).unwrap_or([0; 32]);
 										event_queue
 											.add_event(Event::PaymentSuccessful {
 												payment_id: PaymentId::Trusted(payment_id),
@@ -549,7 +553,15 @@ impl Spark {
 												fee_paid_msat: Some(p.fee_sat * 1_000), // convert to msats
 											})
 										.unwrap();
+
+										if let Err(e) = Self::sync_payments_to_storage(spark_wallet.as_ref(), &store, logger.as_ref()).await {
+											log_error!(logger, "Failed to sync payments to storage: {e:?}");
+										} else {
+											log_info!(logger, "Payments synced to storage");
+										}
 										return;
+									} else {
+										log_debug!(logger, "Polling payment completed but no preimage yet");
 									}
 								}
 								TxStatus::Failed => {
@@ -564,6 +576,8 @@ impl Spark {
 									return;
 								}
 							}
+						} else {
+							log_debug!(logger, "Polling payment not found yet");
 						}
 						let sleep_time = if i < 5 { Duration::from_secs(1) } else { Duration::from_secs(i) };
 						tokio::time::sleep(sleep_time).await;
@@ -703,7 +717,8 @@ impl From<TransferStatus> for TxStatus {
 impl From<LightningSendStatus> for TxStatus {
 	fn from(o: LightningSendStatus) -> TxStatus {
 		match o {
-			LightningSendStatus::LightningPaymentSucceeded => TxStatus::Completed,
+			LightningSendStatus::LightningPaymentSucceeded
+			| LightningSendStatus::TransferCompleted => TxStatus::Completed,
 			LightningSendStatus::TransferFailed
 			| LightningSendStatus::LightningPaymentFailed
 			| LightningSendStatus::UserSwapReturnFailed
@@ -711,7 +726,6 @@ impl From<LightningSendStatus> for TxStatus {
 			LightningSendStatus::Unknown
 			| LightningSendStatus::UserSwapReturned
 			| LightningSendStatus::PendingUserSwapReturn
-			| LightningSendStatus::TransferCompleted
 			| LightningSendStatus::Created
 			| LightningSendStatus::RequestValidated
 			| LightningSendStatus::LightningPaymentInitiated
