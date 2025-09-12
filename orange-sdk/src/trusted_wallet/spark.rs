@@ -79,10 +79,13 @@ impl TrustedWalletInterface for Spark {
 					"Spark does not support amount-less invoices".to_owned(),
 				)),
 				Some(a) => {
-					let res = self
-						.spark_wallet
-						.create_lightning_invoice(a.sats_rounding_up(), None, None)
-						.await?;
+					let sats = a.sats().map_err(|_| {
+						TrustedError::UnsupportedOperation(
+							"msat amounts not supported by spark".to_owned(),
+						)
+					})?;
+
+					let res = self.spark_wallet.create_lightning_invoice(sats, None, None).await?;
 
 					Bolt11Invoice::from_str(&res.invoice)
 						.map_err(|e| TrustedError::Other(format!("Failed to parse invoice: {e}")))
@@ -151,12 +154,15 @@ impl TrustedWalletInterface for Spark {
 	) -> Pin<Box<dyn Future<Output = Result<Amount, TrustedError>> + Send + '_>> {
 		Box::pin(async move {
 			if let PaymentMethod::LightningBolt11(invoice) = method {
+				let sats = amount.sats().map_err(|_| {
+					TrustedError::UnsupportedOperation(
+						"msat amounts not supported by spark".to_owned(),
+					)
+				})?;
+
 				let fee_sats = self
 					.spark_wallet
-					.fetch_lightning_send_fee_estimate(
-						&invoice.to_string(),
-						Some(amount.sats_rounding_up()), // fixme: why do they do sat amounts?
-					)
+					.fetch_lightning_send_fee_estimate(&invoice.to_string(), Some(sats))
 					.await?;
 
 				Amount::from_sats(fee_sats).map_err(|_| TrustedError::AmountError)
@@ -174,11 +180,17 @@ impl TrustedWalletInterface for Spark {
 	) -> Pin<Box<dyn Future<Output = Result<[u8; 32], TrustedError>> + Send + '_>> {
 		Box::pin(async move {
 			if let PaymentMethod::LightningBolt11(invoice) = method {
+				let sats = amount.sats().map_err(|_| {
+					TrustedError::UnsupportedOperation(
+						"msat amounts not supported by spark".to_owned(),
+					)
+				})?;
+
 				let res = self
 					.spark_wallet
 					.pay_lightning_invoice(
 						&invoice.to_string(),
-						Some(amount.sats_rounding_up()), // fixme: why do they do sat amounts?
+						Some(sats),
 						None,
 						true, // prefer spark to make things cheaper
 					)
