@@ -473,12 +473,14 @@ impl Spark {
 			// Process transfers in this batch
 			for transfer in &transfers_response {
 				// Create a payment record
+				let id = get_id_from_wallet_transfer(transfer)?;
 				let store_tx: StoreTransaction = StoreTransaction::try_from(transfer)?;
+
 				// Insert payment into storage
 				if let Err(err) = store.write(
 					SPARK_PRIMARY_NAMESPACE,
 					SPARK_PAYMENTS_NAMESPACE,
-					transfer.id.to_string().as_str(),
+					id.as_str(),
 					&store_tx.encode(),
 				) {
 					log_error!(logger, "Failed to insert payment: {err:?}");
@@ -650,6 +652,33 @@ impl TryFrom<&SspUserRequest> for PaymentType {
 			},
 		};
 		Ok(details)
+	}
+}
+
+fn get_id_from_wallet_transfer(transfer: &WalletTransfer) -> Result<String, TrustedError> {
+	match &transfer.user_request {
+		// Some(SspUserRequest::LeavesSwapRequest(_)) => PaymentType::TrustedInternal {},
+		// Some(SspUserRequest::LightningReceiveRequest(_)) => PaymentType::IncomingLightning {},
+		Some(SspUserRequest::LightningSendRequest(request)) => {
+			// Spark uses UUIDs for payment IDs, so we need to convert them
+			// to our format. Spark uses a UUID in the format `SparkLightningSendRequest:<uuid>`
+			// We only need the UUID part, so we split by ':' and take the last part.
+			// If the format is invalid, we return an error.
+			if let Some(id) = request.id.split(':').next_back() {
+				let uuid = Uuid::from_str(id).map_err(|_| {
+					TrustedError::Other(format!("Failed to parse payment id: {id}"))
+				})?;
+				Ok(uuid.to_string())
+			} else {
+				// if it's not in the expected format, try to parse the whole thing as a uuid
+				let uuid = Uuid::from_str(&request.id).map_err(|_| {
+					TrustedError::Other(format!("Failed to parse payment id: {}", request.id))
+				})?;
+				Ok(uuid.to_string())
+			}
+		},
+		None => Ok(transfer.id.to_string()),
+		_ => Ok(transfer.id.to_string()), // todo do we need to handle other types differently?
 	}
 }
 
