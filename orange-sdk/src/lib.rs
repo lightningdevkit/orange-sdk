@@ -722,24 +722,39 @@ impl Wallet {
 					},
 				}
 			} else {
-				debug_assert!(
-					!payment.outbound,
-					"Missing outbound trusted payment metadata entry on {:?}",
-					payment.id
-				);
+				if payment.outbound {
+					log_warn!(
+						self.inner.logger,
+						"Missing outbound trusted payment metadata entry on {:?}",
+						payment.id
+					);
+					#[cfg(feature = "_test-utils")]
+					debug_assert!(
+						false,
+						"Missing outbound trusted payment metadata entry on {:?}",
+						payment.id
+					);
+				}
 
 				if payment.status != TxStatus::Completed {
 					// We don't bother to surface pending inbound transactions (i.e. issued but
 					// unpaid invoices) in our transaction list.
 					continue;
 				}
+
+				let payment_type = if payment.outbound {
+					PaymentType::OutgoingLightningBolt11 { payment_preimage: None }
+				} else {
+					PaymentType::IncomingLightning {}
+				};
+
 				res.push(Transaction {
 					id: PaymentId::Trusted(payment.id),
 					status: payment.status,
 					outbound: payment.outbound,
 					amount: Some(payment.amount),
 					fee: Some(payment.fee),
-					payment_type: PaymentType::IncomingLightning {},
+					payment_type,
 					time_since_epoch: payment.time_since_epoch,
 				});
 			}
