@@ -15,7 +15,7 @@ use ldk_node::lightning::ln::channelmanager::PaymentId;
 use ldk_node::lightning::ln::msgs::SocketAddress;
 use ldk_node::lightning::util::logger::Logger as _;
 use ldk_node::lightning::util::persist::KVStore;
-use ldk_node::lightning::{log_debug, log_error};
+use ldk_node::lightning::{log_debug, log_error, log_info};
 use ldk_node::lightning_invoice::{Bolt11Invoice, Bolt11InvoiceDescription, Description};
 use ldk_node::payment::{PaymentDetails, PaymentDirection, PaymentKind, PaymentStatus};
 use ldk_node::{NodeError, UserChannelId, lightning};
@@ -55,6 +55,7 @@ impl LightningWallet {
 		runtime: Arc<Runtime>, config: WalletConfig, store: Arc<dyn KVStore + Sync + Send>,
 		event_queue: Arc<EventQueue>, tx_metadata: TxMetadataStore, logger: Arc<Logger>,
 	) -> Result<Self, InitFailure> {
+		log_info!(logger, "Creating LDK node...");
 		let anchor_channels_config = ldk_node::config::AnchorChannelsConfig {
 			trusted_peers_no_reserve: vec![config.lsp.1],
 			..Default::default()

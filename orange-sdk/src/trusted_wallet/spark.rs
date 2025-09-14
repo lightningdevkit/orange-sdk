@@ -304,11 +304,11 @@ impl Spark {
 			signer.get_identity_public_key().map_err(|e| TrustedError::Other(format!("{e:?}")))?;
 		log_info!(logger, "Starting Spark wallet with public key: {pk}");
 
-		let spark_wallet = Arc::new(
-			SparkWallet::connect(spark_config, signer)
-				.await
-				.map_err(|e| InitFailure::TrustedFailure(e.into()))?,
-		);
+		let spark_wallet =
+			Arc::new(SparkWallet::connect(spark_config, signer).await.map_err(|e| {
+				log_error!(logger, "Failed to connect to Spark wallet: {e:?}");
+				InitFailure::TrustedFailure(e.into())
+			})?);
 
 		let (shutdown_sender, shutdown_receiver) = watch::channel::<()>(());
 		let mut events = spark_wallet.subscribe_events();
@@ -407,6 +407,8 @@ impl Spark {
 				}
 			}
 		});
+
+		log_info!(logger, "Spark wallet initialized");
 
 		Ok(Spark {
 			spark_wallet,
