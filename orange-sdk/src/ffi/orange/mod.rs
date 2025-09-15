@@ -1,6 +1,8 @@
 use crate::bitcoin::hashes::Hash;
 use crate::ffi::bitcoin_payment_instructions::Amount;
-use crate::{PaymentId as OrangePaymentId, Transaction as OrangeTransaction};
+use crate::{
+	PaymentId as OrangePaymentId, Transaction as OrangeTransaction, event::Event as OrangeEvent,
+};
 use crate::{impl_from_core_type, impl_into_core_type};
 use std::sync::Arc;
 
@@ -150,6 +152,203 @@ impl From<crate::store::PaymentType> for PaymentType {
 			},
 			crate::store::PaymentType::IncomingLightning {} => PaymentType::IncomingLightning {},
 			crate::store::PaymentType::TrustedInternal {} => PaymentType::TrustedInternal {},
+		}
+	}
+}
+
+/// An event emitted by [`Wallet`], which should be handled by the user.
+///
+/// [`Wallet`]: [`crate::Wallet`]
+#[derive(Debug, Clone, Eq, PartialEq, uniffi::Enum)]
+pub enum Event {
+	/// An outgoing payment was successful.
+	PaymentSuccessful {
+		/// A local identifier used to track the payment.
+		payment_id: Arc<PaymentId>,
+		/// The hash of the payment.
+		payment_hash: Vec<u8>,
+		/// The preimage to the `payment_hash`.
+		///
+		/// Note that this serves as a payment receipt.
+		payment_preimage: Vec<u8>,
+		/// The total fee which was spent at intermediate hops in this payment.
+		fee_paid_msat: Option<u64>,
+	},
+	/// An outgoing payment has failed.
+	PaymentFailed {
+		/// A local identifier used to track the payment.
+		payment_id: Arc<PaymentId>,
+		/// The hash of the payment.
+		///
+		/// This will be `None` if the payment failed before receiving an invoice when paying a
+		/// BOLT12 [`Offer`].
+		///
+		/// [`Offer`]: ldk_node::lightning::offers::offer::Offer
+		payment_hash: Option<Vec<u8>>,
+		/// The reason why the payment failed.
+		///
+		/// Will be `None` if the failure reason is not known.
+		reason: Option<String>,
+	},
+	/// A payment has been received.
+	PaymentReceived {
+		/// A local identifier used to track the payment.
+		payment_id: Arc<PaymentId>,
+		/// The hash of the payment.
+		payment_hash: Vec<u8>,
+		/// The value, in msats, that has been received.
+		amount_msat: u64,
+		/// Custom TLV records received on the payment
+		custom_records: Vec<Vec<u8>>,
+		/// The value, in msats, that was skimmed off of this payment as an extra fee taken by LSP.
+		/// Typically, this is only present for payments that result in opening a channel.
+		lsp_fee_msats: Option<u64>,
+	},
+	/// A payment has been received.
+	OnchainPaymentReceived {
+		/// A local identifier used to track the payment.
+		payment_id: Arc<PaymentId>,
+		/// The transaction ID.
+		txid: Vec<u8>,
+		/// The value, in sats, that has been received.
+		amount_sat: u64,
+	},
+	/// A channel is ready to be used.
+	ChannelOpened {
+		/// The `channel_id` of the channel.
+		channel_id: Vec<u8>,
+		/// The `user_channel_id` of the channel.
+		user_channel_id: Vec<u8>,
+		/// The `node_id` of the channel counterparty.
+		counterparty_node_id: Vec<u8>,
+		/// The outpoint of the channel's funding transaction.
+		funding_txo: String,
+	},
+	/// A channel has been closed.
+	///
+	/// When a channel is closed, we will disable automatic rebalancing
+	/// so new channels will not be opened until it is explicitly enabled again.
+	ChannelClosed {
+		/// The `channel_id` of the channel.
+		channel_id: Vec<u8>,
+		/// The `user_channel_id` of the channel.
+		user_channel_id: Vec<u8>,
+		/// The `node_id` of the channel counterparty.
+		counterparty_node_id: Vec<u8>,
+		/// Why the channel was closed.
+		///
+		/// Will be `None` if the closure reason is not known.
+		reason: Option<String>,
+	},
+	/// A rebalance from our trusted wallet has been initiated.
+	RebalanceInitiated {
+		/// The `payment_id` of the transaction that triggered the rebalance.
+		trigger_payment_id: Arc<PaymentId>,
+		/// The `payment_id` of the rebalance payment sent from the trusted wallet.
+		trusted_rebalance_payment_id: Vec<u8>,
+		/// The amount, in msats, of the rebalance payment.
+		amount_msat: u64,
+	},
+	/// A rebalance from our trusted wallet was successful.
+	RebalanceSuccessful {
+		/// The `payment_id` of the transaction that triggered the rebalance.
+		trigger_payment_id: Arc<PaymentId>,
+		/// The `payment_id` of the rebalance payment sent from the trusted wallet.
+		trusted_rebalance_payment_id: Vec<u8>,
+		/// The `payment_id` of the rebalance payment sent to the LN wallet.
+		ln_rebalance_payment_id: Vec<u8>,
+		/// The amount, in msats, of the rebalance payment.
+		amount_msat: u64,
+		/// The fee paid, in msats, for the rebalance payment.
+		fee_msat: u64,
+	},
+}
+
+impl From<OrangeEvent> for Event {
+	fn from(value: OrangeEvent) -> Self {
+		match value {
+			OrangeEvent::PaymentSuccessful {
+				payment_id,
+				payment_hash,
+				payment_preimage,
+				fee_paid_msat,
+			} => Event::PaymentSuccessful {
+				payment_id: Arc::new(payment_id.into()),
+				payment_hash: payment_hash.0.to_vec(),
+				payment_preimage: payment_preimage.0.to_vec(),
+				fee_paid_msat,
+			},
+			OrangeEvent::PaymentFailed { payment_id, payment_hash, reason } => {
+				Event::PaymentFailed {
+					payment_id: Arc::new(payment_id.into()),
+					payment_hash: payment_hash.map(|h| h.0.to_vec()),
+					reason: reason.map(|r| format!("{:?}", r)),
+				}
+			},
+			OrangeEvent::PaymentReceived {
+				payment_id,
+				payment_hash,
+				amount_msat,
+				custom_records,
+				lsp_fee_msats,
+			} => Event::PaymentReceived {
+				payment_id: Arc::new(payment_id.into()),
+				payment_hash: payment_hash.0.to_vec(),
+				amount_msat,
+				custom_records: custom_records.into_iter().map(|r| r.value).collect(),
+				lsp_fee_msats,
+			},
+			OrangeEvent::OnchainPaymentReceived { payment_id, txid, amount_sat, status: _ } => {
+				Event::OnchainPaymentReceived {
+					payment_id: Arc::new(payment_id.into()),
+					txid: txid.to_byte_array().to_vec(),
+					amount_sat,
+				}
+			},
+			OrangeEvent::ChannelOpened {
+				channel_id,
+				user_channel_id,
+				counterparty_node_id,
+				funding_txo,
+			} => Event::ChannelOpened {
+				channel_id: channel_id.0.to_vec(),
+				user_channel_id: user_channel_id.0.to_be_bytes().to_vec(),
+				counterparty_node_id: counterparty_node_id.serialize().to_vec(),
+				funding_txo: funding_txo.to_string(),
+			},
+			OrangeEvent::ChannelClosed {
+				channel_id,
+				user_channel_id,
+				counterparty_node_id,
+				reason,
+			} => Event::ChannelClosed {
+				channel_id: channel_id.0.to_vec(),
+				user_channel_id: user_channel_id.0.to_be_bytes().to_vec(),
+				counterparty_node_id: counterparty_node_id.serialize().to_vec(),
+				reason: reason.map(|r| format!("{:?}", r)),
+			},
+			OrangeEvent::RebalanceInitiated {
+				trigger_payment_id,
+				trusted_rebalance_payment_id,
+				amount_msat,
+			} => Event::RebalanceInitiated {
+				trigger_payment_id: Arc::new(trigger_payment_id.into()),
+				trusted_rebalance_payment_id: trusted_rebalance_payment_id.to_vec(),
+				amount_msat,
+			},
+			OrangeEvent::RebalanceSuccessful {
+				trigger_payment_id,
+				trusted_rebalance_payment_id,
+				ln_rebalance_payment_id,
+				amount_msat,
+				fee_msat,
+			} => Event::RebalanceSuccessful {
+				trigger_payment_id: Arc::new(trigger_payment_id.into()),
+				trusted_rebalance_payment_id: trusted_rebalance_payment_id.to_vec(),
+				ln_rebalance_payment_id: ln_rebalance_payment_id.to_vec(),
+				amount_msat,
+				fee_msat,
+			},
 		}
 	}
 }

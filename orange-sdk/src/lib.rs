@@ -1249,7 +1249,7 @@ impl Wallet {
 
 	/// Returns the next event in the event queue, if currently available.
 	///
-	/// Will return `Some(..)` if an event is available and `None` otherwise.
+	/// Will return `Some(...)` if an event is available and `None` otherwise.
 	///
 	/// **Note:** this will always return the same event until handling is confirmed via [`Wallet::event_handled`].
 	///

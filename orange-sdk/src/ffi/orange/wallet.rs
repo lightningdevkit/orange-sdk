@@ -1,5 +1,4 @@
 use crate::Balances as OrangeBalances;
-
 use crate::SingleUseReceiveUri as OrangeSingleUseReceiveUri;
 use crate::Wallet as OrangeWallet;
 use crate::WalletConfig as OrangeWalletConfig;
@@ -7,7 +6,8 @@ use crate::ffi::bitcoin_payment_instructions::{
 	Amount, ParseError, PaymentInfo, PaymentInstructions,
 };
 use crate::ffi::ldk_node::ChannelDetails;
-use crate::ffi::orange::config::WalletConfig;
+use crate::ffi::orange::Event;
+use crate::ffi::orange::config::{Tunables, WalletConfig};
 use crate::ffi::orange::error::{InitFailure, WalletError};
 use crate::{impl_from_core_type, impl_into_core_type};
 use std::sync::Arc;
@@ -162,6 +162,17 @@ impl Wallet {
 		Ok(())
 	}
 
+	/// Estimates the fees required to pay using the provided PaymentInfo
+	///
+	/// This will estimate fees for the optimal payment method based on the current wallet state,
+	/// including whether the payment would be routed through the trusted wallet or lightning wallet.
+	pub async fn estimate_fee(
+		&self, payment_info: Arc<PaymentInfo>,
+	) -> Result<Arc<Amount>, WalletError> {
+		let fee = self.inner.estimate_fee(&payment_info.0.instructions).await;
+		Ok(Arc::new(fee.into()))
+	}
+
 	pub async fn stop(&self) {
 		self.inner.stop().await
 	}
@@ -176,5 +187,59 @@ impl Wallet {
 	/// List our current channels
 	pub fn list_channels(&self) -> Vec<Arc<ChannelDetails>> {
 		self.inner.channels().into_iter().map(|ch| Arc::new(ch.into())).collect()
+	}
+
+	/// List our current channels
+	pub fn close_channels(&self) -> Result<(), WalletError> {
+		self.inner.close_channels()?;
+		Ok(())
+	}
+
+	/// Returns the wallet's configured tunables.
+	pub fn get_tunables(&self) -> Arc<Tunables> {
+		Arc::new(self.inner.get_tunables().into())
+	}
+
+	/// Returns the next event in the event queue, if currently available.
+	///
+	/// Will return `Some(...)` if an event is available and `None` otherwise.
+	///
+	/// **Note:** this will always return the same event until handling is confirmed via [`crate::Wallet::event_handled`].
+	///
+	/// **Caution:** Users must handle events as quickly as possible to prevent a large event backlog,
+	/// which can increase the memory footprint of [`crate::Wallet`].
+	pub fn next_event(&self) -> Option<Event> {
+		self.inner.next_event().map(|e| e.into())
+	}
+
+	/// Returns the next event in the event queue.
+	///
+	/// Will asynchronously poll the event queue until the next event is ready.
+	///
+	/// **Note:** this will always return the same event until handling is confirmed via [`crate::Wallet::event_handled`].
+	///
+	/// **Caution:** Users must handle events as quickly as possible to prevent a large event backlog,
+	/// which can increase the memory footprint of [`crate::Wallet`].
+	pub async fn next_event_async(&self) -> Event {
+		self.inner.next_event_async().await.into()
+	}
+
+	/// Returns the next event in the event queue.
+	///
+	/// Will block the current thread until the next event is available.
+	///
+	/// **Note:** this will always return the same event until handling is confirmed via [`crate::Wallet::event_handled`].
+	///
+	/// **Caution:** Users must handle events as quickly as possible to prevent a large event backlog,
+	/// which can increase the memory footprint of [`crate::Wallet`].
+	pub fn wait_next_event(&self) -> Event {
+		self.inner.wait_next_event().into()
+	}
+
+	/// Confirm the last retrieved event handled. Returns true if successful.
+	///
+	/// **Note:** This **MUST** be called after each event has been handled.
+	pub fn event_handled(&self) -> bool {
+		self.inner.event_handled().is_ok()
 	}
 }
