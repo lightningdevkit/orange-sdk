@@ -62,7 +62,7 @@ def run(new_checksum: str = None, new_tag: str = None):
 		print(f'setting {current_variable_name} (JSON-serialization):')
 		print(json.dumps(new_value))
 
-		regex = re.compile(f'(let[\s]+{current_variable_name}[\s]*=[\s]*)(.*)')
+		regex = re.compile(f'({current_variable_name}:[\s]*)(.*)')
 
 		previous_value = regex.search(package_file).group(2)
 		package_file = package_file.replace(previous_value, f'"{new_value}"')
