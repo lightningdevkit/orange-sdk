@@ -324,10 +324,17 @@ impl LdkEventHandler {
 				payment_preimage,
 				fee_paid_msat,
 			} => {
+				let preimage = payment_preimage.unwrap(); // safe
+				let payment_id = PaymentId::SelfCustodial(payment_id.unwrap().0); // safe
+
+				if self.tx_metadata.set_preimage(payment_id, preimage.0).is_err() {
+					log_error!(self.logger, "Failed to set preimage for payment {payment_id:?}");
+				}
+
 				if let Err(e) = self.event_queue.add_event(Event::PaymentSuccessful {
-					payment_id: PaymentId::SelfCustodial(payment_id.unwrap().0), // safe
+					payment_id,
 					payment_hash,
-					payment_preimage: payment_preimage.unwrap(), // safe
+					payment_preimage: preimage,
 					fee_paid_msat,
 				}) {
 					log_error!(self.logger, "Failed to add PaymentSuccessful event: {e:?}");

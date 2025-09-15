@@ -351,12 +351,22 @@ impl TrustedWalletInterface for Cashu {
 									},
 								};
 
+								let payment_preimage =
+									preimage.unwrap_or(PaymentPreimage([0u8; 32]));
+
+								if tx_metadata.set_preimage(payment_id, payment_preimage.0).is_err()
+								{
+									log_error!(
+										logger,
+										"Failed to set preimage for payment {payment_id:?}"
+									);
+								}
+
 								let fee_paid_sat: u64 = res.fee_paid.into();
 								let _ = event_queue.add_event(Event::PaymentSuccessful {
 									payment_id,
 									payment_hash: hash,
-									payment_preimage: preimage
-										.unwrap_or(PaymentPreimage([0u8; 32])),
+									payment_preimage,
 									fee_paid_msat: Some(fee_paid_sat * 1_000), // convert to msats
 								});
 							},

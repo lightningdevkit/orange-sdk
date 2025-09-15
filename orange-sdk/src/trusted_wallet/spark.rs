@@ -524,6 +524,7 @@ impl Spark {
 		let spark_wallet = Arc::clone(&self.spark_wallet);
 		let event_queue = Arc::clone(&self.event_queue);
 		let store = Arc::clone(&self.store);
+		let tx_metadata = self.tx_metadata.clone();
 		let logger = Arc::clone(&self.logger);
 		self.runtime.spawn(async move {
 			for i in 0..MAX_POLL_ATTEMPTS {
@@ -546,6 +547,11 @@ impl Spark {
 									if p.payment_preimage.is_some() || i == MAX_POLL_ATTEMPTS - 1 {
 										log_info!(logger, "Polling payment preimage found");
 										let preimage: [u8; 32] = p.payment_preimage.as_ref().map(|p| FromHex::from_hex(p).unwrap()).unwrap_or([0; 32]);
+
+										if tx_metadata.set_preimage(PaymentId::Trusted(payment_id), preimage).is_err() {
+											log_error!(logger, "Failed to set preimage for payment {payment_id:?}");
+										}
+
 										event_queue
 											.add_event(Event::PaymentSuccessful {
 												payment_id: PaymentId::Trusted(payment_id),
