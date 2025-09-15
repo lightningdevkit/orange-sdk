@@ -536,7 +536,7 @@ impl Spark {
 					},
 					p = spark_wallet.fetch_lightning_send_payment(&spark_id) => {
 						if let Ok(Some(p)) = p {
-							let status: TxStatus = p.status.clone().into();
+							let status: TxStatus = p.status.into();
 							match status {
 								TxStatus::Pending => {
 									// do nothing / wait
