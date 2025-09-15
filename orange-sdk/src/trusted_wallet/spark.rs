@@ -192,7 +192,7 @@ impl TrustedWalletInterface for Spark {
 						&invoice.to_string(),
 						Some(sats),
 						None,
-						true, // prefer spark to make things cheaper
+						false, // do not prefer spark for better privacy
 					)
 					.await?;
 
