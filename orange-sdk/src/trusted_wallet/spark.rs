@@ -38,7 +38,7 @@ use uuid::Uuid;
 /// A wallet implementation using the Breez Spark SDK.
 #[derive(Clone)]
 pub(crate) struct Spark {
-	spark_wallet: Arc<SparkWallet<DefaultSigner>>,
+	spark_wallet: Arc<SparkWallet>,
 	store: Arc<dyn KVStore + Send + Sync>,
 	event_queue: Arc<EventQueue>,
 	tx_metadata: TxMetadataStore,
@@ -305,7 +305,7 @@ impl Spark {
 		log_info!(logger, "Starting Spark wallet with public key: {pk}");
 
 		let spark_wallet =
-			Arc::new(SparkWallet::connect(spark_config, signer).await.map_err(|e| {
+			Arc::new(SparkWallet::connect(spark_config, Arc::new(signer)).await.map_err(|e| {
 				log_error!(logger, "Failed to connect to Spark wallet: {e:?}");
 				InitFailure::TrustedFailure(e.into())
 			})?);
@@ -424,8 +424,7 @@ impl Spark {
 
 	/// Synchronizes payments from transfers to persistent storage
 	async fn sync_payments_to_storage(
-		spark_wallet: &SparkWallet<DefaultSigner>, store: &Arc<dyn KVStore + Send + Sync>,
-		logger: &Logger,
+		spark_wallet: &SparkWallet, store: &Arc<dyn KVStore + Send + Sync>, logger: &Logger,
 	) -> Result<(), TrustedError> {
 		// sync payments
 		const BATCH_SIZE: u64 = 50;
