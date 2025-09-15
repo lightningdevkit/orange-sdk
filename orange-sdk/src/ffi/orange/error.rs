@@ -5,6 +5,7 @@ use std::fmt::Display;
 #[derive(Debug, uniffi::Error)]
 pub enum ConfigError {
 	InvalidEntropySize(u32),
+	InvalidMnemonic,
 	InvalidLspAddress(String),
 	InvalidLspNodeId(String),
 }
@@ -14,6 +15,9 @@ impl Display for ConfigError {
 		match self {
 			ConfigError::InvalidEntropySize(size) => {
 				write!(f, "Invalid entropy size: {size}. Entropy must be 64 bytes.")
+			},
+			ConfigError::InvalidMnemonic => {
+				write!(f, "Invalid mnemonic phrase")
 			},
 			ConfigError::InvalidLspAddress(address) => write!(f, "Invalid LSP address: {address}"),
 			ConfigError::InvalidLspNodeId(node_id) => write!(f, "Invalid LSP node ID: {node_id}"),

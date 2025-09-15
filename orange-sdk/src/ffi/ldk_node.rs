@@ -4,6 +4,7 @@ use crate::{impl_from_core_type, impl_into_core_type};
 use ldk_node::ChannelDetails as LDKChannelDetails;
 use ldk_node::bip39::Mnemonic as LDKMnemonic;
 use ldk_node::bitcoin::Network as LDKNetwork;
+use std::str::FromStr;
 
 impl From<Network> for LDKNetwork {
 	fn from(network: Network) -> Self {
@@ -27,6 +28,18 @@ impl Mnemonic {
 			Ok(mnemonic) => Ok(Mnemonic(mnemonic)),
 			Err(_) => Err(ConfigError::InvalidEntropySize(entropy.len() as u32)),
 		}
+	}
+
+	#[uniffi::constructor]
+	pub fn from_str(str: &str) -> Result<Self, ConfigError> {
+		match LDKMnemonic::from_str(str) {
+			Ok(mnemonic) => Ok(Mnemonic(mnemonic)),
+			Err(_) => Err(ConfigError::InvalidMnemonic),
+		}
+	}
+
+	pub fn to_string(&self) -> String {
+		self.0.to_string()
 	}
 }
 
