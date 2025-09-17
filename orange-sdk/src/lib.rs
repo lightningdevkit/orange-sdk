@@ -1242,6 +1242,14 @@ impl Wallet {
 		Ok(())
 	}
 
+	/// Authenticates the user via [LNURL-auth] for the given LNURL string.
+	///
+	/// [LNURL-auth]: https://github.com/lnurl/luds/blob/luds/04.md
+	pub fn lnurl_auth(&self, lnurl: &str) -> Result<(), WalletError> {
+		self.inner.ln_wallet.inner.ldk_node.lnurl_auth(lnurl)?;
+		Ok(())
+	}
+
 	/// Returns the wallet's configured tunables.
 	pub fn get_tunables(&self) -> Tunables {
 		self.inner.tunables
