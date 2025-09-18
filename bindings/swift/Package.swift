@@ -21,8 +21,9 @@ let package = Package(
         ),
         .binaryTarget(
             name: "OrangeSDKFFI",
-            url: "https://github.com/lightningdevkit/orange-sdk/releases/download/v0.1.0-alpha.1/OrangeSDKFFI.xcframework.zip",
-            checksum: "b4830908bb71a6878974d3e2984cdef23f01b1fbe2b19bc209cef27df12a15d5"
+            //url: "https://github.com/lightningdevkit/orange-sdk/releases/download/v0.1.0-alpha.1/OrangeSDKFFI.xcframework.zip",
+            //checksum: "",
+            path: "./OrangeSDKFFI.xcframework"
             )
     ]
 )
