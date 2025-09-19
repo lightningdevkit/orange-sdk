@@ -1,11 +1,10 @@
 //! An implementation of `TrustedWalletInterface` using the Spark SDK.
-use crate::bitcoin::hashes::{Hash, sha256};
 use crate::bitcoin::hex::FromHex;
 use crate::bitcoin::{Network, io};
 use crate::logging::Logger;
 use crate::store::{PaymentId, TxMetadataStore, TxStatus};
 use crate::trusted_wallet::{Payment, TrustedError, TrustedWalletInterface};
-use crate::{Event, EventQueue, InitFailure, Mnemonic, Seed, WalletConfig};
+use crate::{Event, EventQueue, InitFailure, Seed, WalletConfig};
 
 use ldk_node::lightning::util::logger::Logger as _;
 use ldk_node::lightning::util::persist::KVStore;
@@ -139,20 +138,8 @@ impl TrustedWalletInterface for Spark {
 				.list_payments(ListPaymentsRequest { limit: None, offset: None })
 				.await?;
 
-			let payments = resp
-				.payments
-				.into_iter()
-				.map(|p| {
-					parse_payment_id(&p.id).map(|id| Payment {
-						id,
-						amount: Amount::from_sats(p.amount).unwrap(),
-						fee: Amount::from_sats(p.fees).unwrap(),
-						status: p.status.into(),
-						outbound: p.payment_type == PaymentType::Send,
-						time_since_epoch: Duration::from_secs(p.timestamp),
-					})
-				})
-				.collect::<Result<_, _>>()?;
+			let payments =
+				resp.payments.into_iter().map(|p| p.try_into()).collect::<Result<_, _>>()?;
 
 			Ok(payments)
 		})
@@ -238,18 +225,16 @@ impl Spark {
 	) -> Result<Self, InitFailure> {
 		let spark_config: breez_sdk_spark::Config = spark_config.to_breez_config(config.network)?;
 
-		let (mnemonic, passphrase) = match &config.seed {
-			Seed::Seed64(bytes) => {
-				// max entropy for bip39 is 32 bytes, so we hash the 64 bytes down to 32
-				let hash = sha256::Hash::hash(bytes);
-				let mnemonic = Mnemonic::from_entropy(hash.as_byte_array()).expect("valid length");
-				(mnemonic.to_string(), None)
+		let seed = match &config.seed {
+			Seed::Seed64(bytes) => breez_sdk_spark::Seed::Entropy(bytes.to_vec()),
+			Seed::Mnemonic { mnemonic, passphrase } => breez_sdk_spark::Seed::Mnemonic {
+				mnemonic: mnemonic.to_string(),
+				passphrase: passphrase.clone(),
 			},
-			Seed::Mnemonic { mnemonic, passphrase } => (mnemonic.to_string(), passphrase.clone()),
 		};
 
 		let spark_store = SparkStore(store);
-		let builder = SdkBuilder::new(spark_config, mnemonic, passphrase, Arc::new(spark_store));
+		let builder = SdkBuilder::new(spark_config, seed, Arc::new(spark_store));
 
 		let spark_wallet = Arc::new(builder.build().await.map_err(|e| {
 			log_error!(logger, "Failed to initialize Spark wallet: {e:?}");
@@ -304,6 +289,11 @@ impl EventListener for SparkEventHandler {
 			},
 			SdkEvent::PaymentSucceeded { payment } => {
 				if let Err(e) = self.handle_payment_succeeded(payment) {
+					log_error!(self.logger, "Failed to handle payment succeeded: {e:?}");
+				}
+			},
+			SdkEvent::PaymentFailed { payment } => {
+				if let Err(e) = self.handle_payment_failed(payment) {
 					log_error!(self.logger, "Failed to handle payment succeeded: {e:?}");
 				}
 			},
@@ -378,6 +368,36 @@ impl SparkEventHandler {
 						)
 					},
 				}
+			},
+		}
+
+		Ok(())
+	}
+
+	fn handle_payment_failed(&self, payment: breez_sdk_spark::Payment) -> Result<(), TrustedError> {
+		log_info!(self.logger, "Spark payment failed: {payment:?}");
+
+		let id = parse_payment_id(&payment.id)?;
+
+		match payment.payment_type {
+			PaymentType::Send => match payment.details {
+				Some(PaymentDetails::Lightning { payment_hash, .. }) => {
+					let payment_hash: [u8; 32] = FromHex::from_hex(&payment_hash).map_err(|e| {
+						TrustedError::Other(format!("Invalid payment_hash hex: {e:?}"))
+					})?;
+
+					self.event_queue.add_event(Event::PaymentFailed {
+						payment_id: PaymentId::Trusted(id),
+						payment_hash: Some(PaymentHash(payment_hash)),
+						reason: None,
+					})?;
+				},
+				_ => {
+					log_debug!(self.logger, "Unsupported payment details for Send: {payment:?}")
+				},
+			},
+			PaymentType::Receive => {
+				log_debug!(self.logger, "Receive payments cannot fail: {payment:?}");
 			},
 		}
 
@@ -612,5 +632,22 @@ impl breez_sdk_spark::Storage for SparkStore {
 			.map_err(|e| StorageError::Implementation(format!("{e:?}")))?;
 
 		Ok(())
+	}
+}
+
+impl TryFrom<breez_sdk_spark::Payment> for Payment {
+	type Error = TrustedError;
+
+	fn try_from(value: breez_sdk_spark::Payment) -> Result<Self, Self::Error> {
+		let id = parse_payment_id(&value.id)?;
+
+		Ok(Payment {
+			id,
+			amount: Amount::from_sats(value.amount).map_err(|_| TrustedError::AmountError)?,
+			fee: Amount::from_sats(value.fees).map_err(|_| TrustedError::AmountError)?,
+			status: value.status.into(),
+			outbound: value.payment_type == PaymentType::Send,
+			time_since_epoch: Duration::from_secs(value.timestamp),
+		})
 	}
 }
