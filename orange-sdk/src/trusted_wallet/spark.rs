@@ -103,33 +103,29 @@ impl TrustedWalletInterface for Spark {
 		&self, amount: Option<Amount>,
 	) -> Pin<Box<dyn Future<Output = Result<Bolt11Invoice, TrustedError>> + Send + '_>> {
 		Box::pin(async move {
-			match amount {
-				None => Err(TrustedError::UnsupportedOperation(
-					"Spark does not support amount-less invoices".to_owned(),
-				)),
-				Some(a) if a == Amount::ZERO => Err(TrustedError::UnsupportedOperation(
-					"Spark does not support amount-less invoices".to_owned(),
-				)),
+			// check amount is not msat value
+			let amount_sats = match amount {
 				Some(a) => {
 					let sats = a.sats().map_err(|_| {
 						TrustedError::UnsupportedOperation(
 							"msat amounts not supported by spark".to_owned(),
 						)
 					})?;
-
-					let params = ReceivePaymentRequest {
-						payment_method: ReceivePaymentMethod::Bolt11Invoice {
-							description: "".to_string(),
-							// TODO: can we do amountless now?
-							amount_sats: Some(sats),
-						},
-					};
-					let res = self.spark_wallet.receive_payment(params).await?;
-
-					Bolt11Invoice::from_str(&res.payment_request)
-						.map_err(|e| TrustedError::Other(format!("Failed to parse invoice: {e}")))
+					Some(sats)
 				},
-			}
+				None => None,
+			};
+
+			let params = ReceivePaymentRequest {
+				payment_method: ReceivePaymentMethod::Bolt11Invoice {
+					description: "".to_string(), // empty description for smaller QRs and better privacy
+					amount_sats,
+				},
+			};
+			let res = self.spark_wallet.receive_payment(params).await?;
+
+			Bolt11Invoice::from_str(&res.payment_request)
+				.map_err(|e| TrustedError::Other(format!("Failed to parse invoice: {e}")))
 		})
 	}
 
