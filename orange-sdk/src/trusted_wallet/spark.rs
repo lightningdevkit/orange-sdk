@@ -1,6 +1,6 @@
 //! An implementation of `TrustedWalletInterface` using the Spark SDK.
 use crate::bitcoin::hex::FromHex;
-use crate::bitcoin::io;
+use crate::bitcoin::{Network, io};
 use crate::logging::Logger;
 use crate::store::{PaymentId, TxMetadataStore, TxStatus};
 use crate::trusted_wallet::{Payment, TrustedError, TrustedWalletInterface};
@@ -32,17 +32,53 @@ use std::time::Duration;
 use tokio::runtime::Runtime;
 use uuid::Uuid;
 
+/// Configuration options for the Spark wallet.
+#[derive(Debug, Copy, Clone)]
+pub struct SparkWalletConfig {
+	/// How often to sync the wallet with the blockchain, in seconds.
+	/// Default is 60 seconds.
+	pub sync_interval_secs: u32,
+	/// When this is set to `true` we will prefer to use spark payments over
+	/// lightning when sending and receiving. This has the benefit of lower fees
+	/// but is at the cost of privacy.
+	pub prefer_spark_over_lightning: bool,
+}
+
+impl Default for SparkWalletConfig {
+	fn default() -> Self {
+		SparkWalletConfig { sync_interval_secs: 60, prefer_spark_over_lightning: false }
+	}
+}
+
+/// Breez API key for using the Spark SDK. We aren't using any of their services
+/// but the SDK requires a valid API key to function.
+const BREEZ_API_KEY: &str = "MIIBajCCARygAwIBAgIHPnfOjAhBgzAFBgMrZXAwEDEOMAwGA1UEAxMFQnJlZXowHhcNMjUwOTE5MjEzNTU1WhcNMzUwOTE3MjEzNTU1WjAqMRMwEQYDVQQKEwpvcmFuZ2Utc2RrMRMwEQYDVQQDEwpvcmFuZ2Utc2RrMCowBQYDK2VwAyEA0IP1y98gPByiIMoph1P0G6cctLb864rNXw1LRLOpXXejezB5MA4GA1UdDwEB/wQEAwIFoDAMBgNVHRMBAf8EAjAAMB0GA1UdDgQWBBTaOaPuXmtLDTJVv++VYBiQr9gHCTAfBgNVHSMEGDAWgBTeqtaSVvON53SSFvxMtiCyayiYazAZBgNVHREEEjAQgQ5iZW5Ac3BpcmFsLnh5ejAFBgMrZXADQQCry+1LkA3nrYa1sovS5iFI1Tkpmr/R0nM/4gJtsO93vFOkm3vBEGwjKAV7lrGzFcFbbuyM1wEJPi4Po1XCEG0D";
+
+impl SparkWalletConfig {
+	fn to_breez_config(self, network: Network) -> Result<breez_sdk_spark::Config, TrustedError> {
+		let network = match network {
+			Network::Bitcoin => breez_sdk_spark::Network::Mainnet,
+			Network::Regtest => breez_sdk_spark::Network::Regtest,
+			_ => return Err(TrustedError::InvalidNetwork),
+		};
+
+		Ok(breez_sdk_spark::Config {
+			network,
+			sync_interval_secs: self.sync_interval_secs,
+			prefer_spark_over_lightning: self.prefer_spark_over_lightning,
+			api_key: Some(BREEZ_API_KEY.to_string()),
+			max_deposit_claim_fee: None,
+			lnurl_domain: None,
+		})
+	}
+}
+
 /// A wallet implementation using the Breez Spark SDK.
 #[derive(Clone)]
 pub(crate) struct Spark {
 	spark_wallet: Arc<BreezSdk>,
-	store: Arc<dyn KVStore + Send + Sync>,
-	event_queue: Arc<EventQueue>,
-	tx_metadata: TxMetadataStore,
 	shutdown_sender: watch::Sender<()>,
-	shutdown_receiver: watch::Receiver<()>,
 	logger: Arc<Logger>,
-	runtime: Arc<Runtime>,
 }
 
 impl TrustedWalletInterface for Spark {
@@ -199,15 +235,11 @@ impl TrustedWalletInterface for Spark {
 impl Spark {
 	/// Initialize a new Spark wallet instance with the given configuration.
 	pub(crate) async fn init(
-		config: &WalletConfig, spark_config: breez_sdk_spark::Config,
+		config: &WalletConfig, spark_config: SparkWalletConfig,
 		store: Arc<dyn KVStore + Sync + Send>, event_queue: Arc<EventQueue>,
 		tx_metadata: TxMetadataStore, logger: Arc<Logger>, runtime: Arc<Runtime>,
 	) -> Result<Self, InitFailure> {
-		match (config.network, spark_config.network) {
-			(crate::bitcoin::Network::Bitcoin, breez_sdk_spark::Network::Mainnet) => {},
-			(crate::bitcoin::Network::Regtest, breez_sdk_spark::Network::Regtest) => {},
-			_ => Err(TrustedError::InvalidNetwork)?,
-		}
+		let spark_config: breez_sdk_spark::Config = spark_config.to_breez_config(config.network)?;
 
 		let (mnemonic, passphrase) = match &config.seed {
 			Seed::Seed64(bytes) => {
@@ -217,7 +249,7 @@ impl Spark {
 			Seed::Mnemonic { mnemonic, passphrase } => (mnemonic.to_string(), passphrase.clone()),
 		};
 
-		let spark_store = SparkStore(Arc::clone(&store));
+		let spark_store = SparkStore(store);
 		let builder = SdkBuilder::new(spark_config, mnemonic, passphrase, Arc::new(spark_store));
 
 		let spark_wallet = Arc::new(builder.build().await.map_err(|e| {
@@ -230,6 +262,7 @@ impl Spark {
 		let (shutdown_sender, shutdown_receiver) = watch::channel::<()>(());
 		let listener = SparkEventHandler {
 			event_queue: Arc::clone(&event_queue),
+			tx_metadata,
 			logger: Arc::clone(&logger),
 		};
 
@@ -244,21 +277,14 @@ impl Spark {
 
 		log_info!(logger, "Spark wallet initialized");
 
-		Ok(Spark {
-			spark_wallet,
-			store,
-			event_queue,
-			tx_metadata,
-			shutdown_sender,
-			shutdown_receiver,
-			logger,
-			runtime,
-		})
+		Ok(Spark { spark_wallet, shutdown_sender, logger })
 	}
 }
 
 struct SparkEventHandler {
 	event_queue: Arc<EventQueue>,
+	#[allow(unused)] // will be used in future events
+	tx_metadata: TxMetadataStore,
 	logger: Arc<Logger>,
 }
 
@@ -370,7 +396,7 @@ fn parse_payment_id(id: &str) -> Result<[u8; 32], TrustedError> {
 			.map_err(|_| TrustedError::Other(format!("Failed to parse payment id: {id}")))?
 	} else {
 		// if it's not in the expected format, try to parse the whole thing as a uuid
-		Uuid::from_str(&id)
+		Uuid::from_str(id)
 			.map_err(|_| TrustedError::Other(format!("Failed to parse payment id: {id}")))?
 	};
 	Ok(convert_from_uuid_id(uuid.into_bytes()))

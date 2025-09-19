@@ -6,8 +6,8 @@ use rustyline::error::ReadlineError;
 
 use orange_sdk::bitcoin_payment_instructions::amount::Amount;
 use orange_sdk::{
-	ChainSource, Event, ExtraConfig, Mnemonic, PaymentInfo, Seed, SparkNetwork, SparkWalletConfig,
-	StorageConfig, Tunables, Wallet, WalletConfig, bitcoin::Network,
+	ChainSource, Event, ExtraConfig, Mnemonic, PaymentInfo, Seed, SparkWalletConfig, StorageConfig,
+	Tunables, Wallet, WalletConfig, bitcoin::Network,
 };
 use rand::RngCore;
 use std::fs;
@@ -89,14 +89,7 @@ fn get_config(network: Network) -> Result<WalletConfig> {
 				network,
 				seed,
 				tunables: Tunables::default(),
-				extra_config: ExtraConfig::Spark(SparkWalletConfig {
-					api_key: None,
-					network: SparkNetwork::Regtest,
-					sync_interval_secs: 60,
-					max_deposit_claim_fee: None,
-					lnurl_domain: None,
-					prefer_spark_over_lightning: false,
-				}),
+				extra_config: ExtraConfig::Spark(SparkWalletConfig::default()),
 			})
 		},
 		Network::Bitcoin => {
@@ -123,14 +116,7 @@ fn get_config(network: Network) -> Result<WalletConfig> {
 				network,
 				seed,
 				tunables: Tunables::default(),
-				extra_config: ExtraConfig::Spark(SparkWalletConfig {
-					api_key: None,
-					network: SparkNetwork::Mainnet,
-					sync_interval_secs: 60,
-					max_deposit_claim_fee: None,
-					lnurl_domain: None,
-					prefer_spark_over_lightning: false,
-				}),
+				extra_config: ExtraConfig::Spark(SparkWalletConfig::default()),
 			})
 		},
 		_ => Err(anyhow::anyhow!("Unsupported network: {network:?}")),
