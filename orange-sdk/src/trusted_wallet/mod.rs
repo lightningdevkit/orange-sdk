@@ -125,7 +125,7 @@ impl<T: ?Sized + TrustedWalletInterface> graduated_rebalancer::TrustedWallet for
 pub enum ExtraConfig {
 	/// Configuration for Spark wallet.
 	#[cfg(feature = "spark")]
-	Spark(crate::SparkWalletConfig),
+	Spark(crate::SparkWalletConfig), // todo make my own reduced version
 	/// Configuration for Cashu wallet.
 	#[cfg(feature = "cashu")]
 	Cashu(cashu::CashuConfig),

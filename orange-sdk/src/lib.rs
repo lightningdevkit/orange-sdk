@@ -66,14 +66,14 @@ use trusted_wallet::TrustedError;
 #[cfg(feature = "cashu")]
 pub use crate::trusted_wallet::cashu::CashuConfig;
 pub use bitcoin_payment_instructions;
+#[cfg(feature = "spark")]
+pub use breez_sdk_spark::{Config as SparkWalletConfig, Fee, Network as SparkNetwork};
 #[cfg(feature = "cashu")]
 pub use cdk::nuts::nut00::CurrencyUnit;
 pub use event::{Event, EventQueue};
 pub use ldk_node::bip39::Mnemonic;
 pub use ldk_node::bitcoin;
 pub use ldk_node::payment::ConfirmationStatus;
-#[cfg(feature = "spark")]
-pub use spark_wallet::{OperatorPoolConfig, ServiceProviderConfig, SparkWalletConfig};
 pub use store::{PaymentId, PaymentType, Transaction, TxStatus};
 pub use trusted_wallet::ExtraConfig;
 
