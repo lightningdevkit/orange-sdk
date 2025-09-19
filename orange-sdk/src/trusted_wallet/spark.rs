@@ -1,4 +1,5 @@
 //! An implementation of `TrustedWalletInterface` using the Spark SDK.
+use crate::bitcoin::hashes::{Hash, sha256};
 use crate::bitcoin::hex::FromHex;
 use crate::bitcoin::{Network, io};
 use crate::logging::Logger;
@@ -239,7 +240,9 @@ impl Spark {
 
 		let (mnemonic, passphrase) = match &config.seed {
 			Seed::Seed64(bytes) => {
-				let mnemonic = Mnemonic::from_entropy(bytes.as_slice()).expect("valid length");
+				// max entropy for bip39 is 32 bytes, so we hash the 64 bytes down to 32
+				let hash = sha256::Hash::hash(bytes);
+				let mnemonic = Mnemonic::from_entropy(hash.as_byte_array()).expect("valid length");
 				(mnemonic.to_string(), None)
 			},
 			Seed::Mnemonic { mnemonic, passphrase } => (mnemonic.to_string(), passphrase.clone()),
