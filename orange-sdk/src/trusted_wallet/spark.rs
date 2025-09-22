@@ -605,11 +605,17 @@ impl breez_sdk_spark::Storage for SparkStore {
 	) -> Result<(), StorageError> {
 		let id = format!("{txid}:{vout}");
 
-		// todo should we fail if not found
-		let data = self
-			.0
-			.read(SPARK_PRIMARY_NAMESPACE, SPARK_DEPOSITS_NAMESPACE, &id)
-			.map_err(|e| StorageError::Implementation(format!("{e:?}")))?;
+		let data = match self.0.read(SPARK_PRIMARY_NAMESPACE, SPARK_DEPOSITS_NAMESPACE, &id) {
+			Ok(data) => data,
+			Err(e) => {
+				if let io::ErrorKind::NotFound = e.kind() {
+					// deposit does not exist, nothing to update
+					return Ok(());
+				} else {
+					Err(StorageError::Implementation(format!("{e:?}")))?
+				}
+			},
+		};
 
 		let mut deposit: DepositInfo = serde_json::from_slice(&data)
 			.map_err(|e| StorageError::Serialization(format!("{e:?}")))?;
