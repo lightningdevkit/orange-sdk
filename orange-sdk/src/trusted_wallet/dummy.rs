@@ -92,7 +92,7 @@ impl DummyTrustedWallet {
 						payment_preimage,
 					} => {
 						// convert id
-						let id = payment_id.unwrap().0;
+						let id = mangle_payment_id(payment_id.unwrap().0);
 
 						let mut payments = pays.write().unwrap();
 						let item = payments.iter_mut().find(|p| p.id == id);
@@ -123,7 +123,7 @@ impl DummyTrustedWallet {
 					},
 					Event::PaymentFailed { payment_id, payment_hash, reason } => {
 						// convert id
-						let id = payment_id.unwrap().0;
+						let id = mangle_payment_id(payment_id.unwrap().0);
 
 						let mut payments = pays.write().unwrap();
 						let item = payments.iter().cloned().enumerate().find(|(_, p)| p.id == id);
@@ -152,7 +152,7 @@ impl DummyTrustedWallet {
 					},
 					Event::PaymentReceived { payment_id, amount_msat, payment_hash, .. } => {
 						// convert id
-						let id = payment_id.unwrap().0;
+						let id = mangle_payment_id(payment_id.unwrap().0);
 
 						let mut payments = pays.write().unwrap();
 						// We create invoices on the fly without adding the payment to our list
@@ -301,18 +301,24 @@ impl TrustedWalletInterface for DummyTrustedWallet {
 		Box::pin(async move {
 			let id = match method {
 				PaymentMethod::LightningBolt11(inv) => {
-					self.ldk_node
+					let id = self
+						.ldk_node
 						.bolt11_payment()
 						.send_using_amount(&inv, amount.milli_sats(), None)
 						.unwrap()
-						.0
+						.0;
+
+					mangle_payment_id(id)
 				},
 				PaymentMethod::LightningBolt12(offer) => {
-					self.ldk_node
+					let id = self
+						.ldk_node
 						.bolt12_payment()
 						.send_using_amount(&offer, amount.milli_sats(), None, None)
 						.unwrap()
-						.0
+						.0;
+
+					mangle_payment_id(id)
 				},
 				PaymentMethod::OnChain(address) => {
 					let txid = self
@@ -352,4 +358,14 @@ impl TrustedWalletInterface for DummyTrustedWallet {
 			let _ = self.ldk_node.stop();
 		})
 	}
+}
+
+// we don't want our payment ids to be the same as LDK's, this ended up not testing
+// bad assumptions properly. So we mangle the payment id a bit here to avoid collisions.
+fn mangle_payment_id(id: [u8; 32]) -> [u8; 32] {
+	let mut mangled = id;
+	for i in 0..32 {
+		mangled[i] = mangled[i].wrapping_add(0x42);
+	}
+	mangled
 }

@@ -130,7 +130,9 @@ impl From<Transaction> for StoreTransaction {
 /// the payment to the user.
 #[derive(Debug, Copy, Clone, Hash, PartialEq, Eq)]
 pub enum PaymentId {
+	/// A self-custodial payment identifier.
 	SelfCustodial([u8; 32]),
+	/// A trusted payment identifier.
 	Trusted([u8; 32]),
 }
 

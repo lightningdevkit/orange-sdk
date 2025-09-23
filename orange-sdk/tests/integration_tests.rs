@@ -218,18 +218,23 @@ fn test_sweep_to_ln() {
 			_ => panic!("Expected ChannelOpened event"),
 		}
 
-		// because of an issue in CDK, we skip the rest of this test
-		// otherwise it will fail for now
-		// TODO REMOVE ME
-		if cfg!(feature = "_cashu-tests") {
-			return;
+		let expect_amt = intermediate_amt.saturating_add(recv_amt);
+
+		let event = wait_next_event(&wallet).await;
+		match event {
+			Event::PaymentReceived { payment_id, amount_msat, lsp_fee_msats, .. } => {
+				assert!(matches!(payment_id, orange_sdk::PaymentId::SelfCustodial(_)));
+				assert!(lsp_fee_msats.is_some());
+				assert_eq!(amount_msat, expect_amt.milli_sats() - lsp_fee_msats.unwrap());
+			},
+			e => panic!("Expected RebalanceSuccessful event, got {e:?}"),
 		}
 
 		let event = wait_next_event(&wallet).await;
 		match event {
 			Event::RebalanceSuccessful { amount_msat, fee_msat, .. } => {
 				assert!(fee_msat > 0);
-				assert_eq!(amount_msat, intermediate_amt.saturating_add(recv_amt).milli_sats());
+				assert_eq!(amount_msat, expect_amt.milli_sats());
 			},
 			e => panic!("Expected RebalanceSuccessful event, got {e:?}"),
 		}

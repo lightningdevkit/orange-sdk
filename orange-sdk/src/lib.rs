@@ -20,7 +20,7 @@ pub use bitcoin_payment_instructions::PaymentMethod;
 use bitcoin_payment_instructions::amount::Amount;
 
 use crate::rebalancer::{OrangeRebalanceEventHandler, OrangeTrigger};
-use crate::store::{PaymentId, TxMetadata, TxMetadataStore, TxType};
+use crate::store::{TxMetadata, TxMetadataStore, TxType};
 #[cfg(feature = "cashu")]
 use crate::trusted_wallet::cashu::Cashu;
 #[cfg(feature = "_test-utils")]
@@ -74,7 +74,7 @@ pub use ldk_node::bitcoin;
 pub use ldk_node::payment::ConfirmationStatus;
 #[cfg(feature = "spark")]
 pub use spark_wallet::{OperatorPoolConfig, ServiceProviderConfig, SparkWalletConfig};
-pub use store::{PaymentType, Transaction, TxStatus};
+pub use store::{PaymentId, PaymentType, Transaction, TxStatus};
 pub use trusted_wallet::ExtraConfig;
 
 #[cfg(feature = "uniffi")]

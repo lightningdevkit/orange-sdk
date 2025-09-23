@@ -359,23 +359,14 @@ impl LdkEventHandler {
 					}
 				});
 
-				let payment_id = PaymentId::Trusted(payment_id.0);
-				let is_rebalance = {
-					let map = self.tx_metadata.read();
-					map.get(&payment_id).is_some_and(|m| m.ty.is_rebalance())
-				};
-
-				// If this is a rebalance payment, we do not emit a PaymentReceived event.
-				if !is_rebalance {
-					if let Err(e) = self.event_queue.add_event(Event::PaymentReceived {
-						payment_id,
-						payment_hash,
-						amount_msat,
-						custom_records,
-						lsp_fee_msats,
-					}) {
-						log_error!(self.logger, "Failed to add PaymentReceived event: {e:?}");
-					}
+				if let Err(e) = self.event_queue.add_event(Event::PaymentReceived {
+					payment_id: PaymentId::SelfCustodial(payment_id.0),
+					payment_hash,
+					amount_msat,
+					custom_records,
+					lsp_fee_msats,
+				}) {
+					log_error!(self.logger, "Failed to add PaymentReceived event: {e:?}");
 				}
 				let _ = self.payment_receipt_sender.send(());
 			},
