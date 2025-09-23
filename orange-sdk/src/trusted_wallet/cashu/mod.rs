@@ -550,7 +550,10 @@ impl Cashu {
 		transaction: Transaction, unit: &CurrencyUnit,
 	) -> Result<Payment, TrustedError> {
 		// Convert transaction ID to a 32-byte array
-		let payment_id = Self::id_to_32_byte_array(&transaction.id().to_string());
+		let id = transaction.quote_id.ok_or(TrustedError::WalletOperationFailed(
+			"Missing quote ID in transaction".to_owned(),
+		))?;
+		let payment_id = Self::id_to_32_byte_array(&id);
 
 		// Convert amounts - CDK amounts are u64 representing sats
 		let amount = convert_amount(transaction.amount, unit)?;
@@ -589,9 +592,12 @@ impl Cashu {
 			// Convert quote ID to a 32-byte payment ID
 			let payment_id = Self::id_to_32_byte_array(&mint_quote.id);
 
-			// Create a payment hash from the quote ID
-			// fixme: can we get the actual payment hash?
-			let hash = Sha256::hash(mint_quote.id.as_bytes());
+			// Parse the invoice to get the payment hash
+			// todo this won't work for bolt12
+			let invoice = Bolt11Invoice::from_str(&mint_quote.request).map_err(|e| {
+				TrustedError::Other(format!("Failed to parse invoice from mint quote: {e}"))
+			})?;
+			let hash = invoice.payment_hash();
 
 			// Send a PaymentReceived event
 			event_queue
