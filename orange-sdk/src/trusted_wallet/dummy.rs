@@ -364,8 +364,8 @@ impl TrustedWalletInterface for DummyTrustedWallet {
 // bad assumptions properly. So we mangle the payment id a bit here to avoid collisions.
 fn mangle_payment_id(id: [u8; 32]) -> [u8; 32] {
 	let mut mangled = id;
-	for i in 0..32 {
-		mangled[i] = mangled[i].wrapping_add(0x42);
+	for i in &mut mangled {
+		*i = i.wrapping_add(0x42);
 	}
 	mangled
 }

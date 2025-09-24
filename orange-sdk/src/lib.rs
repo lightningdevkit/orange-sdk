@@ -564,7 +564,6 @@ impl Wallet {
 				config,
 				Arc::clone(&store),
 				Arc::clone(&event_queue),
-				tx_metadata.clone(),
 				Arc::clone(&logger),
 			)
 			.await?,

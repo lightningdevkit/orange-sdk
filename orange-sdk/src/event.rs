@@ -1,5 +1,5 @@
 use crate::logging::Logger;
-use crate::store::{self, PaymentId, TxMetadataStore};
+use crate::store::{self, PaymentId};
 
 use ldk_node::bitcoin::secp256k1::PublicKey;
 use ldk_node::bitcoin::{OutPoint, Txid};
@@ -308,7 +308,6 @@ impl Future for EventFuture {
 #[derive(Clone)]
 pub(crate) struct LdkEventHandler {
 	pub(crate) event_queue: Arc<EventQueue>,
-	pub(crate) tx_metadata: TxMetadataStore,
 	pub(crate) ldk_node: Arc<ldk_node::Node>,
 	pub(crate) payment_receipt_sender: watch::Sender<()>,
 	pub(crate) channel_pending_sender: watch::Sender<u128>,
