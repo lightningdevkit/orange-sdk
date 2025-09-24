@@ -21,6 +21,8 @@ use cdk::wallet::{
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 
+use crate::trusted_wallet::TrustedError;
+
 // Constants for organizing data in the KV store
 const CASHU_PRIMARY_KEY: &str = "cashu_wallet";
 
@@ -35,6 +37,7 @@ const KEYSET_COUNTERS_KEY: &str = "keyset_counters";
 const TRANSACTIONS_KEY: &str = "transactions";
 const KEYSETS_TABLE_KEY: &str = "keysets_table";
 const KEYSET_U32_MAPPING_KEY: &str = "keyset_u32_mapping";
+const HAS_RECOVERED_KEY: &str = "has_recovered";
 
 /// Error type for database operations
 #[derive(Debug)]
@@ -865,4 +868,27 @@ impl WalletDatabase for CashuKvDatabase {
 
 		Ok(())
 	}
+}
+
+pub(super) fn read_has_recovered(
+	store: &Arc<dyn KVStore + Send + Sync>,
+) -> Result<bool, TrustedError> {
+	match store.read(CASHU_PRIMARY_KEY, "", HAS_RECOVERED_KEY) {
+		Ok(data) => {
+			if data.is_empty() {
+				return Ok(false);
+			}
+			Ok(data[0] != 0)
+		},
+		Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(false),
+		Err(e) => Err(TrustedError::IOError(e)),
+	}
+}
+
+pub(super) fn write_has_recovered(
+	store: &Arc<dyn KVStore + Send + Sync>, has_recovered: bool,
+) -> Result<(), TrustedError> {
+	let data = vec![if has_recovered { 1 } else { 0 }];
+
+	store.write(CASHU_PRIMARY_KEY, "", HAS_RECOVERED_KEY, &data).map_err(TrustedError::IOError)
 }

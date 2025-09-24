@@ -38,7 +38,7 @@ use tokio::runtime::Runtime;
 /// Cashu KV store implementation
 pub mod cashu_store;
 
-use cashu_store::CashuKvDatabase;
+use cashu_store::{CashuKvDatabase, read_has_recovered, write_has_recovered};
 
 /// Configuration for the Cashu wallet
 #[derive(Debug, Clone)]
@@ -448,7 +448,7 @@ impl Cashu {
 			},
 		};
 
-		let db = Arc::new(CashuKvDatabase::new(store).map_err(|e| {
+		let db = Arc::new(CashuKvDatabase::new(Arc::clone(&store)).map_err(|e| {
 			InitFailure::TrustedFailure(TrustedError::Other(format!(
 				"Failed to create Cashu database: {e}"
 			)))
@@ -518,6 +518,26 @@ impl Cashu {
 					);
 				}
 			}
+		}
+
+		// spawn background task to recover funds if first time initializing
+		let has_recovered = read_has_recovered(&store)?;
+		if !has_recovered {
+			let w = Arc::clone(&cashu_wallet);
+			let l = Arc::clone(&logger);
+			runtime.spawn(async move {
+				match w.restore().await {
+					Err(e) => log_error!(l, "Failed to restore cashu mint: {e}"),
+					Ok(amt) => {
+						if amt > cdk::Amount::ZERO {
+							log_info!(l, "Restored cashu mint: {}, amt: {amt}", w.mint_url);
+						}
+						if let Err(e) = write_has_recovered(&store, true) {
+							log_error!(l, "Failed to write has_recovered flag: {e:?}");
+						}
+					},
+				}
+			});
 		}
 
 		Ok(Cashu {
