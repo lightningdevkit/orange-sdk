@@ -142,6 +142,23 @@ fn test_pay_from_trusted() {
 			wallet.get_balance().await.unwrap().trusted < bal.trusted
 		})
 		.await;
+
+		let txs = wallet.list_transactions().await.unwrap();
+		assert_eq!(txs.len(), 2);
+		let tx = txs.into_iter().find(|t| t.outbound).unwrap();
+
+		assert!(tx.fee.is_some(), "Trusted wallet send should have fees set");
+		assert!(tx.outbound, "Outgoing payment should be outbound");
+		assert_eq!(tx.status, TxStatus::Completed, "Payment should be completed");
+		match tx.payment_type {
+			PaymentType::OutgoingLightningBolt11 { payment_preimage } => {
+				assert!(
+					payment_preimage.is_some_and(|p| p.0 != [0; 32]),
+					"Completed payment should have payment_preimage"
+				);
+			},
+			pt => panic!("Payment type should be OutgoingLightningBolt11, got {pt:?}"),
+		}
 	})
 }
 
@@ -505,6 +522,15 @@ fn run_test_pay_lightning_from_self_custody(amountless: bool) {
 		);
 		assert_eq!(payment.status, TxStatus::Completed, "Payment should be completed");
 		assert_ne!(payment.time_since_epoch, Duration::ZERO, "Time should be set");
+		match payment.payment_type {
+			PaymentType::OutgoingLightningBolt11 { payment_preimage } => {
+				assert!(
+					payment_preimage.is_some_and(|p| p.0 != [0; 32]),
+					"Completed payment should have payment_preimage"
+				);
+			},
+			pt => panic!("Payment type should be OutgoingLightningBolt11, got {pt:?}"),
+		}
 
 		// Validate fee is reasonable
 		let fee_ratio = payment.fee.unwrap().milli_sats() as f64 / amount.milli_sats() as f64;

@@ -358,6 +358,75 @@ impl TxMetadataStore {
 			Err(())
 		}
 	}
+
+	/// Sets the preimage for an outgoing lightning payment. If the payment already has a preimage,
+	/// this is a no-op and returns Ok(()). If the payment_id does not exist in the store, or if the payment
+	/// is not an outgoing lightning payment, returns Err(()).
+	pub fn set_preimage(&self, payment_id: PaymentId, preimage: [u8; 32]) -> Result<(), ()> {
+		let mut tx_metadata = self.tx_metadata.write().unwrap();
+		if let Some(metadata) = tx_metadata.get_mut(&payment_id) {
+			match metadata.ty {
+				TxType::Payment { ty } => match ty {
+					PaymentType::OutgoingLightningBolt12 { payment_preimage } => {
+						if payment_preimage.is_some() {
+							Ok(())
+						} else {
+							metadata.ty = TxType::Payment {
+								ty: PaymentType::OutgoingLightningBolt12 {
+									payment_preimage: Some(PaymentPreimage(preimage)),
+								},
+							};
+
+							self.store
+								.write(
+									STORE_PRIMARY_KEY,
+									STORE_SECONDARY_KEY,
+									&payment_id.to_string(),
+									&metadata.encode(),
+								)
+								.expect("We do not allow writes to fail");
+							Ok(())
+						}
+					},
+					PaymentType::OutgoingLightningBolt11 { payment_preimage } => {
+						if payment_preimage.is_some() {
+							Ok(())
+						} else {
+							metadata.ty = TxType::Payment {
+								ty: PaymentType::OutgoingLightningBolt11 {
+									payment_preimage: Some(PaymentPreimage(preimage)),
+								},
+							};
+
+							self.store
+								.write(
+									STORE_PRIMARY_KEY,
+									STORE_SECONDARY_KEY,
+									&payment_id.to_string(),
+									&metadata.encode(),
+								)
+								.expect("We do not allow writes to fail");
+							Ok(())
+						}
+					},
+					_ => {
+						eprintln!(
+							"payment_id {payment_id} is not an outgoing lightning payment, cannot set preimage"
+						);
+						Err(())
+					},
+				},
+				_ => {
+					// if we're trying to set a preimage on a non-payment, just continue
+					// this should only happen when we finish a rebalance payment
+					Ok(())
+				},
+			}
+		} else {
+			eprintln!("doesn't exist in metadata store: {payment_id}");
+			Err(())
+		}
+	}
 }
 
 const REBALANCE_ENABLED_KEY: &str = "rebalance_enabled";

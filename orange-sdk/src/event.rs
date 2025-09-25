@@ -309,6 +309,7 @@ impl Future for EventFuture {
 pub(crate) struct LdkEventHandler {
 	pub(crate) event_queue: Arc<EventQueue>,
 	pub(crate) ldk_node: Arc<ldk_node::Node>,
+	pub(crate) tx_metadata: store::TxMetadataStore,
 	pub(crate) payment_receipt_sender: watch::Sender<()>,
 	pub(crate) channel_pending_sender: watch::Sender<u128>,
 	pub(crate) logger: Arc<Logger>,
@@ -323,10 +324,17 @@ impl LdkEventHandler {
 				payment_preimage,
 				fee_paid_msat,
 			} => {
+				let preimage = payment_preimage.unwrap(); // safe
+				let payment_id = PaymentId::SelfCustodial(payment_id.unwrap().0); // safe
+
+				if self.tx_metadata.set_preimage(payment_id, preimage.0).is_err() {
+					log_error!(self.logger, "Failed to set preimage for payment {payment_id:?}");
+				}
+
 				if let Err(e) = self.event_queue.add_event(Event::PaymentSuccessful {
-					payment_id: PaymentId::SelfCustodial(payment_id.unwrap().0), // safe
+					payment_id,
 					payment_hash,
-					payment_preimage: payment_preimage.unwrap(), // safe
+					payment_preimage: preimage,
 					fee_paid_msat,
 				}) {
 					log_error!(self.logger, "Failed to add PaymentSuccessful event: {e:?}");

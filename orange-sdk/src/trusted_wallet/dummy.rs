@@ -111,6 +111,12 @@ impl DummyTrustedWallet {
 
 						// Send a PaymentSuccessful event if not a rebalance
 						if !is_rebalance {
+							if tx_metadata
+								.set_preimage(payment_id, payment_preimage.unwrap().0)
+								.is_err()
+							{
+								println!("Failed to set preimage for payment {payment_id:?}");
+							}
 							event_queue
 								.add_event(crate::Event::PaymentSuccessful {
 									payment_id,
