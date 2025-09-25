@@ -267,7 +267,6 @@ impl Spark {
 
 struct SparkEventHandler {
 	event_queue: Arc<EventQueue>,
-	#[allow(unused)] // will be used in future events
 	tx_metadata: TxMetadataStore,
 	logger: Arc<Logger>,
 }
@@ -313,6 +312,20 @@ impl SparkEventHandler {
 			PaymentType::Send => {
 				match payment.details {
 					Some(PaymentDetails::Lightning { preimage, payment_hash, .. }) => {
+						let payment_id = PaymentId::Trusted(id);
+						let is_rebalance = {
+							let map = self.tx_metadata.read();
+							map.get(&payment_id).is_some_and(|m| m.ty.is_rebalance())
+						};
+
+						if is_rebalance {
+							log_info!(
+								self.logger,
+								"Ignoring successful payment event for rebalance payment: {payment_id:?}"
+							);
+							return Ok(());
+						}
+
 						let preimage = preimage.ok_or_else(|| {
 							TrustedError::Other(
 								"Payment succeeded but preimage is missing".to_string(),
@@ -328,7 +341,7 @@ impl SparkEventHandler {
 							})?;
 
 						self.event_queue.add_event(Event::PaymentSuccessful {
-							payment_id: PaymentId::Trusted(id),
+							payment_id,
 							payment_hash: PaymentHash(payment_hash),
 							payment_preimage: PaymentPreimage(preimage),
 							fee_paid_msat: Some(payment.fees * 1_000), // convert to msats
@@ -382,12 +395,26 @@ impl SparkEventHandler {
 		match payment.payment_type {
 			PaymentType::Send => match payment.details {
 				Some(PaymentDetails::Lightning { payment_hash, .. }) => {
+					let payment_id = PaymentId::Trusted(id);
+					let is_rebalance = {
+						let map = self.tx_metadata.read();
+						map.get(&payment_id).is_some_and(|m| m.ty.is_rebalance())
+					};
+
+					if is_rebalance {
+						log_info!(
+							self.logger,
+							"Ignoring failed payment event for rebalance payment: {payment_id:?}"
+						);
+						return Ok(());
+					}
+
 					let payment_hash: [u8; 32] = FromHex::from_hex(&payment_hash).map_err(|e| {
 						TrustedError::Other(format!("Invalid payment_hash hex: {e:?}"))
 					})?;
 
 					self.event_queue.add_event(Event::PaymentFailed {
-						payment_id: PaymentId::Trusted(id),
+						payment_id,
 						payment_hash: Some(PaymentHash(payment_hash)),
 						reason: None,
 					})?;
