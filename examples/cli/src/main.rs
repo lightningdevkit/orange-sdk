@@ -89,9 +89,7 @@ fn get_config(network: Network) -> Result<WalletConfig> {
 				network,
 				seed,
 				tunables: Tunables::default(),
-				extra_config: ExtraConfig::Spark(SparkWalletConfig::default_config(
-					network.try_into().expect("valid network"),
-				)),
+				extra_config: ExtraConfig::Spark(SparkWalletConfig::default()),
 			})
 		},
 		Network::Bitcoin => {
@@ -118,9 +116,7 @@ fn get_config(network: Network) -> Result<WalletConfig> {
 				network,
 				seed,
 				tunables: Tunables::default(),
-				extra_config: ExtraConfig::Spark(SparkWalletConfig::default_config(
-					network.try_into().expect("valid network"),
-				)),
+				extra_config: ExtraConfig::Spark(SparkWalletConfig::default()),
 			})
 		},
 		_ => Err(anyhow::anyhow!("Unsupported network: {network:?}")),

@@ -10,7 +10,7 @@ name = "orange_sdk"
 [features]
 default = ["spark"]
 uniffi = ["dep:uniffi", "spark", "cashu"]
-spark = ["spark-wallet", "uuid"]
+spark = ["breez-sdk-spark", "uuid", "serde_json"]
 cashu = ["cdk", "serde_json"]
 _test-utils = ["corepc-node", "cashu", "uuid/v7", "rand"]
 _cashu-tests = ["_test-utils", "cdk-ldk-node", "cdk/mint", "cdk-sqlite", "cdk-axum", "axum"]
@@ -23,7 +23,7 @@ bitcoin-payment-instructions = { workspace = true }
 chrono = { version = "0.4", default-features = false }
 rand = { version = "0.8.5", optional = true }
 reqwest = { version = "0.12.23", default-features = false, features = ["rustls-tls"] }
-spark-wallet = { git = "https://github.com/breez/spark-sdk.git", rev = "6e12f98be3f100fca0411e3209a610decfa32279", default-features = false, features = ["rustls-tls"], optional = true }
+breez-sdk-spark = { git = "https://github.com/breez/spark-sdk.git", rev = "41212dfcfe36e22a55ac224c791b326f259f90d6", default-features = false, features = ["rustls-tls"], optional = true }
 tokio = { version = "1.0", default-features = false, features = ["rt-multi-thread", "sync"] }
 uuid = { version = "1.0", default-features = false, optional = true }
 cdk = { git = "https://github.com/benthecarman/cdk.git", rev = "7d25e9ae5ed7f47f9ae7e87d8a9ee16797fee8cd", default-features = false, features = ["wallet"], optional = true }

@@ -65,6 +65,8 @@ use trusted_wallet::TrustedError;
 
 #[cfg(feature = "cashu")]
 pub use crate::trusted_wallet::cashu::CashuConfig;
+#[cfg(feature = "spark")]
+pub use crate::trusted_wallet::spark::SparkWalletConfig;
 pub use bitcoin_payment_instructions;
 #[cfg(feature = "cashu")]
 pub use cdk::nuts::nut00::CurrencyUnit;
@@ -72,8 +74,6 @@ pub use event::{Event, EventQueue};
 pub use ldk_node::bip39::Mnemonic;
 pub use ldk_node::bitcoin;
 pub use ldk_node::payment::ConfirmationStatus;
-#[cfg(feature = "spark")]
-pub use spark_wallet::{OperatorPoolConfig, ServiceProviderConfig, SparkWalletConfig};
 pub use store::{PaymentId, PaymentType, Transaction, TxStatus};
 pub use trusted_wallet::ExtraConfig;
 
@@ -522,7 +522,7 @@ impl Wallet {
 			ExtraConfig::Spark(sp) => Arc::new(Box::new(
 				Spark::init(
 					&config,
-					sp.clone(),
+					*sp,
 					Arc::clone(&store),
 					Arc::clone(&event_queue),
 					tx_metadata.clone(),
