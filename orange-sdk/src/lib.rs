@@ -485,6 +485,21 @@ impl fmt::Display for SingleUseReceiveUri {
 
 impl Wallet {
 	/// Constructs a new Wallet
+	///
+	/// ## Recovery
+	///
+	/// The wallet automatically performs recovery operations when initialized for the first time:
+	///
+	/// - **Trusted wallet backends** (Spark/Cashu): Automatically attempt to recover any existing
+	///   funds associated with the wallet's seed on first initialization. Recovery is performed
+	///   once per wallet instance and runs asynchronously without blocking initialization.
+	///
+	/// - **Lightning wallet**: Recovery will **NOT** work unless using VSS (Versioned Storage Service)
+	///   for storage. With local SQLite storage, Lightning channel state and funds cannot be recovered
+	///   from seed alone and will be lost if the local storage is deleted.
+	///
+	/// Recovery ensures trusted wallet funds can be restored when reconstructed from the same seed
+	/// across different devices or installations.
 	pub async fn new(config: WalletConfig) -> Result<Wallet, InitFailure> {
 		let rt = tokio::runtime::Builder::new_multi_thread()
 			.enable_all()
