@@ -16,7 +16,9 @@ use ldk_node::payment::PaymentStatus;
 use ldk_node::{Node, bitcoin};
 #[cfg(not(feature = "_cashu-tests"))]
 use orange_sdk::trusted_wallet::dummy::DummyTrustedWalletExtraConfig;
-use orange_sdk::{ChainSource, ExtraConfig, Seed, StorageConfig, Tunables, Wallet, WalletConfig};
+use orange_sdk::{
+	ChainSource, ExtraConfig, LoggerType, Seed, StorageConfig, Tunables, Wallet, WalletConfig,
+};
 use rand::RngCore;
 use std::env::temp_dir;
 use std::future::Future;
@@ -290,7 +292,7 @@ pub fn build_test_nodes() -> TestParams {
 
 		let wallet_config = WalletConfig {
 			storage_config: StorageConfig::LocalSQLite(tmp.to_str().unwrap().to_string()),
-			log_file: tmp.join("orange.log"),
+			logger_type: LoggerType::LogFacade,
 			scorer_url: None,
 			rgs_url: None,
 			tunables: Tunables::default(),
@@ -422,7 +424,7 @@ pub fn build_test_nodes() -> TestParams {
 		let tmp = temp_dir().join(format!("orange-test-{test_id}/wallet"));
 		let wallet_config = WalletConfig {
 			storage_config: StorageConfig::LocalSQLite(tmp.to_str().unwrap().to_string()),
-			log_file: tmp.join("orange.log"),
+			logger_type: LoggerType::LogFacade,
 			scorer_url: None,
 			tunables: Tunables::default(),
 			chain_source: ChainSource::BitcoindRPC {

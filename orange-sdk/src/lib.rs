@@ -46,7 +46,6 @@ use tokio::runtime::Runtime;
 
 use std::collections::HashMap;
 use std::fmt::{self, Debug, Write};
-use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
@@ -63,6 +62,7 @@ use lightning_wallet::LightningWallet;
 use logging::Logger;
 use trusted_wallet::TrustedError;
 
+pub use crate::logging::LoggerType;
 #[cfg(feature = "cashu")]
 pub use crate::trusted_wallet::cashu::CashuConfig;
 #[cfg(feature = "spark")]
@@ -215,8 +215,8 @@ pub enum ChainSource {
 pub struct WalletConfig {
 	/// Configuration for wallet storage.
 	pub storage_config: StorageConfig,
-	/// Location of the wallet's log file.
-	pub log_file: PathBuf,
+	/// The type of logger to use.
+	pub logger_type: LoggerType,
 	/// Configuration for the blockchain data source.
 	pub chain_source: ChainSource,
 	/// Lightning Service Provider (LSP) configuration.
@@ -518,7 +518,7 @@ impl Wallet {
 	) -> Result<Wallet, InitFailure> {
 		let tunables = config.tunables;
 		let network = config.network;
-		let logger = Arc::new(Logger::new(&config.log_file).expect("Failed to open log file"));
+		let logger = Arc::new(Logger::new(&config.logger_type).expect("Failed to open log file"));
 
 		log_info!(logger, "Initializing orange on network: {network}");
 

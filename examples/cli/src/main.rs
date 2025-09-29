@@ -6,8 +6,8 @@ use rustyline::error::ReadlineError;
 
 use orange_sdk::bitcoin_payment_instructions::amount::Amount;
 use orange_sdk::{
-	ChainSource, Event, ExtraConfig, Mnemonic, PaymentInfo, Seed, SparkWalletConfig, StorageConfig,
-	Tunables, Wallet, WalletConfig, bitcoin::Network,
+	ChainSource, Event, ExtraConfig, LoggerType, Mnemonic, PaymentInfo, Seed, SparkWalletConfig,
+	StorageConfig, Tunables, Wallet, WalletConfig, bitcoin::Network,
 };
 use rand::RngCore;
 use std::fs;
@@ -79,7 +79,9 @@ fn get_config(network: Network) -> Result<WalletConfig> {
 
 			Ok(WalletConfig {
 				storage_config: StorageConfig::LocalSQLite(storage_path.to_string()),
-				log_file: PathBuf::from(format!("{storage_path}/wallet.log")),
+				logger_type: LoggerType::File {
+					path: PathBuf::from(format!("{storage_path}/wallet.log")),
+				},
 				chain_source: ChainSource::Electrum(
 					"tcp://spark-regtest.benthecarman.com:50001".to_string(),
 				),
@@ -104,7 +106,9 @@ fn get_config(network: Network) -> Result<WalletConfig> {
 
 			Ok(WalletConfig {
 				storage_config: StorageConfig::LocalSQLite(storage_path.to_string()),
-				log_file: PathBuf::from(format!("{storage_path}/wallet.log")),
+				logger_type: LoggerType::File {
+					path: PathBuf::from(format!("{storage_path}/wallet.log")),
+				},
 				chain_source: ChainSource::Esplora {
 					url: "https://blockstream.info/api".to_string(),
 					username: None,

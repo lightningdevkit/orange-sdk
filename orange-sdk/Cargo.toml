@@ -29,6 +29,7 @@ uuid = { version = "1.0", default-features = false, optional = true }
 cdk = { git = "https://github.com/benthecarman/cdk.git", rev = "7d25e9ae5ed7f47f9ae7e87d8a9ee16797fee8cd", default-features = false, features = ["wallet"], optional = true }
 serde_json = { version = "1.0", optional = true }
 async-trait = "0.1"
+log = "0.4.28"
 
 corepc-node = { version = "0.8.0", features = ["29_0", "download"], optional = true }
 cdk-ldk-node = { git = "https://github.com/benthecarman/cdk.git", rev = "7d25e9ae5ed7f47f9ae7e87d8a9ee16797fee8cd", optional = true }

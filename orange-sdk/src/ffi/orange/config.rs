@@ -18,6 +18,7 @@ use crate::ffi::Network;
 use crate::ffi::bitcoin_payment_instructions::Amount;
 use crate::ffi::ldk_node::Mnemonic;
 use crate::ffi::orange::error::ConfigError;
+use crate::logging::LoggerType;
 use crate::trusted_wallet::ExtraConfig as OrangeExtraConfig;
 use crate::{impl_from_core_type, impl_into_core_type};
 
@@ -261,7 +262,7 @@ impl TryFrom<WalletConfig> for OrangeWalletConfig {
 			.map_err(|e| ConfigError::InvalidLspAddress(e.to_string()))?;
 		Ok(OrangeWalletConfig {
 			storage_config: config.storage_config.into(),
-			log_file: PathBuf::from(config.log_file),
+			logger_type: LoggerType::File { path: PathBuf::from(config.log_file) },
 			chain_source: config.chain_source.into(),
 			lsp: (lsp_address, lsp_node_id, config.lsp_token.clone()),
 			scorer_url: config.scorer_url.clone(),
