@@ -79,9 +79,10 @@ pub trait TrustedWallet: Send + Sync {
 		&self, method: PaymentMethod, amount: Amount,
 	) -> Pin<Box<dyn Future<Output = Result<[u8; 32], Self::Error>> + Send + '_>>;
 
-	/// Get transaction fee paid
-	fn get_tx_fee(&self, id: [u8; 32])
-		-> Pin<Box<dyn Future<Output = Option<Amount>> + Send + '_>>;
+	/// Wait for a payment success notification
+	fn await_payment_success(
+		&self, payment_hash: [u8; 32],
+	) -> Pin<Box<dyn Future<Output = Option<ReceivedLightningPayment>> + Send + '_>>;
 }
 
 /// Trait representing a lightning wallet backend
@@ -265,10 +266,6 @@ where
 						amount_msat: transfer_amt.milli_sats(),
 					});
 
-					// get the fee of the rebalance transaction
-					let rebalance_tx_fee =
-						self.trusted.get_tx_fee(rebalance_id).await.unwrap_or(Amount::ZERO);
-
 					let ln_payment = match self
 						.ln_wallet
 						.await_payment_receipt(expected_hash.to_byte_array())
@@ -277,6 +274,18 @@ where
 						Some(receipt) => receipt,
 						None => {
 							log_error!(self.logger, "Failed to receive rebalance payment!");
+							return;
+						},
+					};
+
+					let trusted_payment = match self
+						.trusted
+						.await_payment_success(expected_hash.to_byte_array())
+						.await
+					{
+						Some(success) => success,
+						None => {
+							log_error!(self.logger, "Failed to send rebalance payment!");
 							return;
 						},
 					};
@@ -294,7 +303,7 @@ where
 						ln_rebalance_payment_id: ln_payment.id,
 						amount_msat: transfer_amt.milli_sats(),
 						fee_msat: ln_payment.fee_paid_msat.unwrap_or_default()
-							+ rebalance_tx_fee.milli_sats(),
+							+ trusted_payment.fee_paid_msat.unwrap_or_default(),
 					});
 				},
 				Err(e) => {

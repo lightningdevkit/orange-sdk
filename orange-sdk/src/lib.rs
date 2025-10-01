@@ -887,10 +887,10 @@ impl Wallet {
 			}
 		}
 
-		for (_, tx_info) in internal_transfers {
+		for (id, tx_info) in internal_transfers {
 			debug_assert!(
 				tx_info.send_fee.is_some(),
-				"Internal transfers must have a send fee, got {tx_info:?}",
+				"Internal transfers must have a send fee, got {id}: {tx_info:?}",
 			);
 			debug_assert!(tx_info.transaction.is_some());
 

@@ -19,10 +19,12 @@ use bitcoin_payment_instructions::PaymentMethod;
 use bitcoin_payment_instructions::amount::Amount;
 
 use breez_sdk_spark::{
-	BreezSdk, EventListener, GetInfoRequest, ListPaymentsRequest, PaymentDetails, PaymentType,
-	PrepareSendPaymentRequest, ReceivePaymentMethod, ReceivePaymentRequest, SdkBuilder, SdkError,
-	SdkEvent, SendPaymentMethod, SendPaymentRequest,
+	BreezSdk, EventListener, GetInfoRequest, ListPaymentsRequest, PaymentDetails, PaymentStatus,
+	PaymentType, PrepareSendPaymentRequest, ReceivePaymentMethod, ReceivePaymentRequest,
+	SdkBuilder, SdkError, SdkEvent, SendPaymentMethod, SendPaymentRequest,
 };
+
+use graduated_rebalancer::ReceivedLightningPayment;
 
 use tokio::sync::watch;
 
@@ -80,6 +82,7 @@ impl SparkWalletConfig {
 pub(crate) struct Spark {
 	spark_wallet: Arc<BreezSdk>,
 	shutdown_sender: watch::Sender<()>,
+	payment_success_flag: watch::Receiver<()>,
 	logger: Arc<Logger>,
 }
 
@@ -210,6 +213,38 @@ impl TrustedWalletInterface for Spark {
 		})
 	}
 
+	fn await_payment_success(
+		&self, payment_hash: [u8; 32],
+	) -> Pin<Box<dyn Future<Output = Option<ReceivedLightningPayment>> + Send + '_>> {
+		Box::pin(async move {
+			loop {
+				let res = self
+					.spark_wallet
+					.list_payments(ListPaymentsRequest { offset: None, limit: None })
+					.await
+					.ok()?;
+
+				let tx = res.payments.into_iter().find(|p| {
+					if let Some(PaymentDetails::Lightning { payment_hash: ph, .. }) = &p.details {
+						let hash: Option<[u8; 32]> = FromHex::from_hex(ph).ok();
+						hash == Some(payment_hash)
+					} else {
+						false
+					}
+				})?;
+
+				if tx.status == PaymentStatus::Completed {
+					return Some(ReceivedLightningPayment {
+						id: payment_hash,
+						fee_paid_msat: Some(tx.fees * 1_000),
+					});
+				}
+
+				self.await_payment_success().await;
+			}
+		})
+	}
+
 	fn stop(&self) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
 		Box::pin(async move {
 			log_info!(self.logger, "Stopping Spark wallet");
@@ -246,9 +281,12 @@ impl Spark {
 		log_info!(logger, "Started Spark wallet!");
 
 		let (shutdown_sender, shutdown_receiver) = watch::channel::<()>(());
+		let (payment_success_sender, payment_success_flag) = watch::channel(());
+
 		let listener = SparkEventHandler {
 			event_queue: Arc::clone(&event_queue),
 			tx_metadata,
+			payment_success_sender,
 			logger: Arc::clone(&logger),
 		};
 
@@ -263,13 +301,20 @@ impl Spark {
 
 		log_info!(logger, "Spark wallet initialized");
 
-		Ok(Spark { spark_wallet, shutdown_sender, logger })
+		Ok(Spark { spark_wallet, shutdown_sender, payment_success_flag, logger })
+	}
+
+	pub(crate) async fn await_payment_success(&self) {
+		let mut flag = self.payment_success_flag.clone();
+		flag.mark_unchanged();
+		let _ = flag.changed().await;
 	}
 }
 
 struct SparkEventHandler {
 	event_queue: Arc<EventQueue>,
 	tx_metadata: TxMetadataStore,
+	payment_success_sender: watch::Sender<()>,
 	logger: Arc<Logger>,
 }
 
@@ -325,6 +370,8 @@ impl SparkEventHandler {
 								self.logger,
 								"Ignoring successful payment event for rebalance payment: {payment_id:?}"
 							);
+							// make sure we still send payment success
+							self.payment_success_sender.send(()).unwrap();
 							return Ok(());
 						}
 
@@ -355,6 +402,8 @@ impl SparkEventHandler {
 							payment_preimage: PaymentPreimage(preimage),
 							fee_paid_msat: Some(payment.fees * 1_000), // convert to msats
 						})?;
+
+						self.payment_success_sender.send(()).unwrap();
 					},
 					_ => {
 						log_debug!(self.logger, "Unsupported payment details for Send: {payment:?}")

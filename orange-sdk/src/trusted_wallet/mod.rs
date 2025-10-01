@@ -7,6 +7,8 @@ use ldk_node::lightning_invoice::Bolt11Invoice;
 use bitcoin_payment_instructions::PaymentMethod;
 use bitcoin_payment_instructions::amount::Amount;
 
+use graduated_rebalancer::ReceivedLightningPayment;
+
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -82,6 +84,12 @@ pub trait TrustedWalletInterface: Send + Sync + private::Sealed {
 		&self, method: PaymentMethod, amount: Amount,
 	) -> Pin<Box<dyn Future<Output = Result<[u8; 32], TrustedError>> + Send + '_>>;
 
+	/// Waits for a payment with the given payment hash to succeed.
+	/// Returns the `ReceivedLightningPayment` if successful, or `None` if it fails or times out.
+	fn await_payment_success(
+		&self, payment_hash: [u8; 32],
+	) -> Pin<Box<dyn Future<Output = Option<ReceivedLightningPayment>> + Send + '_>>;
+
 	/// Stops the wallet, cleaning up any resources.
 	/// This is typically used to gracefully shut down the wallet.
 	fn stop(&self) -> Pin<Box<dyn Future<Output = ()> + Send + '_>>;
@@ -110,13 +118,10 @@ impl<T: ?Sized + TrustedWalletInterface> graduated_rebalancer::TrustedWallet for
 		Box::pin(async move { self.0.pay(method, amount).await })
 	}
 
-	fn get_tx_fee(
-		&self, id: [u8; 32],
-	) -> Pin<Box<dyn Future<Output = Option<Amount>> + Send + '_>> {
-		Box::pin(async move {
-			let trusted_txs = self.0.list_payments().await.unwrap_or_default();
-			trusted_txs.iter().find(|p| p.id == id).map(|p| p.fee)
-		})
+	fn await_payment_success(
+		&self, payment_hash: [u8; 32],
+	) -> Pin<Box<dyn Future<Output = Option<ReceivedLightningPayment>> + Send + '_>> {
+		Box::pin(async move { self.0.await_payment_success(payment_hash).await })
 	}
 }
 

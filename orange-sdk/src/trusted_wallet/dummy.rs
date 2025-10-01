@@ -8,8 +8,11 @@ use bitcoin_payment_instructions::PaymentMethod;
 use bitcoin_payment_instructions::amount::Amount;
 use corepc_node::client::bitcoin::Network;
 use corepc_node::{Node as Bitcoind, get_available_port};
+use graduated_rebalancer::ReceivedLightningPayment;
+use ldk_node::lightning::ln::channelmanager;
 use ldk_node::lightning::ln::msgs::SocketAddress;
 use ldk_node::lightning_invoice::{Bolt11Invoice, Bolt11InvoiceDescription, Description};
+use ldk_node::payment::{PaymentKind, PaymentStatus};
 use ldk_node::{Event, Node};
 use rand::RngCore;
 use std::env::temp_dir;
@@ -18,6 +21,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 use tokio::runtime::Runtime;
+use tokio::sync::watch;
 use uuid::Uuid;
 
 /// A dummy implementation of `TrustedWalletInterface` for testing purposes.
@@ -28,6 +32,7 @@ pub(crate) struct DummyTrustedWallet {
 	current_bal_msats: Arc<AtomicU64>,
 	payments: Arc<RwLock<Vec<Payment>>>,
 	ldk_node: Arc<Node>,
+	payment_success_flag: watch::Receiver<()>,
 }
 
 #[derive(Clone)]
@@ -78,6 +83,8 @@ impl DummyTrustedWallet {
 		let current_bal_msats = Arc::new(AtomicU64::new(0));
 		let payments: Arc<RwLock<Vec<Payment>>> = Arc::new(RwLock::new(vec![]));
 
+		let (payment_success_sender, payment_success_flag) = watch::channel(());
+
 		let events_ref = Arc::clone(&ldk_node);
 		let bal = Arc::clone(&current_bal_msats);
 		let pays = Arc::clone(&payments);
@@ -126,6 +133,8 @@ impl DummyTrustedWallet {
 								})
 								.unwrap();
 						}
+
+						payment_success_sender.send(()).unwrap();
 					},
 					Event::PaymentFailed { payment_id, payment_hash, reason } => {
 						// convert id
@@ -241,7 +250,13 @@ impl DummyTrustedWallet {
 			panic!("No usable channels found {channels:?}");
 		}
 
-		DummyTrustedWallet { current_bal_msats, payments, ldk_node }
+		DummyTrustedWallet { current_bal_msats, payments, ldk_node, payment_success_flag }
+	}
+
+	pub(crate) async fn await_payment_success(&self) {
+		let mut flag = self.payment_success_flag.clone();
+		flag.mark_unchanged();
+		let _ = flag.changed().await;
 	}
 }
 
@@ -356,6 +371,40 @@ impl TrustedWalletInterface for DummyTrustedWallet {
 			});
 
 			Ok(id)
+		})
+	}
+
+	fn await_payment_success(
+		&self, payment_hash: [u8; 32],
+	) -> Pin<Box<dyn Future<Output = Option<ReceivedLightningPayment>> + Send + '_>> {
+		Box::pin(async move {
+			let id = channelmanager::PaymentId(payment_hash);
+			loop {
+				if let Some(payment) = self.ldk_node.payment(&id) {
+					let counterparty_skimmed_fee_msat = match payment.kind {
+						PaymentKind::Bolt11 { hash, .. } => {
+							debug_assert!(hash.0 == payment_hash, "Payment Hash mismatch");
+							None
+						},
+						PaymentKind::Bolt11Jit { hash, counterparty_skimmed_fee_msat, .. } => {
+							debug_assert!(hash.0 == payment_hash, "Payment Hash mismatch");
+							counterparty_skimmed_fee_msat
+						},
+						_ => return None, // Ignore other payment kinds, we only care about the one we just sent.
+					};
+					match payment.status {
+						PaymentStatus::Succeeded => {
+							return Some(ReceivedLightningPayment {
+								id: payment.id.0,
+								fee_paid_msat: counterparty_skimmed_fee_msat,
+							});
+						},
+						PaymentStatus::Pending => {},
+						PaymentStatus::Failed => return None,
+					}
+				}
+				self.await_payment_success().await;
+			}
 		})
 	}
 
