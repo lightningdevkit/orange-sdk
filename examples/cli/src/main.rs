@@ -56,6 +56,13 @@ enum Commands {
 		/// Amount in sats (optional)
 		amount: Option<u64>,
 	},
+	/// Get the current lightning address
+	GetLightningAddress,
+	/// Register a lightning address
+	RegisterLightningAddress {
+		/// The lightning address name to register
+		name: String,
+	},
 	/// Clear the screen
 	Clear,
 	/// Exit the application
@@ -367,6 +374,14 @@ fn parse_command(input: &str) -> Result<Commands> {
 
 			Ok(Commands::EstimateFee { destination, amount })
 		},
+		"get-lightning-address" | "get-ln-addr" | "ln-addr" => Ok(Commands::GetLightningAddress),
+		"register-lightning-address" | "register-ln-addr" => {
+			if parts.len() < 2 {
+				return Err(anyhow::anyhow!("Usage: register-lightning-address <name>"));
+			}
+			let name = parts[1].to_string();
+			Ok(Commands::RegisterLightningAddress { name })
+		},
 		"clear" | "cls" => Ok(Commands::Clear),
 		"exit" | "quit" | "q" => Ok(Commands::Exit),
 		"help" => {
@@ -590,6 +605,60 @@ async fn execute_command(command: Commands, state: &mut WalletState) -> Result<(
 				},
 			}
 		},
+		Commands::GetLightningAddress => {
+			let wallet = state.wallet();
+
+			println!("{} Fetching lightning address...", "⚡".bright_yellow());
+
+			match wallet.get_lightning_address().await {
+				Ok(Some(address)) => {
+					println!(
+						"{} Lightning address: {}",
+						"⚡".bright_green(),
+						address.bright_cyan()
+					);
+				},
+				Ok(None) => {
+					println!("{} No lightning address registered yet.", "⚡".bright_yellow());
+					println!(
+						"{} Use 'register-lightning-address <name>' to register one",
+						"Hint:".bright_yellow().bold()
+					);
+				},
+				Err(e) => {
+					return Err(anyhow::anyhow!("Failed to get lightning address: {:?}", e));
+				},
+			}
+		},
+		Commands::RegisterLightningAddress { name } => {
+			let wallet = state.wallet();
+
+			println!(
+				"{} Registering lightning address: {}...",
+				"⚡".bright_yellow(),
+				name.bright_cyan()
+			);
+
+			match wallet.register_lightning_address(name.clone()).await {
+				Ok(()) => {
+					println!("{} Lightning address registered successfully!", "✅".bright_green());
+					// Fetch and display the full address
+					match wallet.get_lightning_address().await {
+						Ok(Some(address)) => {
+							println!(
+								"{} Your lightning address: {}",
+								"⚡".bright_green(),
+								address.bright_cyan()
+							);
+						},
+						_ => {},
+					}
+				},
+				Err(e) => {
+					return Err(anyhow::anyhow!("Failed to register lightning address: {:?}", e));
+				},
+			}
+		},
 		Commands::Clear => {
 			print!("\x1B[2J\x1B[1;1H");
 			std::io::stdout().flush().unwrap();
@@ -627,6 +696,12 @@ fn print_help() {
 	println!();
 	println!("  {} <destination> [amount]", "estimate-fee".bright_green().bold());
 	println!("    Estimate the fee for a payment");
+	println!();
+	println!("  {}", "get-lightning-address".bright_green().bold());
+	println!("    Get the current lightning address");
+	println!();
+	println!("  {} <name>", "register-lightning-address".bright_green().bold());
+	println!("    Register a lightning address");
 	println!();
 	println!("  {}", "clear".bright_green().bold());
 	println!("    Clear the terminal screen");
