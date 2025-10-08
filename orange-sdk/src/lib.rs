@@ -1,4 +1,4 @@
-#![deny(missing_docs)]
+﻿#![deny(missing_docs)]
 
 //! A library implementing the full backend for a modern, highly usable, Bitcoin wallet focusing on
 //! maximizing security and self-custody without trading off user experience.
@@ -169,11 +169,11 @@ pub enum VssAuth {
 #[allow(dead_code)]
 pub struct VssConfig {
 	/// The URL of the VSS.
-	vss_url: String,
+	pub vss_url: String,
 	/// The store ID for the VSS.
-	store_id: String,
+	pub store_id: String,
 	/// Authentication method for the VSS.
-	headers: VssAuth,
+	pub headers: VssAuth,
 }
 
 /// Configuration for wallet storage, either local SQLite or VSS.
@@ -387,6 +387,16 @@ impl PaymentInfo {
 				}
 			},
 		}
+	}
+
+	/// Get the payment instructions.
+	pub fn instructions(&self) -> PaymentInstructions {
+		self.instructions.clone()
+	}
+
+	/// Get the amount to be paid.
+	pub fn amount(&self) -> Amount {
+		self.amount
 	}
 }
 
