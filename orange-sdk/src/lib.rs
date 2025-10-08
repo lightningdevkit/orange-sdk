@@ -536,7 +536,7 @@ impl Wallet {
 					ExtraConfig::Spark(sp) => Arc::new(Box::new(
 						Spark::init(
 							&config,
-							*sp,
+							sp.clone(),
 							Arc::clone(&store),
 							Arc::clone(&event_queue),
 							tx_metadata.clone(),
@@ -1369,6 +1369,16 @@ impl Wallet {
 			});
 		}
 		res
+	}
+
+	/// Gets the lightning address for this wallet, if one is set.
+	pub async fn get_lightning_address(&self) -> Result<Option<String>, WalletError> {
+		Ok(self.inner.trusted.get_lightning_address().await?)
+	}
+
+	/// Attempts to register the lightning address for this wallet.
+	pub async fn register_lightning_address(&self, name: String) -> Result<(), WalletError> {
+		Ok(self.inner.trusted.register_lightning_address(name).await?)
 	}
 
 	/// Stops the wallet, which will stop the underlying LDK node and any background tasks.

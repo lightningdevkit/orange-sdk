@@ -89,6 +89,16 @@ pub trait TrustedWalletInterface: Send + Sync + private::Sealed {
 		&self, payment_hash: [u8; 32],
 	) -> Pin<Box<dyn Future<Output = Option<ReceivedLightningPayment>> + Send + '_>>;
 
+	/// Gets the lightning address for this wallet, if one is set.
+	fn get_lightning_address(
+		&self,
+	) -> Pin<Box<dyn Future<Output = Result<Option<String>, TrustedError>> + Send + '_>>;
+
+	/// Attempts to register the lightning address for this wallet.
+	fn register_lightning_address(
+		&self, name: String,
+	) -> Pin<Box<dyn Future<Output = Result<(), TrustedError>> + Send + '_>>;
+
 	/// Stops the wallet, cleaning up any resources.
 	/// This is typically used to gracefully shut down the wallet.
 	fn stop(&self) -> Pin<Box<dyn Future<Output = ()> + Send + '_>>;
