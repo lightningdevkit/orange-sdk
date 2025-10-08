@@ -43,7 +43,6 @@ pub struct Payment {
 
 pub(crate) type DynTrustedWalletInterface = dyn TrustedWalletInterface + Send + Sync;
 
-// todo i dont think we need send + sync
 /// Represents a trait for a trusted wallet interface.
 pub trait TrustedWalletInterface: Send + Sync + private::Sealed {
 	/// Returns the current balance of the wallet.
