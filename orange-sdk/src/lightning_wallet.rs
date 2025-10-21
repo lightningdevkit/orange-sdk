@@ -1,6 +1,7 @@
 use crate::bitcoin::OutPoint;
 use crate::event::{EventQueue, LdkEventHandler};
 use crate::logging::Logger;
+use crate::runtime::Runtime;
 use crate::store::{TxMetadataStore, TxStatus};
 use crate::{ChainSource, InitFailure, PaymentType, Seed, WalletConfig};
 
@@ -27,7 +28,6 @@ use std::fmt::Debug;
 use std::pin::Pin;
 use std::sync::Arc;
 
-use tokio::runtime::Runtime;
 use tokio::sync::watch;
 
 #[derive(Debug, Clone, Copy)]
@@ -129,6 +129,8 @@ impl LightningWallet {
 
 		builder.set_custom_logger(Arc::clone(&logger) as Arc<dyn ldk_node::logger::LogWriter>);
 
+		builder.set_runtime(runtime.get_handle());
+
 		// download scorer and write to storage
 		// todo switch to https://github.com/lightningdevkit/ldk-node/pull/449 once available
 		if let Some(url) = config.scorer_url {
@@ -179,10 +181,10 @@ impl LightningWallet {
 
 		inner.ldk_node.start()?;
 
-		runtime.spawn(async move {
+		runtime.spawn_cancellable_background_task(async move {
 			loop {
 				let event = ev_handler.ldk_node.next_event_async().await;
-				log_debug!(ev_handler.logger, "Got ldk-node event {:?}", event);
+				log_debug!(ev_handler.logger, "Got ldk-node event {event:?}");
 				ev_handler.handle_ldk_node_event(event).await;
 			}
 		});

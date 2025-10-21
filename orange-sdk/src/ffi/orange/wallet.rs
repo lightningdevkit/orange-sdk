@@ -98,9 +98,7 @@ impl Wallet {
 
 		let config: OrangeWalletConfig = config.try_into()?;
 
-		let rt_clone = rt.clone();
-		let inner =
-			rt.block_on(async move { OrangeWallet::new_with_runtime(rt_clone, config).await })?;
+		let inner = rt.block_on(async move { OrangeWallet::new(config).await })?;
 
 		Ok(Wallet { inner: Arc::new(inner) })
 	}

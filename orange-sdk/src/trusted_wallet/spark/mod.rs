@@ -28,12 +28,12 @@ use graduated_rebalancer::ReceivedLightningPayment;
 
 use tokio::sync::watch;
 
+use crate::runtime::Runtime;
 use std::future::Future;
 use std::pin::Pin;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::runtime::Runtime;
 use uuid::Uuid;
 
 /// Configuration options for the Spark wallet.
@@ -294,7 +294,7 @@ impl Spark {
 		log_info!(logger, "Added Spark event listener with ID: {listener_id}");
 		let w = Arc::clone(&spark_wallet);
 		let mut shutdown_recv = shutdown_receiver.clone();
-		runtime.spawn(async move {
+		runtime.spawn_background_task(async move {
 			let _ = shutdown_recv.changed().await;
 			w.remove_event_listener(&listener_id).await;
 		});

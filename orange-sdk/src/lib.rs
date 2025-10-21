@@ -29,8 +29,6 @@ use ldk_node::lightning_invoice::Bolt11Invoice;
 use ldk_node::payment::PaymentKind;
 use ldk_node::{BuildError, ChannelDetails, DynStore, NodeError};
 
-use tokio::runtime::Runtime;
-
 use std::collections::HashMap;
 use std::fmt::{self, Debug, Write};
 use std::sync::Arc;
@@ -42,6 +40,7 @@ mod ffi;
 mod lightning_wallet;
 pub(crate) mod logging;
 mod rebalancer;
+mod runtime;
 mod store;
 pub mod trusted_wallet;
 
@@ -50,6 +49,7 @@ use logging::Logger;
 use trusted_wallet::TrustedError;
 
 pub use crate::logging::LoggerType;
+use crate::runtime::Runtime;
 #[cfg(feature = "cashu")]
 pub use crate::trusted_wallet::cashu::CashuConfig;
 #[cfg(feature = "spark")]
@@ -507,26 +507,16 @@ impl Wallet {
 	/// Recovery ensures trusted wallet funds can be restored when reconstructed from the same seed
 	/// across different devices or installations.
 	pub async fn new(config: WalletConfig) -> Result<Wallet, InitFailure> {
-		let rt = tokio::runtime::Builder::new_multi_thread()
-			.enable_all()
-			.build()
-			.map_err(|e| InitFailure::IoError(e.into()))?;
-
-		Self::new_with_runtime(Arc::new(rt), config).await
-	}
-	/// Constructs a new Wallet with a runtime.
-	///
-	/// `runtime` must be a reference to the running `tokio` runtime which we are currently
-	/// operating in.
-	// TODO: WOW that is a terrible API lol
-	pub async fn new_with_runtime(
-		runtime: Arc<Runtime>, config: WalletConfig,
-	) -> Result<Wallet, InitFailure> {
 		let tunables = config.tunables;
 		let network = config.network;
 		let logger = Arc::new(Logger::new(&config.logger_type).expect("Failed to open log file"));
 
 		log_info!(logger, "Initializing orange on network: {network}");
+
+		let runtime = Arc::new(Runtime::new(Arc::clone(&logger)).map_err(|e| {
+			log_error!(logger, "Failed to set up tokio runtime: {e}");
+			BuildError::RuntimeSetupFailed
+		})?);
 
 		let store: Arc<DynStore> = match &config.storage_config {
 			StorageConfig::LocalSQLite(path) => {
@@ -620,7 +610,7 @@ impl Wallet {
 		// Spawn a background thread that every second, we see if we should initiate a rebalance
 		// This will withdraw from the trusted balance to our LN balance, possibly opening a channel.
 		let rb = Arc::clone(&rebalancer);
-		runtime.spawn(async move {
+		runtime.spawn_cancellable_background_task(async move {
 			loop {
 				rb.do_rebalance_if_needed().await;
 
@@ -1134,7 +1124,7 @@ impl Wallet {
 									},
 								);
 								let inner_ref = Arc::clone(&self.inner);
-								self.inner.runtime.spawn(async move {
+								self.inner.runtime.spawn_cancellable_background_task(async move {
 									inner_ref.rebalancer.do_rebalance_if_needed().await;
 								});
 								return Ok(());
@@ -1338,5 +1328,11 @@ impl Wallet {
 
 		log_debug!(self.inner.logger, "Stopping ln wallet...");
 		self.inner.ln_wallet.stop();
+
+		// Cancel cancellable background tasks
+		self.inner.runtime.abort_cancellable_background_tasks();
+
+		// Wait until non-cancellable background tasks (mod LDK's background processor) are done.
+		self.inner.runtime.wait_on_background_tasks();
 	}
 }

@@ -2,7 +2,7 @@ default:
     @just --list
 
 test *args:
-    cargo test {{ args }} --features _test-utils -p orange-sdk
+    cargo test {{ args }} --features _test-utils -p orange-sdk -- --nocapture
 
 test-cashu *args:
     cargo test {{ args }} --features _cashu-tests -p orange-sdk

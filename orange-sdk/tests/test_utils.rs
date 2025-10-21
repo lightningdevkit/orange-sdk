@@ -28,7 +28,6 @@ use std::net::SocketAddr;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::runtime::Runtime;
 use uuid::Uuid;
 
 /// Waits for an async condition to be true, polling at a specified interval until a timeout.
@@ -112,7 +111,7 @@ pub fn generate_blocks(bitcoind: &Bitcoind, num: usize) {
 		.unwrap_or_else(|_| panic!("failed to generate {num} blocks"));
 }
 
-fn create_lsp(rt: Arc<Runtime>, uuid: Uuid, bitcoind: &Bitcoind) -> Arc<Node> {
+fn create_lsp(uuid: Uuid, bitcoind: &Bitcoind) -> Arc<Node> {
 	let mut builder = ldk_node::Builder::new();
 	builder.set_network(Network::Regtest);
 	let mut seed: [u8; 64] = [0; 64];
@@ -156,7 +155,7 @@ fn create_lsp(rt: Arc<Runtime>, uuid: Uuid, bitcoind: &Bitcoind) -> Arc<Node> {
 	ldk_node.start().unwrap();
 
 	let events_ref = Arc::clone(&ldk_node);
-	rt.spawn(async move {
+	tokio::spawn(async move {
 		loop {
 			let event = events_ref.next_event_async().await;
 			println!("LSP: {event:?}");
@@ -169,7 +168,7 @@ fn create_lsp(rt: Arc<Runtime>, uuid: Uuid, bitcoind: &Bitcoind) -> Arc<Node> {
 	ldk_node
 }
 
-fn create_third_party(rt: Arc<Runtime>, uuid: Uuid, bitcoind: &Bitcoind) -> Arc<Node> {
+fn create_third_party(uuid: Uuid, bitcoind: &Bitcoind) -> Arc<Node> {
 	let mut builder = ldk_node::Builder::new();
 	builder.set_network(Network::Regtest);
 	let mut seed: [u8; 64] = [0; 64];
@@ -200,7 +199,7 @@ fn create_third_party(rt: Arc<Runtime>, uuid: Uuid, bitcoind: &Bitcoind) -> Arc<
 	ldk_node.start().unwrap();
 
 	let events_ref = Arc::clone(&ldk_node);
-	rt.spawn(async move {
+	tokio::spawn(async move {
 		loop {
 			let event = events_ref.next_event_async().await;
 			println!("3rd party: {event:?}");
@@ -224,32 +223,27 @@ pub struct TestParams {
 	pub lsp: Arc<Node>,
 	pub third_party: Arc<Node>,
 	pub bitcoind: Arc<Bitcoind>,
-	pub rt: Arc<Runtime>,
 	#[cfg(feature = "_cashu-tests")]
 	pub _mint: Arc<cdk::Mint>,
 }
 
-pub fn build_test_nodes() -> TestParams {
+pub async fn build_test_nodes() -> TestParams {
 	let test_id = Uuid::now_v7();
 	let bitcoind = Arc::new(create_bitcoind(test_id));
 
-	let rt = Arc::new(tokio::runtime::Builder::new_multi_thread().enable_all().build().unwrap());
-
-	let lsp = create_lsp(Arc::clone(&rt), test_id, &bitcoind);
+	let lsp = create_lsp(test_id, &bitcoind);
 	fund_node(&lsp, &bitcoind);
-	let third_party = create_third_party(Arc::clone(&rt), test_id, &bitcoind);
+	let third_party = create_third_party(test_id, &bitcoind);
 	let start_bal = third_party.list_balances().total_onchain_balance_sats;
 	fund_node(&third_party, &bitcoind);
 
 	// wait for node to sync (needs blocking wait as we are not in async context here)
 	let third = Arc::clone(&third_party);
-	rt.block_on(async move {
-		wait_for_condition("third_party node sync after funding", || {
-			let res = third.list_balances().total_onchain_balance_sats > start_bal;
-			async move { res }
-		})
-		.await;
-	});
+	wait_for_condition("third_party node sync after funding", || {
+		let res = third.list_balances().total_onchain_balance_sats > start_bal;
+		async move { res }
+	})
+	.await;
 
 	let lsp_listen = lsp.listening_addresses().unwrap().first().unwrap().clone();
 
@@ -260,13 +254,11 @@ pub fn build_test_nodes() -> TestParams {
 
 	// wait for channel ready (needs blocking wait as we are not in async context here)
 	let third_party_clone = Arc::clone(&third_party);
-	rt.block_on(async move {
-		wait_for_condition("channel to become usable", || {
-			let res = third_party_clone.list_channels().first().is_some_and(|c| c.is_usable);
-			async move { res }
-		})
-		.await;
-	});
+	wait_for_condition("channel to become usable", || {
+		let res = third_party_clone.list_channels().first().is_some_and(|c| c.is_usable);
+		async move { res }
+	})
+	.await;
 
 	// make sure it actually became usable
 	assert!(third_party.list_channels().first().unwrap().is_usable);
@@ -281,13 +273,11 @@ pub fn build_test_nodes() -> TestParams {
 			uuid: test_id,
 			lsp: Arc::clone(&lsp),
 			bitcoind: Arc::clone(&bitcoind),
-			rt: Arc::clone(&rt),
 		};
 
 		let tmp = temp_dir().join(format!("orange-test-{test_id}/ldk-node"));
 		let cookie = bitcoind.params.get_cookie_values().unwrap().unwrap();
 
-		let rt_clone = Arc::clone(&rt);
 		let bitcoind_port = bitcoind.params.rpc_socket.port();
 
 		let wallet_config = WalletConfig {
@@ -307,7 +297,8 @@ pub fn build_test_nodes() -> TestParams {
 			seed: Seed::Seed64(seed),
 			extra_config: ExtraConfig::Dummy(dummy_wallet_config),
 		};
-		rt.block_on(async move { Wallet::new_with_runtime(rt_clone, wallet_config).await.unwrap() })
+
+		Wallet::new(wallet_config).await.unwrap()
 	};
 
 	#[cfg(feature = "_cashu-tests")]
@@ -332,7 +323,7 @@ pub fn build_test_nodes() -> TestParams {
 			tmp.to_str().unwrap().to_string(),
 			FeeReserve { min_fee_reserve: Default::default(), percent_fee_reserve: 0.0 },
 			vec![cdk_addr.into()],
-			Some(rt.clone()),
+			None,
 		)
 		.unwrap();
 		let cdk = Arc::new(cdk);
@@ -345,7 +336,7 @@ pub fn build_test_nodes() -> TestParams {
 
 		let bitcoind_clone = Arc::clone(&bitcoind);
 		let lsp_listen_clone = lsp_listen.clone();
-		let mint = rt.block_on(async move {
+		let mint = {
 			// build mint
 			let mem_db = Arc::new(cdk_sqlite::mint::memory::empty().await.unwrap());
 			let mut mint_seed: [u8; 64] = [0; 64];
@@ -417,9 +408,7 @@ pub fn build_test_nodes() -> TestParams {
 			.await;
 
 			mint
-		});
-
-		let rt_clone = Arc::clone(&rt);
+		};
 
 		let tmp = temp_dir().join(format!("orange-test-{test_id}/wallet"));
 		let wallet_config = WalletConfig {
@@ -442,16 +431,13 @@ pub fn build_test_nodes() -> TestParams {
 				unit: orange_sdk::CurrencyUnit::Sat,
 			}),
 		};
-		let wallet =
-			rt.block_on(
-				async move { Wallet::new_with_runtime(rt_clone, wallet_config).await.unwrap() },
-			);
+		let wallet = Wallet::new(wallet_config).await.unwrap();
 
-		return TestParams { wallet, lsp, third_party, bitcoind, rt, _mint: mint };
+		return TestParams { wallet, lsp, third_party, bitcoind, _mint: mint };
 	};
 
 	#[cfg(not(feature = "_cashu-tests"))]
-	TestParams { wallet, lsp, third_party, bitcoind, rt }
+	TestParams { wallet, lsp, third_party, bitcoind }
 }
 
 pub async fn open_channel_from_lsp(wallet: &orange_sdk::Wallet, payer: Arc<Node>) -> Amount {

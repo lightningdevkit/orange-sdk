@@ -2,6 +2,7 @@
 
 use crate::EventQueue;
 use crate::bitcoin::hashes::Hash;
+use crate::runtime::Runtime;
 use crate::store::{PaymentId, TxMetadataStore, TxStatus};
 use crate::trusted_wallet::{Payment, TrustedError, TrustedWalletInterface};
 use bitcoin_payment_instructions::PaymentMethod;
@@ -20,7 +21,6 @@ use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
-use tokio::runtime::Runtime;
 use tokio::sync::watch;
 use uuid::Uuid;
 
@@ -44,8 +44,6 @@ pub struct DummyTrustedWalletExtraConfig {
 	pub lsp: Arc<Node>,
 	/// The Bitcoind node to connect to
 	pub bitcoind: Arc<Bitcoind>,
-	/// The runtime to use for async tasks
-	pub rt: Arc<Runtime>,
 }
 
 impl DummyTrustedWallet {
@@ -88,7 +86,7 @@ impl DummyTrustedWallet {
 		let events_ref = Arc::clone(&ldk_node);
 		let bal = Arc::clone(&current_bal_msats);
 		let pays = Arc::clone(&payments);
-		rt.spawn(async move {
+		rt.spawn_cancellable_background_task(async move {
 			loop {
 				let event = events_ref.next_event_async().await;
 				match event {
