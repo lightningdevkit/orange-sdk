@@ -943,7 +943,7 @@ fn test_threshold_boundary_rebalance_min() {
 		.await;
 
 		test_utils::wait_for_condition("wait for transaction", || async {
-			wallet.list_transactions().await.unwrap().len() >= 1
+			!wallet.list_transactions().await.unwrap().is_empty()
 		})
 		.await;
 
@@ -1263,10 +1263,14 @@ fn test_payment_network_mismatch() {
 		);
 
 		// now force a correct parsing to ensure we fail when trying to pay
-		let instr =
-			PaymentInstructions::parse(wrong_network, Network::Bitcoin, &HTTPHrnResolver, true)
-				.await
-				.unwrap();
+		let instr = PaymentInstructions::parse(
+			wrong_network,
+			Network::Bitcoin,
+			&HTTPHrnResolver::new(),
+			true,
+		)
+		.await
+		.unwrap();
 
 		// If it parsed, trying to pay should fail due to network mismatch
 		let amount = Amount::from_sats(1000).unwrap();
@@ -1498,9 +1502,7 @@ fn test_concurrent_receive_operations() {
 
 		// Wait for first payment to complete
 		test_utils::wait_for_condition("first payment to succeed", || async {
-			third_party
-				.payment(&payment_id_1)
-				.map_or(false, |p| p.status == PaymentStatus::Succeeded)
+			third_party.payment(&payment_id_1).is_some_and(|p| p.status == PaymentStatus::Succeeded)
 		})
 		.await;
 
@@ -1509,9 +1511,7 @@ fn test_concurrent_receive_operations() {
 
 		// Wait for second payment to complete
 		test_utils::wait_for_condition("second payment to succeed", || async {
-			third_party
-				.payment(&payment_id_2)
-				.map_or(false, |p| p.status == PaymentStatus::Succeeded)
+			third_party.payment(&payment_id_2).is_some_and(|p| p.status == PaymentStatus::Succeeded)
 		})
 		.await;
 

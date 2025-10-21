@@ -6,11 +6,11 @@ use crate::store::{PaymentId, TxMetadataStore, TxStatus};
 use crate::trusted_wallet::{Payment, TrustedError, TrustedWalletInterface};
 use crate::{Event, EventQueue, InitFailure, Seed, WalletConfig};
 
+use ldk_node::DynStore;
 use ldk_node::bitcoin::hashes::Hash;
 use ldk_node::bitcoin::hashes::sha256::Hash as Sha256;
 use ldk_node::bitcoin::hex::FromHex;
 use ldk_node::lightning::util::logger::Logger as _;
-use ldk_node::lightning::util::persist::KVStore;
 use ldk_node::lightning::{log_error, log_info};
 use ldk_node::lightning_invoice::Bolt11Invoice;
 use ldk_node::lightning_types::payment::{PaymentHash, PaymentPreimage};
@@ -475,7 +475,7 @@ const PAYMENT_HASH_METADATA_KEY: &str = "payment_hash";
 
 impl Cashu {
 	pub(crate) async fn init(
-		config: &WalletConfig, cashu_config: CashuConfig, store: Arc<dyn KVStore + Sync + Send>,
+		config: &WalletConfig, cashu_config: CashuConfig, store: Arc<DynStore>,
 		event_queue: Arc<EventQueue>, tx_metadata: TxMetadataStore, logger: Arc<Logger>,
 		runtime: Arc<Runtime>,
 	) -> Result<Self, InitFailure> {
@@ -505,7 +505,7 @@ impl Cashu {
 			},
 		};
 
-		let db = Arc::new(CashuKvDatabase::new(Arc::clone(&store)).map_err(|e| {
+		let db = Arc::new(CashuKvDatabase::new(Arc::clone(&store)).await.map_err(|e| {
 			InitFailure::TrustedFailure(TrustedError::Other(format!(
 				"Failed to create Cashu database: {e}"
 			)))
@@ -579,7 +579,7 @@ impl Cashu {
 		}
 
 		// spawn background task to recover funds if first time initializing
-		let has_recovered = read_has_recovered(&store)?;
+		let has_recovered = read_has_recovered(&store).await?;
 		if !has_recovered {
 			let w = Arc::clone(&cashu_wallet);
 			let l = Arc::clone(&logger);
@@ -590,7 +590,7 @@ impl Cashu {
 						if amt > cdk::Amount::ZERO {
 							log_info!(l, "Restored cashu mint: {}, amt: {amt}", w.mint_url);
 						}
-						if let Err(e) = write_has_recovered(&store, true) {
+						if let Err(e) = write_has_recovered(&store, true).await {
 							log_error!(l, "Failed to write has_recovered flag: {e:?}");
 						}
 					},

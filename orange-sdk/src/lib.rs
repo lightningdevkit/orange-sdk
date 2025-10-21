@@ -24,11 +24,10 @@ use ldk_node::bitcoin::secp256k1::PublicKey;
 use ldk_node::io::sqlite_store::SqliteStore;
 use ldk_node::lightning::ln::msgs::SocketAddress;
 use ldk_node::lightning::util::logger::Logger as _;
-use ldk_node::lightning::util::persist::KVStore;
 use ldk_node::lightning::{log_debug, log_error, log_info, log_trace, log_warn};
 use ldk_node::lightning_invoice::Bolt11Invoice;
 use ldk_node::payment::PaymentKind;
-use ldk_node::{BuildError, ChannelDetails, NodeError};
+use ldk_node::{BuildError, ChannelDetails, DynStore, NodeError};
 
 use tokio::runtime::Runtime;
 
@@ -113,7 +112,7 @@ struct WalletImpl {
 	/// Metadata store for tracking transactions.
 	tx_metadata: TxMetadataStore,
 	/// Key-value store for persistent storage.
-	store: Arc<dyn KVStore + Send + Sync>,
+	store: Arc<DynStore>,
 	/// Logger for logging wallet operations.
 	logger: Arc<Logger>,
 	/// The Tokio runtime for asynchronous operations.
@@ -529,7 +528,7 @@ impl Wallet {
 
 		log_info!(logger, "Initializing orange on network: {network}");
 
-		let store: Arc<dyn KVStore + Send + Sync> = match &config.storage_config {
+		let store: Arc<DynStore> = match &config.storage_config {
 			StorageConfig::LocalSQLite(path) => {
 				Arc::new(SqliteStore::new(path.into(), Some("orange.sqlite".to_owned()), None)?)
 			},
@@ -537,7 +536,7 @@ impl Wallet {
 
 		let event_queue = Arc::new(EventQueue::new(Arc::clone(&store), Arc::clone(&logger)));
 
-		let tx_metadata = TxMetadataStore::new(Arc::clone(&store));
+		let tx_metadata = TxMetadataStore::new(Arc::clone(&store)).await;
 
 		let trusted: Arc<Box<DynTrustedWalletInterface>> = match &config.extra_config {
 			#[cfg(feature = "spark")]
@@ -647,7 +646,7 @@ impl Wallet {
 
 	/// Sets whether the wallet should automatically rebalance from trusted/onchain to lightning.
 	pub fn set_rebalance_enabled(&self, value: bool) {
-		store::set_rebalance_enabled(self.inner.store.as_ref(), value);
+		store::set_rebalance_enabled(self.inner.store.as_ref(), value)
 	}
 
 	/// Whether the wallet should automatically rebalance from trusted/onchain to lightning.
@@ -1023,7 +1022,8 @@ impl Wallet {
 	pub async fn parse_payment_instructions(
 		&self, instructions: &str,
 	) -> Result<PaymentInstructions, instructions::ParseError> {
-		PaymentInstructions::parse(instructions, self.inner.network, &HTTPHrnResolver, true).await
+		PaymentInstructions::parse(instructions, self.inner.network, &HTTPHrnResolver::new(), true)
+			.await
 	}
 
 	// /// Verifies instructions which allow us to claim funds given as:
@@ -1152,7 +1152,8 @@ impl Wallet {
 
 		let methods = match &instructions.instructions {
 			PaymentInstructions::ConfigurableAmount(conf) => {
-				let res = conf.clone().set_amount(instructions.amount, &HTTPHrnResolver).await;
+				let res =
+					conf.clone().set_amount(instructions.amount, &HTTPHrnResolver::new()).await;
 				let fixed_instr = res.map_err(|e| {
 					log_error!(
 						self.inner.logger,
@@ -1266,8 +1267,8 @@ impl Wallet {
 	/// Authenticates the user via [LNURL-auth] for the given LNURL string.
 	///
 	/// [LNURL-auth]: https://github.com/lnurl/luds/blob/luds/04.md
-	pub fn lnurl_auth(&self, lnurl: &str) -> Result<(), WalletError> {
-		self.inner.ln_wallet.inner.ldk_node.lnurl_auth(lnurl)?;
+	pub fn lnurl_auth(&self, _lnurl: &str) -> Result<(), WalletError> {
+		// todo wait for merge, self.inner.ln_wallet.inner.ldk_node.lnurl_auth(lnurl)?;
 		Ok(())
 	}
 

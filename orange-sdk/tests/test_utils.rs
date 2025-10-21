@@ -68,7 +68,7 @@ fn create_bitcoind(uuid: Uuid) -> Bitcoind {
 	conf.args.push("-rpcworkqueue=100");
 	conf.staticdir = Some(temp_dir().join(format!("orange-test-{uuid}/bitcoind")));
 	let bitcoind = Bitcoind::with_conf(corepc_node::downloaded_exe_path().unwrap(), &conf)
-		.expect(&format!("Failed to start bitcoind for test {uuid}"));
+		.unwrap_or_else(|_| panic!("Failed to start bitcoind for test {uuid}"));
 
 	// Wait for bitcoind to be ready before returning
 	wait_for_bitcoind_ready(&bitcoind);
@@ -109,7 +109,7 @@ pub fn generate_blocks(bitcoind: &Bitcoind, num: usize) {
 	let _block_hashes = bitcoind
 		.client
 		.generate_to_address(num, &address)
-		.expect(&format!("failed to generate {num} blocks"));
+		.unwrap_or_else(|_| panic!("failed to generate {num} blocks"));
 }
 
 fn create_lsp(rt: Arc<Runtime>, uuid: Uuid, bitcoind: &Bitcoind) -> Arc<Node> {
@@ -153,7 +153,7 @@ fn create_lsp(rt: Arc<Runtime>, uuid: Uuid, bitcoind: &Bitcoind) -> Arc<Node> {
 
 	let ldk_node = Arc::new(builder.build().unwrap());
 
-	ldk_node.start_with_runtime(Arc::clone(&rt)).unwrap();
+	ldk_node.start().unwrap();
 
 	let events_ref = Arc::clone(&ldk_node);
 	rt.spawn(async move {
@@ -197,7 +197,7 @@ fn create_third_party(rt: Arc<Runtime>, uuid: Uuid, bitcoind: &Bitcoind) -> Arc<
 
 	let ldk_node = Arc::new(builder.build().unwrap());
 
-	ldk_node.start_with_runtime(Arc::clone(&rt)).unwrap();
+	ldk_node.start().unwrap();
 
 	let events_ref = Arc::clone(&ldk_node);
 	rt.spawn(async move {
@@ -478,10 +478,10 @@ pub async fn open_channel_from_lsp(wallet: &orange_sdk::Wallet, payer: Arc<Node>
 	})
 	.await;
 
-	let event = wait_next_event(&wallet).await;
+	let event = wait_next_event(wallet).await;
 	assert!(matches!(event, orange_sdk::Event::ChannelOpened { .. }));
 
-	let event = wait_next_event(&wallet).await;
+	let event = wait_next_event(wallet).await;
 	match event {
 		orange_sdk::Event::PaymentReceived { payment_hash, amount_msat, lsp_fee_msats, .. } => {
 			assert!(lsp_fee_msats.is_some()); // we expect a fee to be paid for opening a channel

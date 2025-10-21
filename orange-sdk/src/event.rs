@@ -6,12 +6,12 @@ use ldk_node::bitcoin::{OutPoint, Txid};
 use ldk_node::lightning::events::{ClosureReason, PaymentFailureReason};
 use ldk_node::lightning::ln::types::ChannelId;
 use ldk_node::lightning::util::logger::Logger as _;
-use ldk_node::lightning::util::persist::KVStore;
+use ldk_node::lightning::util::persist::KVStoreSync;
 use ldk_node::lightning::util::ser::{Writeable, Writer};
 use ldk_node::lightning::{impl_writeable_tlv_based_enum, log_debug, log_error, log_warn};
 use ldk_node::lightning_types::payment::{PaymentHash, PaymentPreimage};
 use ldk_node::payment::{ConfirmationStatus, PaymentKind};
-use ldk_node::{CustomTlvRecord, UserChannelId};
+use ldk_node::{CustomTlvRecord, DynStore, UserChannelId};
 
 use std::collections::VecDeque;
 use std::sync::{Arc, Condvar, Mutex};
@@ -191,12 +191,12 @@ pub struct EventQueue {
 	queue: Arc<Mutex<VecDeque<Event>>>,
 	waker: Arc<Mutex<Option<Waker>>>,
 	notifier: Condvar,
-	kv_store: Arc<dyn KVStore + Send + Sync>,
+	kv_store: Arc<DynStore>,
 	logger: Arc<Logger>,
 }
 
 impl EventQueue {
-	pub(crate) fn new(kv_store: Arc<dyn KVStore + Send + Sync>, logger: Arc<Logger>) -> Self {
+	pub(crate) fn new(kv_store: Arc<DynStore>, logger: Arc<Logger>) -> Self {
 		let queue = Arc::new(Mutex::new(VecDeque::new()));
 		let waker = Arc::new(Mutex::new(None));
 		let notifier = Condvar::new();
@@ -251,24 +251,24 @@ impl EventQueue {
 		&self, locked_queue: &VecDeque<Event>,
 	) -> Result<(), ldk_node::lightning::io::Error> {
 		let data = EventQueueSerWrapper(locked_queue).encode();
-		self.kv_store
-			.write(
+		KVStoreSync::write(
+			self.kv_store.as_ref(),
+			EVENT_QUEUE_PERSISTENCE_PRIMARY_NAMESPACE,
+			EVENT_QUEUE_PERSISTENCE_SECONDARY_NAMESPACE,
+			EVENT_QUEUE_PERSISTENCE_KEY,
+			data,
+		)
+		.map_err(|e| {
+			log_error!(
+				self.logger.as_ref(),
+				"Write for key {}/{}/{} failed due to: {}",
 				EVENT_QUEUE_PERSISTENCE_PRIMARY_NAMESPACE,
 				EVENT_QUEUE_PERSISTENCE_SECONDARY_NAMESPACE,
 				EVENT_QUEUE_PERSISTENCE_KEY,
-				&data,
-			)
-			.map_err(|e| {
-				log_error!(
-					self.logger.as_ref(),
-					"Write for key {}/{}/{} failed due to: {}",
-					EVENT_QUEUE_PERSISTENCE_PRIMARY_NAMESPACE,
-					EVENT_QUEUE_PERSISTENCE_SECONDARY_NAMESPACE,
-					EVENT_QUEUE_PERSISTENCE_KEY,
-					e
-				);
 				e
-			})?;
+			);
+			e
+		})?;
 		Ok(())
 	}
 }
@@ -316,7 +316,7 @@ pub(crate) struct LdkEventHandler {
 }
 
 impl LdkEventHandler {
-	pub(crate) fn handle_ldk_node_event(&self, event: ldk_node::Event) {
+	pub(crate) async fn handle_ldk_node_event(&self, event: ldk_node::Event) {
 		match event {
 			ldk_node::Event::PaymentSuccessful {
 				payment_id,

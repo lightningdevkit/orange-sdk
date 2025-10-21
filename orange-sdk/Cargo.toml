@@ -23,7 +23,8 @@ _cashu-tests = ["_test-utils", "cdk-ldk-node", "cdk/mint", "cdk-sqlite", "cdk-ax
 [dependencies]
 graduated-rebalancer = { path = "../graduated-rebalancer", version = "0.1.0" }
 
-ldk-node = { git = "https://github.com/benthecarman/ldk-node.git", branch = "esplora-auth" }
+ldk-node = { git = "https://github.com/lightningdevkit/ldk-node.git", rev = "dd519080318ba099280b4353fb6335c587a67cbd" }
+lightning-macros = "0.2.0-beta1"
 bitcoin-payment-instructions = { workspace = true }
 chrono = { version = "0.4", default-features = false }
 rand = { version = "0.8.5", optional = true }
@@ -31,15 +32,15 @@ reqwest = { version = "0.12.23", default-features = false, features = ["rustls-t
 breez-sdk-spark = { git = "https://github.com/breez/spark-sdk.git", rev = "1f2e9995230cd582d6b4aa7d06d76b99defb635e", default-features = false, features = ["rustls-tls"], optional = true }
 tokio = { version = "1.0", default-features = false, features = ["rt-multi-thread", "sync"] }
 uuid = { version = "1.0", default-features = false, optional = true }
-cdk = { git = "https://github.com/benthecarman/cdk.git", rev = "39c1206a4a1dda2adc1f3e23628136ef645f6c6b", default-features = false, features = ["wallet"], optional = true }
+cdk = { git = "https://github.com/benthecarman/cdk.git", rev = "0d7c1b2b9b73964e497763c4a315133db83d1c53", default-features = false, features = ["wallet"], optional = true }
 serde_json = { version = "1.0", optional = true }
 async-trait = "0.1"
 log = "0.4.28"
 
 corepc-node = { version = "0.8.0", features = ["29_0", "download"], optional = true }
-cdk-ldk-node = { git = "https://github.com/benthecarman/cdk.git", rev = "39c1206a4a1dda2adc1f3e23628136ef645f6c6b", optional = true }
-cdk-sqlite = { git = "https://github.com/benthecarman/cdk.git", rev = "39c1206a4a1dda2adc1f3e23628136ef645f6c6b", optional = true }
-cdk-axum = { git = "https://github.com/benthecarman/cdk.git", rev = "39c1206a4a1dda2adc1f3e23628136ef645f6c6b", optional = true }
+cdk-ldk-node = { git = "https://github.com/benthecarman/cdk.git", rev = "0d7c1b2b9b73964e497763c4a315133db83d1c53", optional = true }
+cdk-sqlite = { git = "https://github.com/benthecarman/cdk.git", rev = "0d7c1b2b9b73964e497763c4a315133db83d1c53", optional = true }
+cdk-axum = { git = "https://github.com/benthecarman/cdk.git", rev = "0d7c1b2b9b73964e497763c4a315133db83d1c53", optional = true }
 axum = { version = "0.8.1", optional = true }
 
 uniffi = { version = "0.29", features = ["cli", "tokio"], optional = true }
