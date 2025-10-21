@@ -78,7 +78,7 @@ impl DummyTrustedWallet {
 
 		let ldk_node = Arc::new(builder.build().unwrap());
 
-		ldk_node.start_with_runtime(Arc::clone(&rt)).unwrap();
+		ldk_node.start().unwrap();
 
 		let current_bal_msats = Arc::new(AtomicU64::new(0));
 		let payments: Arc<RwLock<Vec<Payment>>> = Arc::new(RwLock::new(vec![]));
@@ -216,7 +216,7 @@ impl DummyTrustedWallet {
 		// wait for ldk to be ready
 		let iterations = if std::env::var("CI").is_ok() { 120 } else { 10 };
 		for _ in 0..iterations {
-			if ldk_node.status().is_listening {
+			if ldk_node.status().is_running {
 				break;
 			}
 			tokio::time::sleep(Duration::from_secs(1)).await;

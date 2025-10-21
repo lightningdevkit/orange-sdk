@@ -9,8 +9,8 @@ use crate::store::{PaymentId, TxMetadataStore, TxStatus};
 use crate::trusted_wallet::{Payment, TrustedError, TrustedWalletInterface};
 use crate::{Event, EventQueue, InitFailure, Seed, WalletConfig};
 
+use ldk_node::DynStore;
 use ldk_node::lightning::util::logger::Logger as _;
-use ldk_node::lightning::util::persist::KVStore;
 use ldk_node::lightning::{log_debug, log_error, log_info, log_warn};
 use ldk_node::lightning_invoice::Bolt11Invoice;
 use ldk_node::lightning_types::payment::{PaymentHash, PaymentPreimage};
@@ -256,9 +256,9 @@ impl TrustedWalletInterface for Spark {
 impl Spark {
 	/// Initialize a new Spark wallet instance with the given configuration.
 	pub(crate) async fn init(
-		config: &WalletConfig, spark_config: SparkWalletConfig,
-		store: Arc<dyn KVStore + Sync + Send>, event_queue: Arc<EventQueue>,
-		tx_metadata: TxMetadataStore, logger: Arc<Logger>, runtime: Arc<Runtime>,
+		config: &WalletConfig, spark_config: SparkWalletConfig, store: Arc<DynStore>,
+		event_queue: Arc<EventQueue>, tx_metadata: TxMetadataStore, logger: Arc<Logger>,
+		runtime: Arc<Runtime>,
 	) -> Result<Self, InitFailure> {
 		let spark_config: breez_sdk_spark::Config = spark_config.to_breez_config(config.network)?;
 

@@ -10,7 +10,7 @@ use bitcoin_payment_instructions::amount::Amount;
 use ldk_node::bitcoin::base64::Engine;
 use ldk_node::bitcoin::base64::prelude::BASE64_STANDARD;
 use ldk_node::bitcoin::secp256k1::PublicKey;
-use ldk_node::bitcoin::{Address, Network, Script};
+use ldk_node::bitcoin::{Address, Network};
 use ldk_node::lightning::ln::channelmanager::PaymentId;
 use ldk_node::lightning::ln::msgs::SocketAddress;
 use ldk_node::lightning::util::logger::Logger as _;
@@ -18,7 +18,7 @@ use ldk_node::lightning::util::persist::KVStore;
 use ldk_node::lightning::{log_debug, log_error, log_info};
 use ldk_node::lightning_invoice::{Bolt11Invoice, Bolt11InvoiceDescription, Description};
 use ldk_node::payment::{PaymentDetails, PaymentDirection, PaymentKind, PaymentStatus};
-use ldk_node::{NodeError, UserChannelId, lightning};
+use ldk_node::{DynStore, NodeError, UserChannelId, lightning};
 
 use graduated_rebalancer::{LightningBalance, ReceivedLightningPayment};
 
@@ -52,7 +52,7 @@ const DEFAULT_INVOICE_EXPIRY_SECS: u32 = 86_400; // 24 hours
 
 impl LightningWallet {
 	pub(super) async fn init(
-		runtime: Arc<Runtime>, config: WalletConfig, store: Arc<dyn KVStore + Sync + Send>,
+		runtime: Arc<Runtime>, config: WalletConfig, store: Arc<DynStore>,
 		event_queue: Arc<EventQueue>, tx_metadata: TxMetadataStore, logger: Arc<Logger>,
 	) -> Result<Self, InitFailure> {
 		log_info!(logger, "Creating LDK node...");
@@ -148,12 +148,14 @@ impl LightningWallet {
 				InitFailure::LdkNodeStartFailure(NodeError::InvalidUri)
 			})?;
 
-			store.write(
+			KVStore::write(
+				store.as_ref(),
 				lightning::util::persist::SCORER_PERSISTENCE_PRIMARY_NAMESPACE,
 				lightning::util::persist::SCORER_PERSISTENCE_SECONDARY_NAMESPACE,
 				lightning::util::persist::SCORER_PERSISTENCE_KEY,
-				bytes.as_ref(),
-			)?;
+				bytes.to_vec(),
+			)
+			.await?;
 		}
 
 		let ldk_node = Arc::new(builder.build_with_store(Arc::clone(&store))?);
@@ -175,13 +177,13 @@ impl LightningWallet {
 			lsp_socket_addr,
 		});
 
-		inner.ldk_node.start_with_runtime(Arc::clone(&runtime))?;
+		inner.ldk_node.start()?;
 
 		runtime.spawn(async move {
 			loop {
 				let event = ev_handler.ldk_node.next_event_async().await;
 				log_debug!(ev_handler.logger, "Got ldk-node event {:?}", event);
-				ev_handler.handle_ldk_node_event(event);
+				ev_handler.handle_ldk_node_event(event).await;
 			}
 		});
 
@@ -295,18 +297,20 @@ impl LightningWallet {
 		let bal = self.inner.ldk_node.list_balances().spendable_onchain_balance_sats;
 
 		// need a dummy p2wsh address to estimate the fee, p2wsh is used for LN channels
-		let fake_addr = Address::p2wsh(Script::new(), self.inner.ldk_node.config().network);
-
-		let fee = self
-			.inner
-			.ldk_node
-			.onchain_payment()
-			.estimate_send_all_to_address(&fake_addr, true, None)?;
+		// let fake_addr = Address::p2wsh(Script::new(), self.inner.ldk_node.config().network);
+		//
+		// let fee = self
+		// 	.inner
+		// 	.ldk_node
+		// 	.onchain_payment()
+		// 	.estimate_send_all_to_address(&fake_addr, true, None)?;
+		// todo get real fee
+		let fee = 1000;
 
 		let id = self.inner.ldk_node.open_channel(
 			self.inner.lsp_node_id,
 			self.inner.lsp_socket_addr.clone(),
-			bal - fee.to_sat(),
+			bal - fee,
 			None,
 			None,
 		)?;
