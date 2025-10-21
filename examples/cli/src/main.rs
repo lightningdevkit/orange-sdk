@@ -58,7 +58,6 @@ enum Commands {
 
 struct WalletState {
 	wallet: Wallet,
-	_runtime: Arc<Runtime>, // Keep runtime alive
 	shutdown: Arc<AtomicBool>,
 }
 
@@ -128,20 +127,20 @@ fn get_config(network: Network) -> Result<WalletConfig> {
 }
 
 impl WalletState {
-	async fn new(runtime: Arc<Runtime>) -> Result<Self> {
+	async fn new() -> Result<Self> {
 		let shutdown = Arc::new(AtomicBool::new(false));
 		let config = get_config(NETWORK)
 			.with_context(|| format!("Failed to get wallet config for network: {NETWORK:?}"))?;
 
 		println!("{} Initializing wallet...", "⚡".bright_yellow());
 
-		match Wallet::new_with_runtime(runtime.clone(), config).await {
+		match Wallet::new(config).await {
 			Ok(wallet) => {
 				println!("{} Wallet initialized successfully!", "✅".bright_green());
 				println!("Network: {}", NETWORK.to_string().bright_cyan());
 
 				let w = wallet.clone();
-				runtime.spawn(async move {
+				tokio::spawn(async move {
 					let event = w.next_event_async().await;
 					match event {
 						Event::PaymentSuccessful { payment_id, .. } => {
@@ -198,7 +197,7 @@ impl WalletState {
 					w.event_handled().unwrap();
 				});
 
-				Ok(WalletState { wallet, _runtime: runtime, shutdown })
+				Ok(WalletState { wallet, shutdown })
 			},
 			Err(e) => Err(anyhow::anyhow!("Failed to initialize wallet: {:?}", e)),
 		}
@@ -213,7 +212,8 @@ impl WalletState {
 	}
 }
 
-fn main() -> Result<()> {
+#[tokio::main(flavor = "multi_thread")]
+async fn main() -> Result<()> {
 	let cli = Cli::parse();
 
 	println!("{}", "🟠 Orange CLI Wallet".bright_yellow().bold());
@@ -224,7 +224,7 @@ fn main() -> Result<()> {
 	let runtime = Arc::new(Runtime::new().context("Failed to create tokio runtime")?);
 
 	// Initialize wallet once at startup
-	let mut state = runtime.block_on(WalletState::new(runtime.clone()))?;
+	let mut state = runtime.block_on(WalletState::new())?;
 
 	// Set up signal handling for graceful shutdown
 	let shutdown_state = state.shutdown.clone();

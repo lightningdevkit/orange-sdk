@@ -2,6 +2,7 @@
 
 use crate::bitcoin::hex::DisplayHex;
 use crate::logging::Logger;
+use crate::runtime::Runtime;
 use crate::store::{PaymentId, TxMetadataStore, TxStatus};
 use crate::trusted_wallet::{Payment, TrustedError, TrustedWalletInterface};
 use crate::{Event, EventQueue, InitFailure, Seed, WalletConfig};
@@ -37,7 +38,6 @@ use std::pin::Pin;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::runtime::Runtime;
 
 /// Cashu KV store implementation
 pub mod cashu_store;
@@ -298,7 +298,7 @@ impl TrustedWalletInterface for Cashu {
 			let tx_metadata = self.tx_metadata.clone();
 			let quote_id = quote.id.clone();
 			let payment_success_sender = self.payment_success_sender.clone();
-			self.runtime.spawn(async move {
+			self.runtime.spawn_background_task(async move {
 				let mut metadata = HashMap::new();
 				if let Some(hash) = &payment_hash {
 					metadata.insert(PAYMENT_HASH_METADATA_KEY.to_string(), hash.to_string());
@@ -542,7 +542,7 @@ impl Cashu {
 		let logger_for_monitoring = Arc::clone(&logger);
 		let eq_for_monitoring = Arc::clone(&event_queue);
 		let rt_for_monitoring = Arc::clone(&runtime);
-		runtime.spawn(async move {
+		runtime.spawn_cancellable_background_task(async move {
 			loop {
 				tokio::select! {
 					_ = shutdown_receiver.changed() => {
@@ -556,7 +556,7 @@ impl Cashu {
 						let wallet = Arc::clone(&wallet_for_monitoring);
 						let event_queue = Arc::clone(&eq_for_monitoring);
 						let logger = Arc::clone(&logger_for_monitoring);
-						rt_for_monitoring.spawn(async move {
+						rt_for_monitoring.spawn_cancellable_background_task(async move {
 							if let Err(e) = Self::monitor_mint_quote(wallet, event_queue, &logger, mint_quote).await {
 								log_error!(logger, "Failed to monitor mint quote: {e:?}");
 							}
@@ -583,7 +583,7 @@ impl Cashu {
 		if !has_recovered {
 			let w = Arc::clone(&cashu_wallet);
 			let l = Arc::clone(&logger);
-			runtime.spawn(async move {
+			runtime.spawn_background_task(async move {
 				match w.restore().await {
 					Err(e) => log_error!(l, "Failed to restore cashu mint: {e}"),
 					Ok(amt) => {
