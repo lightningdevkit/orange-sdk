@@ -18,7 +18,7 @@ use std::time::Duration;
 
 mod test_utils;
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+#[tokio::test(flavor = "multi_thread")]
 async fn test_node_start() {
 	let TestParams { wallet, .. } = build_test_nodes().await;
 
@@ -88,7 +88,7 @@ async fn test_receive_to_trusted() {
 	lsp.stop().unwrap();
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+#[tokio::test(flavor = "multi_thread")]
 async fn test_pay_from_trusted() {
 	let TestParams { wallet, third_party, lsp, .. } = build_test_nodes().await;
 
@@ -167,7 +167,7 @@ async fn test_pay_from_trusted() {
 	}
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+#[tokio::test(flavor = "multi_thread")]
 async fn test_sweep_to_ln() {
 	let TestParams { wallet, lsp, third_party, .. } = build_test_nodes().await;
 
@@ -320,7 +320,7 @@ async fn test_sweep_to_ln() {
 	);
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+#[tokio::test(flavor = "multi_thread")]
 async fn test_receive_to_ln() {
 	let TestParams { wallet, third_party, .. } = build_test_nodes().await;
 
@@ -358,7 +358,7 @@ async fn test_receive_to_ln() {
 	);
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+#[tokio::test(flavor = "multi_thread")]
 async fn test_receive_to_onchain() {
 	let TestParams { wallet, lsp, bitcoind, third_party, .. } = build_test_nodes().await;
 
@@ -556,7 +556,7 @@ async fn run_test_pay_lightning_from_self_custody(amountless: bool) {
 		&& p.amount_msat == Some(amount.milli_sats())));
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+#[tokio::test(flavor = "multi_thread")]
 async fn test_pay_lightning_from_self_custody() {
 	run_test_pay_lightning_from_self_custody(false).await;
 	run_test_pay_lightning_from_self_custody(true).await;
@@ -644,13 +644,13 @@ async fn run_test_pay_bolt12_from_self_custody(amountless: bool) {
 		&& p.amount_msat == Some(amount.milli_sats())));
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+#[tokio::test(flavor = "multi_thread")]
 async fn test_pay_bolt12_from_self_custody() {
 	run_test_pay_bolt12_from_self_custody(false).await;
 	run_test_pay_bolt12_from_self_custody(true).await;
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+#[tokio::test(flavor = "multi_thread")]
 async fn test_pay_onchain_from_self_custody() {
 	let TestParams { wallet, bitcoind, third_party, .. } = build_test_nodes().await;
 
@@ -753,7 +753,7 @@ async fn test_pay_onchain_from_self_custody() {
 	.await;
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+#[tokio::test(flavor = "multi_thread")]
 async fn test_force_close_handling() {
 	let TestParams { wallet, lsp, bitcoind, third_party, .. } = build_test_nodes().await;
 
@@ -794,7 +794,7 @@ async fn test_force_close_handling() {
 	assert!(!rebalancing);
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+#[tokio::test(flavor = "multi_thread")]
 async fn test_close_all_channels() {
 	let TestParams { wallet, lsp, bitcoind, third_party, .. } = build_test_nodes().await;
 
@@ -828,7 +828,7 @@ async fn test_close_all_channels() {
 	assert!(!rebalancing);
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+#[tokio::test(flavor = "multi_thread")]
 async fn test_threshold_boundary_trusted_balance_limit() {
 	let TestParams { wallet, third_party, .. } = build_test_nodes().await;
 
@@ -904,7 +904,7 @@ async fn test_threshold_boundary_trusted_balance_limit() {
 	);
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+#[tokio::test(flavor = "multi_thread")]
 async fn test_threshold_boundary_rebalance_min() {
 	let TestParams { wallet, third_party, .. } = build_test_nodes().await;
 
@@ -977,7 +977,7 @@ async fn test_threshold_boundary_rebalance_min() {
 	);
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+#[tokio::test(flavor = "multi_thread")]
 async fn test_threshold_boundary_onchain_receive_threshold() {
 	let TestParams { wallet, .. } = build_test_nodes().await;
 
@@ -1037,7 +1037,7 @@ async fn test_threshold_boundary_onchain_receive_threshold() {
 	}
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+#[tokio::test(flavor = "multi_thread")]
 async fn test_threshold_combinations_and_edge_cases() {
 	let TestParams { wallet, .. } = build_test_nodes().await;
 
@@ -1095,7 +1095,7 @@ async fn test_threshold_combinations_and_edge_cases() {
 	}
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+#[tokio::test(flavor = "multi_thread")]
 async fn test_invalid_payment_instructions() {
 	let TestParams { wallet, third_party, .. } = build_test_nodes().await;
 
@@ -1156,7 +1156,7 @@ async fn test_invalid_payment_instructions() {
 	assert_eq!(txs.len(), 0, "Failed payments should not be recorded in transaction list");
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+#[tokio::test(flavor = "multi_thread")]
 async fn test_payment_with_expired_invoice() {
 	let TestParams { wallet, third_party, .. } = build_test_nodes().await;
 
@@ -1185,7 +1185,7 @@ async fn test_payment_with_expired_invoice() {
 	assert!(matches!(parse_result.unwrap_err(), ParseError::InstructionsExpired));
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+#[tokio::test(flavor = "multi_thread")]
 async fn test_payment_network_mismatch() {
 	let TestParams { wallet, bitcoind, .. } = build_test_nodes().await;
 
@@ -1238,7 +1238,7 @@ async fn test_payment_network_mismatch() {
 	);
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+#[tokio::test(flavor = "multi_thread")]
 async fn test_concurrent_payments() {
 	let TestParams { wallet, bitcoind, third_party, .. } = build_test_nodes().await;
 
@@ -1410,7 +1410,7 @@ async fn test_concurrent_payments() {
 	);
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+#[tokio::test(flavor = "multi_thread")]
 async fn test_concurrent_receive_operations() {
 	let TestParams { wallet, third_party, .. } = build_test_nodes().await;
 
@@ -1465,7 +1465,7 @@ async fn test_concurrent_receive_operations() {
 	assert_eq!(incoming_count, 2, "Should have exactly 2 incoming transactions");
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+#[tokio::test(flavor = "multi_thread")]
 async fn test_balance_consistency_under_load() {
 	let TestParams { wallet, third_party, .. } = build_test_nodes().await;
 
@@ -1516,7 +1516,7 @@ async fn test_balance_consistency_under_load() {
 	}
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+#[tokio::test(flavor = "multi_thread")]
 async fn test_invalid_tunables_relationships() {
 	let TestParams { wallet, .. } = build_test_nodes().await;
 
@@ -1593,7 +1593,7 @@ async fn test_invalid_tunables_relationships() {
 	}
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+#[tokio::test(flavor = "multi_thread")]
 async fn test_extreme_amount_handling() {
 	let TestParams { wallet, .. } = build_test_nodes().await;
 
@@ -1658,7 +1658,7 @@ async fn test_extreme_amount_handling() {
 	// On-chain address depends on threshold, not msat precision
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+#[tokio::test(flavor = "multi_thread")]
 async fn test_wallet_configuration_validation() {
 	let TestParams { wallet, .. } = build_test_nodes().await;
 
@@ -1721,7 +1721,7 @@ async fn test_wallet_configuration_validation() {
 	);
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+#[tokio::test(flavor = "multi_thread")]
 async fn test_edge_case_payment_instruction_parsing() {
 	let TestParams { wallet, third_party, .. } = build_test_nodes().await;
 
@@ -1771,7 +1771,7 @@ async fn test_edge_case_payment_instruction_parsing() {
 	}
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+#[tokio::test(flavor = "multi_thread")]
 async fn test_lsp_connectivity_fallback() {
 	let TestParams { wallet, lsp, bitcoind, third_party, .. } = build_test_nodes().await;
 

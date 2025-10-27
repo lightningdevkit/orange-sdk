@@ -64,7 +64,7 @@ pub async fn wait_next_event(wallet: &orange_sdk::Wallet) -> orange_sdk::Event {
 fn create_bitcoind(uuid: Uuid) -> Bitcoind {
 	let mut conf = Conf::default();
 	conf.args.push("-txindex");
-	conf.args.push("-rpcworkqueue=100");
+	conf.args.push("-rpcworkqueue=200");
 	conf.staticdir = Some(temp_dir().join(format!("orange-test-{uuid}/bitcoind")));
 	let bitcoind = Bitcoind::with_conf(corepc_node::downloaded_exe_path().unwrap(), &conf)
 		.unwrap_or_else(|_| panic!("Failed to start bitcoind for test {uuid}"));
