@@ -85,6 +85,7 @@ pub enum ParseError {
 	UnknownRequiredParameter,
 	HrnResolutionError(String),
 	InstructionsExpired,
+	InvalidLnurl(String),
 }
 
 impl Display for ParseError {
@@ -108,6 +109,7 @@ impl Display for ParseError {
 				write!(f, "Human readable name resolution error: {}", e)
 			},
 			ParseError::InstructionsExpired => write!(f, "Payment instructions have expired"),
+			ParseError::InvalidLnurl(e) => write!(f, "Invalid LNURL: {}", e),
 		}
 	}
 }
@@ -131,6 +133,7 @@ impl From<BPIParseError> for ParseError {
 				ParseError::HrnResolutionError(msg.to_string())
 			},
 			BPIParseError::InstructionsExpired => ParseError::InstructionsExpired,
+			BPIParseError::InvalidLnurl(msg) => ParseError::InvalidLnurl(msg.to_string()),
 		}
 	}
 }
