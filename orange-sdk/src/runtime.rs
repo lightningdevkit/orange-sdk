@@ -6,7 +6,7 @@
 // accordance with one or both of these licenses.
 
 use ldk_node::lightning::util::logger::Logger as _;
-use ldk_node::lightning::{log_debug, log_error, log_trace};
+use ldk_node::lightning::{log_debug, log_error, log_trace, log_warn};
 use std::future::Future;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -95,14 +95,20 @@ impl Runtime {
 
 	pub fn abort_cancellable_background_tasks(&self) {
 		let mut tasks = core::mem::take(&mut *self.cancellable_background_tasks.lock().unwrap());
-		debug_assert!(!tasks.is_empty(), "Expected some cancellable background_tasks");
+		if tasks.is_empty() {
+			log_warn!(self.logger, "Stopping cancellable background tasks with no tasks");
+			return;
+		}
 		tasks.abort_all();
 		self.block_on(async { while tasks.join_next().await.is_some() {} })
 	}
 
 	pub fn wait_on_background_tasks(&self) {
 		let mut tasks = core::mem::take(&mut *self.background_tasks.lock().unwrap());
-		debug_assert!(!tasks.is_empty(), "Expected some background_tasks");
+		if tasks.is_empty() {
+			log_warn!(self.logger, "Stopping background tasks with no tasks");
+			return;
+		}
 		self.block_on(async {
 			loop {
 				let timeout_fut = tokio::time::timeout(
