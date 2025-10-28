@@ -2,10 +2,16 @@ default:
     @just --list
 
 test *args:
-    cargo test {{ args }} --features _test-utils -p orange-sdk -- --nocapture
+    #!/usr/bin/env bash
+    THREADS=$(($(nproc) / 2))
+    if [ $THREADS -lt 1 ]; then THREADS=1; fi
+    cargo test {{ args }} --features _test-utils -p orange-sdk -- --test-threads=$THREADS
 
 test-cashu *args:
-    cargo test {{ args }} --features _cashu-tests -p orange-sdk
+    #!/usr/bin/env bash
+    THREADS=$(($(nproc) / 2))
+    if [ $THREADS -lt 1 ]; then THREADS=1; fi
+    cargo test {{ args }} --features _cashu-tests -p orange-sdk -- --test-threads=$THREADS
 
 cli:
     cd examples/cli && cargo run

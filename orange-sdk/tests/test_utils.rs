@@ -218,8 +218,9 @@ fn fund_node(node: &Node, bitcoind: &Bitcoind) {
 	generate_blocks(bitcoind, 6);
 }
 
+#[derive(Clone)]
 pub struct TestParams {
-	pub wallet: orange_sdk::Wallet,
+	pub wallet: Arc<orange_sdk::Wallet>,
 	pub lsp: Arc<Node>,
 	pub third_party: Arc<Node>,
 	pub bitcoind: Arc<Bitcoind>,
@@ -227,7 +228,36 @@ pub struct TestParams {
 	pub _mint: Arc<cdk::Mint>,
 }
 
-pub async fn build_test_nodes() -> TestParams {
+impl TestParams {
+	async fn stop(&self) {
+		self.wallet.stop().await;
+
+		#[cfg(feature = "_cashu-tests")]
+		let _ = self._mint.stop().await;
+
+		let _ = self.lsp.stop();
+		let _ = self.third_party.stop();
+	}
+}
+
+/// Runs a test with automatically managed TestParams lifecycle.
+/// The test closure receives TestParams and must return it when done.
+/// Cleanup happens automatically after the test completes.
+pub async fn run_test<F, Fut>(test: F)
+where
+	F: FnOnce(TestParams) -> Fut,
+	Fut: Future<Output = ()>,
+{
+	let params = build_test_nodes().await;
+
+	// Run the test and get params back
+	test(params.clone()).await;
+
+	// Always clean up
+	params.stop().await;
+}
+
+async fn build_test_nodes() -> TestParams {
 	let test_id = Uuid::now_v7();
 	let bitcoind = Arc::new(create_bitcoind(test_id));
 
@@ -268,7 +298,7 @@ pub async fn build_test_nodes() -> TestParams {
 	rand::thread_rng().fill_bytes(&mut seed);
 
 	#[cfg(not(feature = "_cashu-tests"))]
-	let wallet: orange_sdk::Wallet = {
+	let wallet = {
 		let dummy_wallet_config = DummyTrustedWalletExtraConfig {
 			uuid: test_id,
 			lsp: Arc::clone(&lsp),
@@ -298,7 +328,7 @@ pub async fn build_test_nodes() -> TestParams {
 			extra_config: ExtraConfig::Dummy(dummy_wallet_config),
 		};
 
-		Wallet::new(wallet_config).await.unwrap()
+		Arc::new(Wallet::new(wallet_config).await.unwrap())
 	};
 
 	#[cfg(feature = "_cashu-tests")]
@@ -431,7 +461,7 @@ pub async fn build_test_nodes() -> TestParams {
 				unit: orange_sdk::CurrencyUnit::Sat,
 			}),
 		};
-		let wallet = Wallet::new(wallet_config).await.unwrap();
+		let wallet = Arc::new(Wallet::new(wallet_config).await.unwrap());
 
 		return TestParams { wallet, lsp, third_party, bitcoind, _mint: mint };
 	};
