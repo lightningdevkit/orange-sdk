@@ -17,8 +17,8 @@ panic = 'abort'     # Abort on panic
 
 [workspace.dependencies]
 bitcoin-payment-instructions = { git = "https://github.com/benthecarman/bitcoin-payment-instructions.git", branch = "orange-fork2", features = ["http"] }
-lightning = { version = "0.2.0-beta1" }
-lightning-invoice = { version = "0.34.0-beta1" }
+lightning = { version = "0.2.0-rc1" }
+lightning-invoice = { version = "0.34.0-rc1" }
 
 [profile.release]
 panic = "abort"

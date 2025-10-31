@@ -33,9 +33,15 @@ fn sanitize_key(key: String) -> String {
 impl breez_sdk_spark::Storage for SparkStore {
 	async fn delete_cached_item(&self, key: String) -> Result<(), StorageError> {
 		let key = sanitize_key(key);
-		KVStore::remove(self.0.as_ref(), SPARK_PRIMARY_NAMESPACE, SPARK_CACHE_NAMESPACE, &key, false)
-			.await
-			.map_err(|e| StorageError::Implementation(format!("{e:?}")))?;
+		KVStore::remove(
+			self.0.as_ref(),
+			SPARK_PRIMARY_NAMESPACE,
+			SPARK_CACHE_NAMESPACE,
+			&key,
+			false,
+		)
+		.await
+		.map_err(|e| StorageError::Implementation(format!("{e:?}")))?;
 		Ok(())
 	}
 
@@ -211,9 +217,15 @@ impl breez_sdk_spark::Storage for SparkStore {
 
 	async fn delete_deposit(&self, txid: String, vout: u32) -> Result<(), StorageError> {
 		let id = format!("{txid}:{vout}");
-		KVStore::remove(self.0.as_ref(), SPARK_PRIMARY_NAMESPACE, SPARK_DEPOSITS_NAMESPACE, &id)
-			.await
-			.map_err(|e| StorageError::Implementation(format!("{e:?}")))?;
+		KVStore::remove(
+			self.0.as_ref(),
+			SPARK_PRIMARY_NAMESPACE,
+			SPARK_DEPOSITS_NAMESPACE,
+			&id,
+			false,
+		)
+		.await
+		.map_err(|e| StorageError::Implementation(format!("{e:?}")))?;
 		Ok(())
 	}
 

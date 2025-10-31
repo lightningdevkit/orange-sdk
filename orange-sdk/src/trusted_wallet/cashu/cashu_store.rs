@@ -309,21 +309,27 @@ impl WalletDatabase for CashuKvDatabase {
 		let mint_key = Self::generate_mint_key(&mint_url);
 
 		// Remove mint URL by writing empty data
-		KVStore::remove(self.store.as_ref(), CASHU_PRIMARY_KEY, MINTS_KEY, &mint_key)
+		KVStore::remove(self.store.as_ref(), CASHU_PRIMARY_KEY, MINTS_KEY, &mint_key, false)
 			.await
 			.map_err(DatabaseError::Io)?;
 
 		// Remove mint info
 		let info_key = Self::generate_mint_info_key(&mint_url);
-		KVStore::remove(self.store.as_ref(), CASHU_PRIMARY_KEY, MINTS_KEY, &info_key)
+		KVStore::remove(self.store.as_ref(), CASHU_PRIMARY_KEY, MINTS_KEY, &info_key, false)
 			.await
 			.map_err(DatabaseError::Io)?;
 
 		// Remove mint keysets
 		let keysets_key = Self::generate_mint_keysets_key(&mint_url);
-		KVStore::remove(self.store.as_ref(), CASHU_PRIMARY_KEY, MINT_KEYSETS_KEY, &keysets_key)
-			.await
-			.map_err(DatabaseError::Io)?;
+		KVStore::remove(
+			self.store.as_ref(),
+			CASHU_PRIMARY_KEY,
+			MINT_KEYSETS_KEY,
+			&keysets_key,
+			false,
+		)
+		.await
+		.map_err(DatabaseError::Io)?;
 
 		// Update cache
 		{
@@ -580,7 +586,7 @@ impl WalletDatabase for CashuKvDatabase {
 
 	async fn remove_mint_quote(&self, quote_id: &str) -> Result<(), Self::Err> {
 		// Mark as removed by writing empty data
-		KVStore::remove(self.store.as_ref(), CASHU_PRIMARY_KEY, MINT_QUOTES_KEY, quote_id)
+		KVStore::remove(self.store.as_ref(), CASHU_PRIMARY_KEY, MINT_QUOTES_KEY, quote_id, false)
 			.await
 			.map_err(DatabaseError::Io)?;
 
@@ -637,7 +643,7 @@ impl WalletDatabase for CashuKvDatabase {
 	}
 
 	async fn remove_melt_quote(&self, quote_id: &str) -> Result<(), Self::Err> {
-		KVStore::remove(self.store.as_ref(), CASHU_PRIMARY_KEY, MELT_QUOTES_KEY, quote_id)
+		KVStore::remove(self.store.as_ref(), CASHU_PRIMARY_KEY, MELT_QUOTES_KEY, quote_id, false)
 			.await
 			.map_err(DatabaseError::Io)?;
 
@@ -682,7 +688,7 @@ impl WalletDatabase for CashuKvDatabase {
 	async fn remove_keys(&self, id: &Id) -> Result<(), Self::Err> {
 		let key = id.to_string();
 
-		KVStore::remove(self.store.as_ref(), CASHU_PRIMARY_KEY, KEYS_KEY, &key)
+		KVStore::remove(self.store.as_ref(), CASHU_PRIMARY_KEY, KEYS_KEY, &key, false)
 			.await
 			.map_err(DatabaseError::Io)?;
 
@@ -707,7 +713,7 @@ impl WalletDatabase for CashuKvDatabase {
 		for y in &removed_ys {
 			let key = format!("proof_{}", hex::encode(y.serialize()));
 
-			KVStore::remove(self.store.as_ref(), CASHU_PRIMARY_KEY, PROOFS_KEY, &key)
+			KVStore::remove(self.store.as_ref(), CASHU_PRIMARY_KEY, PROOFS_KEY, &key, false)
 				.await
 				.map_err(DatabaseError::Io)?;
 		}
@@ -913,7 +919,7 @@ impl WalletDatabase for CashuKvDatabase {
 	async fn remove_transaction(&self, transaction_id: TransactionId) -> Result<(), Self::Err> {
 		let key = transaction_id.to_string();
 
-		KVStore::remove(self.store.as_ref(), CASHU_PRIMARY_KEY, TRANSACTIONS_KEY, &key)
+		KVStore::remove(self.store.as_ref(), CASHU_PRIMARY_KEY, TRANSACTIONS_KEY, &key, false)
 			.await
 			.map_err(DatabaseError::Io)?;
 
