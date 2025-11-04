@@ -376,14 +376,13 @@ impl LdkEventHandler {
 			ldk_node::Event::ChannelPending { .. } => {
 				log_debug!(self.logger, "Received ChannelPending event");
 			},
-			ldk_node::Event::ChannelReady { channel_id, user_channel_id, counterparty_node_id } => {
-				let funding_txo = self
-					.ldk_node
-					.list_channels()
-					.iter()
-					.find(|c| c.user_channel_id == user_channel_id)
-					.and_then(|c| c.funding_txo)
-					.unwrap();
+			ldk_node::Event::ChannelReady {
+				channel_id,
+				user_channel_id,
+				counterparty_node_id,
+				funding_txo,
+			} => {
+				let funding_txo = funding_txo.unwrap(); // safe
 
 				if let Err(e) = self.event_queue.add_event(Event::ChannelOpened {
 					channel_id,
@@ -415,6 +414,12 @@ impl LdkEventHandler {
 					log_error!(self.logger, "Failed to add ChannelClosed event: {e:?}");
 					return;
 				}
+			},
+			ldk_node::Event::SplicePending { .. } => {
+				log_debug!(self.logger, "Received SplicePending event");
+			},
+			ldk_node::Event::SpliceFailed { .. } => {
+				log_debug!(self.logger, "Received SpliceFailed event");
 			},
 		}
 

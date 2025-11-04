@@ -203,6 +203,8 @@ impl DummyTrustedWallet {
 					Event::ChannelPending { .. } => {},
 					Event::ChannelReady { .. } => {},
 					Event::ChannelClosed { .. } => {},
+					Event::SplicePending { .. } => {},
+					Event::SpliceFailed { .. } => {},
 				}
 				println!("dummy: {event:?}");
 				if let Err(e) = events_ref.event_handled() {

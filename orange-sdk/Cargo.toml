@@ -23,7 +23,7 @@ _cashu-tests = ["_test-utils", "cdk-ldk-node", "cdk/mint", "cdk-sqlite", "cdk-ax
 [dependencies]
 graduated-rebalancer = { path = "../graduated-rebalancer", version = "0.1.0" }
 
-ldk-node = { git = "https://github.com/lightningdevkit/ldk-node.git", rev = "870521446700353ff6461da98bd6e2c2318a9930" }
+ldk-node = { git = "https://github.com/benthecarman/ldk-node.git", rev = "d0d91b809065dc3689d2eda75b9718bf1ec1da69" }
 lightning-macros = "0.2.0-beta1"
 bitcoin-payment-instructions = { workspace = true }
 chrono = { version = "0.4", default-features = false }
