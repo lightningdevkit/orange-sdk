@@ -461,6 +461,8 @@ fn test_receive_to_onchain() {
 			"Rebalance fee should be less than 5% of received amount, got {:.2}%",
 			fee_ratio * 100.0
 		);
+
+		assert!(wallet.next_event().is_none());
 	})
 }
 

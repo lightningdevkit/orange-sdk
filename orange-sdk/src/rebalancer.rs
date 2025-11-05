@@ -10,7 +10,7 @@ use bitcoin_payment_instructions::amount::Amount;
 use graduated_rebalancer::{RebalanceTrigger, RebalancerEvent, TriggerParams};
 use ldk_node::lightning::util::logger::Logger as _;
 use ldk_node::lightning::util::persist::KVStore;
-use ldk_node::lightning::{log_error, log_info, log_warn};
+use ldk_node::lightning::{log_error, log_info, log_trace, log_warn};
 use ldk_node::payment::{ConfirmationStatus, PaymentDirection, PaymentKind, PaymentStatus};
 use std::cmp;
 use std::sync::Arc;
@@ -149,8 +149,8 @@ impl RebalanceTrigger for OrangeTrigger {
 			let new_onchain_sync_time =
 				self.ln_wallet.inner.ldk_node.status().latest_onchain_wallet_sync_timestamp;
 			let onchain_sync_time = self.onchain_sync_time.load(Ordering::Relaxed);
-			if new_onchain_sync_time.is_some()
-				&& onchain_sync_time != new_onchain_sync_time.unwrap_or(0)
+			if let Some(new_onchain_sync_time) = new_onchain_sync_time
+				&& onchain_sync_time != new_onchain_sync_time
 			{
 				// find all new confirmed inbound onchain payments since last sync
 				let new_recvs = self.ln_wallet.inner.ldk_node.list_payments_with_filter(|p| {
@@ -166,7 +166,7 @@ impl RebalanceTrigger for OrangeTrigger {
 						)
 				});
 
-				self.onchain_sync_time.swap(onchain_sync_time, Ordering::Relaxed);
+				self.onchain_sync_time.swap(new_onchain_sync_time, Ordering::Relaxed);
 
 				// now create events for these payments
 				for payment in new_recvs {
@@ -175,12 +175,15 @@ impl RebalanceTrigger for OrangeTrigger {
 						PaymentKind::Onchain { txid, status } => (txid, status),
 						_ => continue,
 					};
-					if let Err(e) = self.event_queue.add_event(Event::OnchainPaymentReceived {
+					let event = Event::OnchainPaymentReceived {
 						payment_id,
 						txid,
 						amount_sat: payment.amount_msat.expect("must have amount") / 1_000,
 						status,
-					}) {
+					};
+
+					log_trace!(self.logger, "Generated OnchainPaymentReceived event: {event:?}");
+					if let Err(e) = self.event_queue.add_event(event) {
 						log_error!(
 							self.logger,
 							"Failed to add OnchainPaymentReceived event: {e:?}"
