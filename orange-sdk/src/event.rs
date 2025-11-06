@@ -131,6 +131,17 @@ pub enum Event {
 		/// The fee paid, in msats, for the rebalance payment.
 		fee_msat: u64,
 	},
+	/// We have initiated a splice and are waiting for it to confirm.
+	SplicePending {
+		/// The `channel_id` of the channel.
+		channel_id: ChannelId,
+		/// The `user_channel_id` of the channel.
+		user_channel_id: UserChannelId,
+		/// The `node_id` of the channel counterparty.
+		counterparty_node_id: PublicKey,
+		/// The outpoint of the channel's splice funding transaction.
+		new_funding_txo: OutPoint,
+	},
 }
 
 impl_writeable_tlv_based_enum!(Event,
@@ -181,6 +192,12 @@ impl_writeable_tlv_based_enum!(Event,
 		(4, ln_rebalance_payment_id, required),
 		(6, amount_msat, required),
 		(8, fee_msat, required),
+	},
+	(8, SplicePending) => {
+		(1, channel_id, required),
+		(3, counterparty_node_id, required),
+		(5, user_channel_id, required),
+		(7, new_funding_txo, required),
 	},
 );
 
@@ -301,6 +318,7 @@ pub(crate) struct LdkEventHandler {
 	pub(crate) tx_metadata: store::TxMetadataStore,
 	pub(crate) payment_receipt_sender: watch::Sender<()>,
 	pub(crate) channel_pending_sender: watch::Sender<u128>,
+	pub(crate) splice_pending_sender: watch::Sender<u128>,
 	pub(crate) logger: Arc<Logger>,
 }
 
@@ -415,11 +433,28 @@ impl LdkEventHandler {
 					return;
 				}
 			},
-			ldk_node::Event::SplicePending { .. } => {
-				log_debug!(self.logger, "Received SplicePending event");
+			ldk_node::Event::SplicePending {
+				channel_id,
+				user_channel_id,
+				counterparty_node_id,
+				new_funding_txo,
+			} => {
+				log_debug!(self.logger, "Received SplicePending event {event:?}");
+				let _ = self.splice_pending_sender.send(user_channel_id.0);
+
+				if let Err(e) = self.event_queue.add_event(Event::SplicePending {
+					channel_id,
+					user_channel_id,
+					counterparty_node_id,
+					new_funding_txo,
+				}) {
+					log_error!(self.logger, "Failed to add SplicePending event: {e:?}");
+					return;
+				}
 			},
 			ldk_node::Event::SpliceFailed { .. } => {
-				log_debug!(self.logger, "Received SpliceFailed event");
+				println!("===========splice failed============");
+				log_warn!(self.logger, "Received SpliceFailed event: {event:?}");
 			},
 		}
 

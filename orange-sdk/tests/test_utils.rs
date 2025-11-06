@@ -250,6 +250,8 @@ where
 {
 	let params = build_test_nodes().await;
 
+	println!("=== test start ===");
+
 	// Run the test and get params back
 	test(params.clone()).await;
 

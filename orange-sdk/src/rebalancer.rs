@@ -10,7 +10,6 @@ use bitcoin_payment_instructions::amount::Amount;
 use graduated_rebalancer::{RebalanceTrigger, RebalancerEvent, TriggerParams};
 use ldk_node::DynStore;
 use ldk_node::lightning::util::logger::Logger as _;
-use ldk_node::lightning::util::persist::KVStore;
 use ldk_node::lightning::{log_error, log_info, log_trace, log_warn};
 use ldk_node::payment::{ConfirmationStatus, PaymentDirection, PaymentKind, PaymentStatus};
 use std::cmp;
@@ -339,6 +338,9 @@ impl graduated_rebalancer::EventHandler for OrangeRebalanceEventHandler {
 			} => {
 				let chan_txid = channel_outpoint.txid;
 				let triggering_txid = Txid::from_byte_array(trigger_id);
+				println!(
+					"Marking {chan_txid} as onchain rebalance initiated for triggering txid {triggering_txid}"
+				);
 				let trigger_id = PaymentId::SelfCustodial(triggering_txid.to_byte_array());
 				self.tx_metadata
 					.set_tx_caused_rebalance(&trigger_id)

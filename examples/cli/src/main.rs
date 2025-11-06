@@ -192,6 +192,13 @@ impl WalletState {
 								fee_msat
 							);
 						},
+						Event::SplicePending { new_funding_txo, .. } => {
+							println!(
+								"{} Splice pending: {}",
+								"🔄".bright_yellow(),
+								new_funding_txo
+							);
+						},
 					}
 
 					w.event_handled().unwrap();

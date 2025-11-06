@@ -108,6 +108,9 @@ pub trait LightningWallet: Send + Sync {
 		&self, payment_hash: [u8; 32],
 	) -> Pin<Box<dyn Future<Output = Option<ReceivedLightningPayment>> + Send + '_>>;
 
+	/// Check if we already have a channel with the LSP
+	fn has_channel_with_lsp(&self) -> bool;
+
 	/// Open a channel with the LSP using on-chain funds
 	fn open_channel_with_lsp(
 		&self, amt: Amount,
@@ -115,6 +118,16 @@ pub trait LightningWallet: Send + Sync {
 
 	/// Wait for a channel pending notification, returns the new channel's outpoint
 	fn await_channel_pending(
+		&self, channel_id: u128,
+	) -> Pin<Box<dyn Future<Output = OutPoint> + Send + '_>>;
+
+	/// Splice funds from on-chain to an existing channel with the LSP
+	fn splice_to_lsp_channel(
+		&self, amt: Amount,
+	) -> Pin<Box<dyn Future<Output = Result<u128, Self::Error>> + Send + '_>>;
+
+	/// Wait for a splice pending notification, returns the splice outpoint
+	fn await_splice_pending(
 		&self, channel_id: u128,
 	) -> Pin<Box<dyn Future<Output = OutPoint> + Send + '_>>;
 }
@@ -313,32 +326,51 @@ where
 		}
 	}
 
-	/// Perform on-chain to lightning rebalance by opening a channel
+	/// Perform on-chain to lightning rebalance by opening a channel or splicing into an existing one
 	async fn do_onchain_rebalance(&self, params: TriggerParams) {
-		// This should open a channel with the LSP using available on-chain funds
-
 		let _ = self.balance_mutex.lock().await;
 
-		log_info!(self.logger, "Opening channel with LSP with on-chain funds");
+		let (channel_outpoint, user_channel_id) = if self.ln_wallet.has_channel_with_lsp() {
+			log_info!(self.logger, "Splicing into channel with LSP with on-chain funds");
 
-		// todo for now we can only open a channel, eventually move to splicing
-		let user_chan_id = match self.ln_wallet.open_channel_with_lsp(params.amount).await {
-			Ok(chan_id) => chan_id,
-			Err(e) => {
-				log_error!(self.logger, "Failed to open channel with LSP: {e:?}");
-				return;
-			},
+			let user_chan_id = match self.ln_wallet.splice_to_lsp_channel(params.amount).await {
+				Ok(chan_id) => chan_id,
+				Err(e) => {
+					log_error!(self.logger, "Failed to open channel with LSP: {e:?}");
+					return;
+				},
+			};
+
+			log_info!(self.logger, "Initiated splice opened with LSP");
+
+			let channel_outpoint = self.ln_wallet.await_splice_pending(user_chan_id).await;
+
+			log_info!(self.logger, "Splice initiated at: {channel_outpoint}");
+
+			(channel_outpoint, user_chan_id)
+		} else {
+			log_info!(self.logger, "Opening channel with LSP with on-chain funds");
+
+			let user_chan_id = match self.ln_wallet.open_channel_with_lsp(params.amount).await {
+				Ok(chan_id) => chan_id,
+				Err(e) => {
+					log_error!(self.logger, "Failed to open channel with LSP: {e:?}");
+					return;
+				},
+			};
+
+			log_info!(self.logger, "Initiated channel opened with LSP");
+
+			let channel_outpoint = self.ln_wallet.await_channel_pending(user_chan_id).await;
+
+			log_info!(self.logger, "Channel open succeeded at: {channel_outpoint}");
+
+			(channel_outpoint, user_chan_id)
 		};
-
-		log_info!(self.logger, "Initiated channel opened with LSP");
-
-		let channel_outpoint = self.ln_wallet.await_channel_pending(user_chan_id).await;
-
-		log_info!(self.logger, "Channel open succeeded at: {channel_outpoint}",);
 
 		self.event_handler.handle_event(RebalancerEvent::OnChainRebalanceInitiated {
 			trigger_id: params.id,
-			user_channel_id: user_chan_id,
+			user_channel_id,
 			channel_outpoint,
 		});
 	}
