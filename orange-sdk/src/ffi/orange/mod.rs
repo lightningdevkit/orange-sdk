@@ -262,6 +262,17 @@ pub enum Event {
 		/// The fee paid, in msats, for the rebalance payment.
 		fee_msat: u64,
 	},
+	/// We have initiated a splice and are waiting for it to confirm.
+	SplicePending {
+		/// The `channel_id` of the channel.
+		channel_id: Vec<u8>,
+		/// The `user_channel_id` of the channel.
+		user_channel_id: Vec<u8>,
+		/// The `node_id` of the channel counterparty.
+		counterparty_node_id: Vec<u8>,
+		/// The outpoint of the channel's splice funding transaction.
+		new_funding_txo: String,
+	},
 }
 
 impl From<OrangeEvent> for Event {
@@ -348,6 +359,17 @@ impl From<OrangeEvent> for Event {
 				ln_rebalance_payment_id: ln_rebalance_payment_id.to_vec(),
 				amount_msat,
 				fee_msat,
+			},
+			OrangeEvent::SplicePending {
+				channel_id,
+				user_channel_id,
+				counterparty_node_id,
+				new_funding_txo,
+			} => Event::SplicePending {
+				channel_id: channel_id.0.to_vec(),
+				user_channel_id: user_channel_id.0.to_be_bytes().to_vec(),
+				counterparty_node_id: counterparty_node_id.serialize().to_vec(),
+				new_funding_txo: new_funding_txo.to_string(),
 			},
 		}
 	}

@@ -662,10 +662,13 @@ impl Wallet {
 	/// Lists the transactions which have been made.
 	pub async fn list_transactions(&self) -> Result<Vec<Transaction>, WalletError> {
 		let trusted_payments = self.inner.trusted.list_payments().await?;
-		let lightning_payments = self.inner.ln_wallet.list_payments();
+		let mut lightning_payments = self.inner.ln_wallet.list_payments();
+		lightning_payments.sort_by_key(|l| l.latest_update_timestamp);
 
 		let mut res = Vec::with_capacity(trusted_payments.len() + lightning_payments.len());
 		let tx_metadata = self.inner.tx_metadata.read();
+
+		println!("\n\n=======================");
 
 		let mut internal_transfers = HashMap::new();
 		#[derive(Debug, Default)]
@@ -770,6 +773,7 @@ impl Wallet {
 				});
 			}
 		}
+		println!("ln payments: {:#?}", lightning_payments);
 		for payment in lightning_payments {
 			use ldk_node::payment::PaymentDirection;
 			let lightning_receive_fee = match payment.kind {
@@ -789,6 +793,10 @@ impl Wallet {
 				),
 			};
 			if let Some(tx_metadata) = tx_metadata.get(&PaymentId::SelfCustodial(payment.id.0)) {
+				println!(
+					"Found metadata for lightning payment {} got {:?}",
+					payment.id, tx_metadata.ty
+				);
 				match &tx_metadata.ty {
 					TxType::TrustedToLightning {
 						trusted_payment: _,
@@ -811,6 +819,7 @@ impl Wallet {
 							.or_insert(InternalTransfer::default());
 						if &payment.id.0 == channel_txid.as_byte_array() {
 							debug_assert!(entry.send_fee.is_none());
+							println!("onchain to ln fee: {:?}", payment.fee_paid_msat);
 							entry.send_fee = payment
 								.fee_paid_msat
 								.map(|fee| Amount::from_milli_sats(fee).expect("Must be valid"));
@@ -827,6 +836,8 @@ impl Wallet {
 								transaction: None,
 							});
 						debug_assert!(entry.transaction.is_none());
+
+						println!("trigger: {:?}", payment.fee_paid_msat);
 
 						entry.transaction = Some(Transaction {
 							id: PaymentId::SelfCustodial(payment.id.0),

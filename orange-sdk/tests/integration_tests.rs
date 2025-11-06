@@ -481,6 +481,109 @@ async fn test_receive_to_onchain() {
 	.await;
 }
 
+#[tokio::test(flavor = "multi_thread")]
+// #[test_log::test]
+async fn test_receive_to_onchain_with_channel() {
+	test_utils::run_test(|params| async move {
+		let wallet = Arc::clone(&params.wallet);
+		let lsp = Arc::clone(&params.lsp);
+		let bitcoind = Arc::clone(&params.bitcoind);
+		let third_party = Arc::clone(&params.third_party);
+
+		let start = open_channel_from_lsp(&wallet, Arc::clone(&third_party)).await;
+
+		let starting_bal = wallet.get_balance().await.unwrap();
+		// channel amt - opening fees
+		assert_eq!(
+			starting_bal.available_balance(),
+			start.saturating_sub(Amount::from_sats(2_000).unwrap())
+		);
+		assert_eq!(starting_bal.pending_balance, Amount::ZERO);
+
+		let recv_amt = Amount::from_sats(300_000).unwrap();
+
+		let uri = wallet.get_single_use_receive_uri(Some(recv_amt)).await.unwrap();
+		let sent_txid = third_party
+			.onchain_payment()
+			.send_to_address(&uri.address.unwrap(), recv_amt.sats().unwrap(), None)
+			.unwrap();
+
+		println!("Sent txid: {}", sent_txid);
+
+		// confirm transaction
+		generate_blocks(&bitcoind, 6);
+
+		// check we received on-chain, should be pending
+		// wait for payment success
+		test_utils::wait_for_condition("pending balance to update", || async {
+			// onchain balance is always listed as pending until we splice it into the channel.
+			wallet.get_balance().await.unwrap().pending_balance == recv_amt
+		})
+		.await;
+
+		let event = wait_next_event(&wallet).await;
+		match event {
+			Event::OnchainPaymentReceived { txid, amount_sat, status, .. } => {
+				assert_eq!(txid, sent_txid);
+				assert_eq!(amount_sat, recv_amt.sats().unwrap());
+				assert!(matches!(status, ConfirmationStatus::Confirmed { .. }));
+			},
+			ev => panic!("Expected OnchainPaymentReceived event, got {ev:?}"),
+		}
+
+		let event = wait_next_event(&wallet).await;
+		match event {
+			Event::SplicePending { counterparty_node_id, .. } => {
+				assert_eq!(counterparty_node_id, lsp.node_id());
+			},
+			ev => panic!("Expected SplicePending event, got {ev:?}"),
+		}
+
+		// confirm splice
+		generate_blocks(&bitcoind, 6);
+		tokio::time::sleep(Duration::from_secs(5)).await;
+
+		let event = wait_next_event(&wallet).await;
+		match event {
+			Event::ChannelOpened { counterparty_node_id, .. } => {
+				assert_eq!(counterparty_node_id, lsp.node_id());
+			},
+			ev => panic!("Expected ChannelOpened event, got {ev:?}"),
+		}
+
+		let txs = wallet.list_transactions().await.unwrap();
+		assert_eq!(txs.len(), 2);
+		let tx = txs.into_iter().last().unwrap();
+
+		// Comprehensive validation for on-chain receive after rebalance
+		assert!(!tx.outbound, "Incoming payment should not be outbound");
+		assert_eq!(tx.status, TxStatus::Completed, "Payment should be completed");
+		assert_eq!(
+			tx.payment_type,
+			PaymentType::IncomingOnChain { txid: Some(sent_txid) },
+			"Payment type should be IncomingOnChain with correct txid"
+		);
+		assert_ne!(tx.time_since_epoch, Duration::ZERO, "Time should be set");
+		assert_eq!(tx.amount, Some(recv_amt), "Amount should equal received amount");
+		// fixme assert!(
+		// 	tx.fee.unwrap() > Amount::ZERO,
+		// 	"On-chain receive should have rebalance fees after channel opening"
+		// );
+
+		// Validate fee is reasonable (should be less than 5% of received amount for rebalance)
+		let fee_ratio = tx.fee.unwrap().milli_sats() as f64 / recv_amt.milli_sats() as f64;
+		assert!(
+			fee_ratio < 0.05,
+			"Rebalance fee should be less than 5% of received amount, got {:.2}%",
+			fee_ratio * 100.0
+		);
+
+		let next = wallet.next_event();
+		assert!(next.is_none(), "Expected no more events, got {next:?}");
+	})
+	.await;
+}
+
 async fn run_test_pay_lightning_from_self_custody(amountless: bool) {
 	test_utils::run_test(|params| async move {
 		let wallet = Arc::clone(&params.wallet);

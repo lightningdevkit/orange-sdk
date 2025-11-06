@@ -38,8 +38,10 @@ pub(crate) struct LightningWalletBalance {
 
 pub(crate) struct LightningWalletImpl {
 	pub(crate) ldk_node: Arc<ldk_node::Node>,
+	logger: Arc<Logger>,
 	payment_receipt_flag: watch::Receiver<()>,
 	channel_pending_receipt_flag: watch::Receiver<u128>,
+	splice_pending_receipt_flag: watch::Receiver<u128>,
 	lsp_node_id: PublicKey,
 	lsp_socket_addr: SocketAddress,
 }
@@ -163,18 +165,22 @@ impl LightningWallet {
 		let ldk_node = Arc::new(builder.build_with_store(Arc::clone(&store))?);
 		let (payment_receipt_sender, payment_receipt_flag) = watch::channel(());
 		let (channel_pending_sender, channel_pending_receipt_flag) = watch::channel(0);
+		let (splice_pending_sender, splice_pending_receipt_flag) = watch::channel(0);
 		let ev_handler = Arc::new(LdkEventHandler {
 			event_queue,
 			ldk_node: Arc::clone(&ldk_node),
 			tx_metadata,
 			payment_receipt_sender,
 			channel_pending_sender,
-			logger,
+			splice_pending_sender,
+			logger: Arc::clone(&logger),
 		});
 		let inner = Arc::new(LightningWalletImpl {
 			ldk_node,
+			logger,
 			payment_receipt_flag,
 			channel_pending_receipt_flag,
+			splice_pending_receipt_flag,
 			lsp_node_id,
 			lsp_socket_addr,
 		});
@@ -202,6 +208,12 @@ impl LightningWallet {
 		let mut flag = self.inner.channel_pending_receipt_flag.clone();
 		flag.mark_unchanged();
 		flag.wait_for(|t| t == &channel_id).await.expect("channel pending not received");
+	}
+
+	pub(crate) async fn await_splice_pending(&self, channel_id: u128) {
+		let mut flag = self.inner.splice_pending_receipt_flag.clone();
+		flag.mark_unchanged();
+		flag.wait_for(|t| t == &channel_id).await.expect("splice pending not received");
 	}
 
 	pub(crate) fn get_on_chain_address(&self) -> Result<Address, NodeError> {
@@ -292,6 +304,32 @@ impl LightningWallet {
 				.onchain_payment()
 				.send_to_address(address, amount.sats_rounding_up(), None)
 				.map(|txid| PaymentId(*txid.as_ref())),
+		}
+	}
+
+	pub(crate) async fn splice_balance_into_channel(
+		&self, amount: Amount,
+	) -> Result<UserChannelId, NodeError> {
+		// find existing channel to splice into
+		let channels = self.inner.ldk_node.list_channels();
+		let channel = channels.iter().find(|c| c.counterparty_node_id == self.inner.lsp_node_id);
+
+		// todo fix this, for now leave some onchain balance for fees
+		let amt = amount.saturating_sub(Amount::from_sats(10_000).unwrap());
+
+		match channel {
+			Some(chan) => {
+				self.inner.ldk_node.splice_in(
+					&chan.user_channel_id,
+					chan.counterparty_node_id,
+					amt.sats_rounding_up(),
+				)?;
+				Ok(chan.user_channel_id)
+			},
+			None => {
+				log_error!(self.inner.logger, "No existing channel to splice into");
+				Err(NodeError::WalletOperationFailed)
+			},
 		}
 	}
 
@@ -407,6 +445,11 @@ impl graduated_rebalancer::LightningWallet for LightningWallet {
 		})
 	}
 
+	fn has_channel_with_lsp(&self) -> bool {
+		let channels = self.inner.ldk_node.list_channels();
+		channels.iter().any(|c| c.counterparty_node_id == self.inner.lsp_node_id)
+	}
+
 	fn open_channel_with_lsp(
 		&self, _amt: Amount,
 	) -> Pin<Box<dyn Future<Output = Result<u128, Self::Error>> + Send + '_>> {
@@ -429,6 +472,38 @@ impl graduated_rebalancer::LightningWallet for LightningWallet {
 					Some(c) => return c.funding_txo.expect("channel has no funding txo"),
 					None => {
 						self.await_channel_pending(channel_id).await;
+						// Wait for the next channel pending event
+					},
+				}
+			}
+		})
+	}
+
+	fn splice_to_lsp_channel(
+		&self, amt: Amount,
+	) -> Pin<Box<dyn Future<Output = Result<u128, Self::Error>> + Send + '_>> {
+		Box::pin(async move { self.splice_balance_into_channel(amt).await.map(|c| c.0) })
+	}
+
+	fn await_splice_pending(
+		&self, channel_id: u128,
+	) -> Pin<Box<dyn Future<Output = OutPoint> + Send + '_>> {
+		Box::pin(async move {
+			// todo since we can't see if we have any active splices, we just await the next splice pending event
+			// this is kinda race-y hopefully we can fix
+			self.await_splice_pending(channel_id).await;
+			loop {
+				let channels = self.inner.ldk_node.list_channels();
+				let chan = channels
+					.into_iter()
+					.find(|c| c.user_channel_id.0 == channel_id && c.funding_txo.is_some());
+				match chan {
+					Some(c) => {
+						println!("\nRETURNING HERE\n");
+						return c.funding_txo.expect("channel has no funding txo");
+					},
+					None => {
+						self.await_splice_pending(channel_id).await;
 						// Wait for the next channel pending event
 					},
 				}
