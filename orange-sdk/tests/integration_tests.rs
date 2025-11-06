@@ -565,10 +565,10 @@ async fn test_receive_to_onchain_with_channel() {
 		);
 		assert_ne!(tx.time_since_epoch, Duration::ZERO, "Time should be set");
 		assert_eq!(tx.amount, Some(recv_amt), "Amount should equal received amount");
-		// fixme assert!(
-		// 	tx.fee.unwrap() > Amount::ZERO,
-		// 	"On-chain receive should have rebalance fees after channel opening"
-		// );
+		assert!(
+			tx.fee.unwrap() > Amount::ZERO,
+			"On-chain receive should have rebalance fees after channel opening"
+		);
 
 		// Validate fee is reasonable (should be less than 5% of received amount for rebalance)
 		let fee_ratio = tx.fee.unwrap().milli_sats() as f64 / recv_amt.milli_sats() as f64;
@@ -878,6 +878,110 @@ async fn test_pay_onchain_from_self_custody() {
 		assert_eq!(
 			bal.pending_balance,
 			recv_amount.saturating_sub(send_amount).saturating_sub(payment.fee.unwrap())
+		);
+
+		// Wait for third party node to receive it
+		test_utils::wait_for_condition("on-chain payment received", || async {
+			let payments = third_party.list_payments();
+			payments.iter().any(|p| {
+				p.status == PaymentStatus::Succeeded
+					&& p.direction == PaymentDirection::Inbound
+					&& p.amount_msat == Some(send_amount.milli_sats())
+			})
+		})
+		.await;
+	})
+	.await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_pay_onchain_from_channel() {
+	test_utils::run_test(|params| async move {
+		let wallet = Arc::clone(&params.wallet);
+		let bitcoind = Arc::clone(&params.bitcoind);
+		let third_party = Arc::clone(&params.third_party);
+
+		// get a channel so we can make a payment
+		let recv = open_channel_from_lsp(&wallet, Arc::clone(&third_party)).await;
+
+		let starting_bal = wallet.get_balance().await.unwrap();
+		assert_eq!(
+			starting_bal.available_balance(),
+			recv.saturating_sub(Amount::from_sats(2_000).unwrap())
+		);
+		assert_eq!(starting_bal.pending_balance, Amount::ZERO);
+
+		// wait for sync
+		generate_blocks(&bitcoind, 6);
+		test_utils::wait_for_condition("wallet sync after channel open", || async {
+			wallet.channels().iter().any(|a| a.confirmations.is_some_and(|c| c > 0) && a.is_usable)
+		})
+		.await;
+
+		// get address from third party node
+		let addr = third_party.onchain_payment().new_address().unwrap();
+		let send_amount = Amount::from_sats(10_000).unwrap();
+
+		let instr = wallet.parse_payment_instructions(addr.to_string().as_str()).await.unwrap();
+		let info = PaymentInfo::build(instr, Some(send_amount)).unwrap();
+		wallet.pay(&info).await.unwrap();
+
+		// sleep for a second to wait for proper broadcast
+		tokio::time::sleep(Duration::from_secs(1)).await;
+
+		// confirm the tx
+		generate_blocks(&bitcoind, 6);
+
+		// sleep for a second to wait for sync
+		tokio::time::sleep(Duration::from_secs(1)).await;
+
+		// wait for payment to complete
+		test_utils::wait_for_condition("on-chain payment completion", || async {
+			let payments = wallet.list_transactions().await.unwrap();
+			let payment = payments.into_iter().find(|p| p.outbound);
+			if payment.as_ref().is_some_and(|p| p.status == TxStatus::Failed) {
+				panic!("Payment failed");
+			}
+			payment.is_some_and(|p| p.status == TxStatus::Completed)
+		})
+		.await;
+
+		// check the payment is correct
+		let payments = wallet.list_transactions().await.unwrap();
+		let payment = payments.into_iter().find(|p| p.outbound).unwrap();
+
+		// Comprehensive validation for outgoing on-chain payment
+		assert_eq!(payment.amount, Some(send_amount), "Amount should equal sent amount");
+		assert!(
+			payment.fee.is_some_and(|f| f > Amount::ZERO),
+			"On-chain payment should have non-zero fees"
+		);
+		assert!(payment.outbound, "Outgoing payment should be outbound");
+		assert!(
+			matches!(payment.payment_type, PaymentType::OutgoingOnChain { .. }),
+			"Payment type should be OutgoingOnChain"
+		);
+		assert_eq!(payment.status, TxStatus::Completed, "Payment should be completed");
+		assert_ne!(payment.time_since_epoch, Duration::ZERO, "Time should be set");
+
+		// Validate fee is reasonable for on-chain (should be less than 1% of sent amount)
+		let fee_ratio = payment.fee.unwrap().milli_sats() as f64 / send_amount.milli_sats() as f64;
+		assert!(
+			fee_ratio < 0.01,
+			"On-chain fee should be less than 1% of sent amount, got {:.2}%",
+			fee_ratio * 100.0
+		);
+
+		// Check that payment_type contains txid for completed payments
+		if let PaymentType::OutgoingOnChain { txid } = &payment.payment_type {
+			assert!(txid.is_some(), "Completed on-chain payment should have txid");
+		}
+
+		// check balance left our wallet
+		let bal = wallet.get_balance().await.unwrap();
+		assert_eq!(
+			bal.pending_balance,
+			recv.saturating_sub(send_amount).saturating_sub(payment.fee.unwrap())
 		);
 
 		// Wait for third party node to receive it

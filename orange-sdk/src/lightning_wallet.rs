@@ -298,12 +298,66 @@ impl LightningWallet {
 				.ldk_node
 				.bolt12_payment()
 				.send_using_amount(offer, amount.milli_sats(), None, None),
-			PaymentMethod::OnChain(address) => self
-				.inner
-				.ldk_node
-				.onchain_payment()
-				.send_to_address(address, amount.sats_rounding_up(), None)
-				.map(|txid| PaymentId(*txid.as_ref())),
+			PaymentMethod::OnChain(address) => {
+				let balance = self.inner.ldk_node.list_balances();
+
+				// if we have enough onchain balance, send onchain
+				if balance.spendable_onchain_balance_sats > amount.sats_rounding_up() {
+					self.inner
+						.ldk_node
+						.onchain_payment()
+						.send_to_address(address, amount.sats_rounding_up(), None)
+						.map(|txid| PaymentId(*txid.as_ref()))
+				} else {
+					// otherwise try to pay via splice out
+
+					// find existing channel to splice out of
+					let channels = self.inner.ldk_node.list_channels();
+					let channel =
+						channels.iter().find(|c| c.counterparty_node_id == self.inner.lsp_node_id);
+
+					match channel {
+						None => {
+							log_error!(self.inner.logger, "No existing channel to splice out of");
+							Err(NodeError::InsufficientFunds)
+						},
+						Some(chan) => {
+							self.inner.ldk_node.splice_out(
+								&chan.user_channel_id,
+								chan.counterparty_node_id,
+								address.clone(),
+								amount.sats_rounding_up(),
+							)?;
+
+							loop {
+								self.await_splice_pending(chan.user_channel_id.0).await;
+								let channels = self.inner.ldk_node.list_channels();
+								let new_chan = channels
+									.iter()
+									.find(|c| c.user_channel_id == chan.user_channel_id);
+								match new_chan {
+									Some(c) => {
+										if c.funding_txo
+											.is_some_and(|f| f != chan.funding_txo.unwrap())
+										{
+											return Ok(PaymentId(
+												*c.funding_txo.unwrap().txid.as_ref(),
+											));
+										}
+									},
+									None => {
+										log_error!(
+											self.inner.logger,
+											"Channel disappeared while awaiting splice out"
+										);
+										return Err(NodeError::WalletOperationFailed);
+									},
+								}
+							}
+						},
+					}
+				}
+			},
 		}
 	}
 
