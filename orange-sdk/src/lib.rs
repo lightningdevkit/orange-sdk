@@ -1110,7 +1110,9 @@ impl Wallet {
 		let mut pay_lightning = async |method, ty: fn() -> PaymentType| {
 			let typ = ty();
 			let balance = if matches!(typ, PaymentType::OutgoingOnChain { .. }) {
-				ln_balance.onchain
+				// if we are paying on-chain, we can either use the on-chain balance or the
+				// lightning balance with a splice. Use the larger of the two.
+				ln_balance.onchain.max(ln_balance.lightning)
 			} else {
 				ln_balance.lightning
 			};
