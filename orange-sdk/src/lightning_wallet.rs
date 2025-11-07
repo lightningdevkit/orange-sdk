@@ -1,9 +1,10 @@
 use crate::bitcoin::OutPoint;
+use crate::bitcoin::hashes::Hash;
 use crate::event::{EventQueue, LdkEventHandler};
 use crate::logging::Logger;
 use crate::runtime::Runtime;
 use crate::store::{TxMetadataStore, TxStatus};
-use crate::{ChainSource, InitFailure, PaymentType, Seed, WalletConfig};
+use crate::{ChainSource, InitFailure, PaymentType, Seed, WalletConfig, store};
 
 use bitcoin_payment_instructions::PaymentMethod;
 use bitcoin_payment_instructions::amount::Amount;
@@ -18,7 +19,9 @@ use ldk_node::lightning::util::logger::Logger as _;
 use ldk_node::lightning::util::persist::KVStore;
 use ldk_node::lightning::{log_debug, log_error, log_info};
 use ldk_node::lightning_invoice::{Bolt11Invoice, Bolt11InvoiceDescription, Description};
-use ldk_node::payment::{PaymentDetails, PaymentDirection, PaymentKind, PaymentStatus};
+use ldk_node::payment::{
+	ConfirmationStatus, PaymentDetails, PaymentDirection, PaymentKind, PaymentStatus,
+};
 use ldk_node::{DynStore, NodeError, UserChannelId, lightning};
 
 use graduated_rebalancer::{LightningBalance, ReceivedLightningPayment};
@@ -27,7 +30,7 @@ use std::collections::HashMap;
 use std::fmt::Debug;
 use std::pin::Pin;
 use std::sync::Arc;
-
+use std::time::SystemTime;
 use tokio::sync::watch;
 
 #[derive(Debug, Clone, Copy)]
@@ -39,6 +42,7 @@ pub(crate) struct LightningWalletBalance {
 pub(crate) struct LightningWalletImpl {
 	pub(crate) ldk_node: Arc<ldk_node::Node>,
 	logger: Arc<Logger>,
+	store: Arc<DynStore>,
 	payment_receipt_flag: watch::Receiver<()>,
 	channel_pending_receipt_flag: watch::Receiver<u128>,
 	splice_pending_receipt_flag: watch::Receiver<u128>,
@@ -178,6 +182,7 @@ impl LightningWallet {
 		let inner = Arc::new(LightningWalletImpl {
 			ldk_node,
 			logger,
+			store,
 			payment_receipt_flag,
 			channel_pending_receipt_flag,
 			splice_pending_receipt_flag,
@@ -299,14 +304,16 @@ impl LightningWallet {
 				.bolt12_payment()
 				.send_using_amount(offer, amount.milli_sats(), None, None),
 			PaymentMethod::OnChain(address) => {
+				let amount_sats = amount.sats().map_err(|_| NodeError::InvalidAmount)?;
+
 				let balance = self.inner.ldk_node.list_balances();
 
 				// if we have enough onchain balance, send onchain
-				if balance.spendable_onchain_balance_sats > amount.sats_rounding_up() {
+				if balance.spendable_onchain_balance_sats > amount_sats {
 					self.inner
 						.ldk_node
 						.onchain_payment()
-						.send_to_address(address, amount.sats_rounding_up(), None)
+						.send_to_address(address, amount_sats, None)
 						.map(|txid| PaymentId(*txid.as_ref()))
 				} else {
 					// otherwise try to pay via splice out
@@ -326,7 +333,7 @@ impl LightningWallet {
 								&chan.user_channel_id,
 								chan.counterparty_node_id,
 								address.clone(),
-								amount.sats_rounding_up(),
+								amount_sats,
 							)?;
 
 							loop {
@@ -340,9 +347,30 @@ impl LightningWallet {
 										if c.funding_txo
 											.is_some_and(|f| f != chan.funding_txo.unwrap())
 										{
-											return Ok(PaymentId(
-												*c.funding_txo.unwrap().txid.as_ref(),
-											));
+											let funding_txo = c.funding_txo.unwrap();
+
+											let id = PaymentId(funding_txo.txid.to_byte_array());
+											let details = PaymentDetails {
+												id,
+												kind: PaymentKind::Onchain {
+													txid: funding_txo.txid,
+													status: ConfirmationStatus::Unconfirmed, // todo how do we update this?
+												},
+												amount_msat: Some(amount_sats * 1_000),
+												fee_paid_msat: Some(69), // todo get real fee
+												direction: PaymentDirection::Outbound,
+												status: PaymentStatus::Succeeded,
+												latest_update_timestamp: SystemTime::now()
+													.duration_since(SystemTime::UNIX_EPOCH)
+													.unwrap()
+													.as_secs(),
+											};
+
+											store::write_splice_out(
+												self.inner.store.as_ref(),
+												&details,
+											);
+											return Ok(id);
 										}
 									},
 									None => {

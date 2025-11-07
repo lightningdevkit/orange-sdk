@@ -26,7 +26,7 @@ use ldk_node::lightning::ln::msgs::SocketAddress;
 use ldk_node::lightning::util::logger::Logger as _;
 use ldk_node::lightning::{log_debug, log_error, log_info, log_trace, log_warn};
 use ldk_node::lightning_invoice::Bolt11Invoice;
-use ldk_node::payment::PaymentKind;
+use ldk_node::payment::{PaymentDirection, PaymentKind};
 use ldk_node::{BuildError, ChannelDetails, DynStore, NodeError};
 
 use std::collections::HashMap;
@@ -665,7 +665,11 @@ impl Wallet {
 		let mut lightning_payments = self.inner.ln_wallet.list_payments();
 		lightning_payments.sort_by_key(|l| l.latest_update_timestamp);
 
-		let mut res = Vec::with_capacity(trusted_payments.len() + lightning_payments.len());
+		let splice_outs = store::read_splice_outs(self.inner.store.as_ref());
+
+		let mut res = Vec::with_capacity(
+			trusted_payments.len() + lightning_payments.len() + splice_outs.len(),
+		);
 		let tx_metadata = self.inner.tx_metadata.read();
 
 		println!("\n\n=======================");
@@ -892,6 +896,18 @@ impl Wallet {
 					time_since_epoch: Duration::from_secs(payment.latest_update_timestamp),
 				})
 			}
+		}
+
+		for details in splice_outs {
+			res.push(Transaction {
+				id: PaymentId::SelfCustodial(details.id.0),
+				status: details.status.into(),
+				outbound: details.direction == PaymentDirection::Outbound,
+				amount: details.amount_msat.map(|a| Amount::from_milli_sats(a).unwrap()),
+				fee: details.fee_paid_msat.map(|fee| Amount::from_milli_sats(fee).unwrap()),
+				payment_type: (&details).into(),
+				time_since_epoch: Duration::from_secs(details.latest_update_timestamp),
+			});
 		}
 
 		for (id, tx_info) in internal_transfers {
