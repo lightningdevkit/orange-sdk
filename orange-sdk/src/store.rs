@@ -13,6 +13,7 @@
 
 use bitcoin_payment_instructions::amount::Amount;
 
+use ldk_node::DynStore;
 use ldk_node::bitcoin::Txid;
 use ldk_node::bitcoin::hex::{DisplayHex, FromHex};
 use ldk_node::lightning::io;
@@ -21,8 +22,8 @@ use ldk_node::lightning::types::payment::PaymentPreimage;
 use ldk_node::lightning::util::persist::{KVStore, KVStoreSync};
 use ldk_node::lightning::util::ser::{Readable, Writeable, Writer};
 use ldk_node::lightning::{impl_writeable_tlv_based, impl_writeable_tlv_based_enum};
+use ldk_node::payment::PaymentDetails;
 
-use ldk_node::DynStore;
 use std::collections::HashMap;
 use std::fmt;
 use std::str::FromStr;
@@ -31,6 +32,7 @@ use std::time::Duration;
 
 const STORE_PRIMARY_KEY: &str = "orange_sdk";
 const STORE_SECONDARY_KEY: &str = "payment_store";
+const SPLICE_OUT_SECONDARY_KEY: &str = "splice_out";
 
 /// The status of a transaction. This is used to track the state of a transaction
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -463,6 +465,32 @@ pub(crate) fn set_rebalance_enabled(store: &DynStore, enabled: bool) {
 	let bytes = enabled.encode();
 	KVStoreSync::write(store, STORE_PRIMARY_KEY, "", REBALANCE_ENABLED_KEY, bytes)
 		.expect("Failed to write rebalance_enabled");
+}
+
+pub(crate) fn write_splice_out(store: &DynStore, details: &PaymentDetails) {
+	KVStoreSync::write(
+		store,
+		STORE_PRIMARY_KEY,
+		SPLICE_OUT_SECONDARY_KEY,
+		&details.id.0.to_lower_hex_string(),
+		details.encode(),
+	)
+	.expect("Failed to write splice out txid");
+}
+
+pub(crate) fn read_splice_outs(store: &DynStore) -> Vec<PaymentDetails> {
+	let keys = KVStoreSync::list(store, STORE_PRIMARY_KEY, SPLICE_OUT_SECONDARY_KEY)
+		.expect("We do not allow reads to fail");
+	let mut splice_outs = Vec::with_capacity(keys.len());
+	for key in keys {
+		let data_bytes =
+			KVStoreSync::read(store, STORE_PRIMARY_KEY, SPLICE_OUT_SECONDARY_KEY, &key)
+				.expect("We do not allow reads to fail");
+		let data =
+			Readable::read(&mut &data_bytes[..]).expect("Invalid data in splice out storage");
+		splice_outs.push(data);
+	}
+	splice_outs
 }
 
 #[cfg(test)]
