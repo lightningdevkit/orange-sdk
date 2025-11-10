@@ -1,0 +1,6 @@
+framework module OrangeSDKFFI {
+  umbrella header "OrangeSDKFFI-umbrella.h"
+
+  export *
+  module * { export * }
+}
