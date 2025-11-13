@@ -2,6 +2,7 @@
 name = "graduated-rebalancer"
 version = "0.1.0"
 edition = "2021"
+authors = ["benthecarman <benthecarman@live.com>"]
 description = "A library for managing graduated rebalancing between trusted and lightning wallets"
 license = "MIT OR Apache-2.0"
 
