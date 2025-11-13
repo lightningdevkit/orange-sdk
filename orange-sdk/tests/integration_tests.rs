@@ -982,8 +982,11 @@ async fn test_pay_onchain_from_channel() {
 		let bal = wallet.get_balance().await.unwrap();
 		// fixme change to exact match once we have the real feee
 		assert!(
-			bal.available_balance() <
-			starting_bal.available_balance().saturating_sub(send_amount).saturating_sub(payment.fee.unwrap())
+			bal.available_balance()
+				< starting_bal
+					.available_balance()
+					.saturating_sub(send_amount)
+					.saturating_sub(payment.fee.unwrap())
 		);
 
 		// Wait for third party node to receive it
