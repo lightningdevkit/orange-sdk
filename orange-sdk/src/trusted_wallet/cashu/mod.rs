@@ -684,7 +684,7 @@ impl Cashu {
 				.add_event(Event::PaymentReceived {
 					payment_id: PaymentId::Trusted(payment_id),
 					payment_hash: PaymentHash(hash.to_byte_array()),
-					amount_msat: u64::from(mint_quote.amount.unwrap_or_default()) * 1_000, // convert to msats
+					amount_msat: u64::from(mint_quote.amount.unwrap_or_default()) * 1_000, /* convert to msats */
 					custom_records: vec![],
 					lsp_fee_msats: None,
 				})

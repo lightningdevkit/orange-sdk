@@ -1,17 +1,5 @@
-﻿#![deny(missing_docs)]
-
-//! A library implementing the full backend for a modern, highly usable, Bitcoin wallet focusing on
-//! maximizing security and self-custody without trading off user experience.
-//!
-//! This crate should do everything you need to build a great Bitcoin wallet, except the UI.
-//!
-//! In order to maximize the user experience, small balances are held in a trusted service (XXX
-//! which one), avoiding expensive setup fees, while larger balances are moved into on-chain
-//! lightning channels, ensuring trust is minimized in the trusted service.
-//!
-//! Despite funds being stored in multiple places, the full balance can be treated as a single
-//! wallet - payments can draw on both balances simultaneously and deposits are automatically
-//! shifted to minimize fees and ensure maximal security.
+#![deny(missing_docs)]
+#![doc = include_str!("../../README.md")]
 
 use bitcoin_payment_instructions as instructions;
 use bitcoin_payment_instructions::{PaymentInstructions, http_resolver::HTTPHrnResolver};
@@ -132,9 +120,18 @@ struct WalletImpl {
 	runtime: Arc<Runtime>,
 }
 
-// todo better doc, include examples, etc
-/// The primary entry point for orange-sdk. This is the main wallet struct that
-/// contains the trusted wallet and the lightning wallet.
+/// The primary entry point for orange-sdk providing a graduated custody Bitcoin wallet.
+///
+/// This struct combines a trusted wallet backend (e.g., Spark, Cashu) with self-custodial
+/// Lightning channels, automatically managing fund distribution based on configurable thresholds.
+///
+/// See the [crate-level documentation](crate) for a comprehensive overview, payment flow diagram,
+/// and usage examples.
+///
+/// # Thread Safety
+///
+/// `Wallet` is `Clone` and all operations are thread-safe. Cloning is cheap as it only
+/// increments reference counts.
 #[derive(Clone)]
 pub struct Wallet {
 	/// The internal wallet implementation.
@@ -1020,7 +1017,6 @@ impl Wallet {
 	/// code, or read from a link which the user opened with this application.
 	///
 	/// See [`PaymentInstructions`] for the list of supported formats.
-	///
 	// Note that a user might also be pasting or scanning a QR code containing a lightning BOLT 12
 	// refund, which allow us to *receive* funds, and must be parsed with
 	// [`Self::parse_claim_instructions`].
@@ -1030,13 +1026,13 @@ impl Wallet {
 		PaymentInstructions::parse(instructions, self.inner.network, &HTTPHrnResolver, true).await
 	}
 
-	/*/// Verifies instructions which allow us to claim funds given as:
-	///  * A lightning BOLT 12 refund
-	///  * An on-chain private key, which we will sweep
+	// /// Verifies instructions which allow us to claim funds given as:
+	//  * A lightning BOLT 12 refund
+	//  * An on-chain private key, which we will sweep
 	// TODO: consider LNURL claim thing
-	pub fn parse_claim_instructions(&self, instructions: &str) -> Result<..., ...> {
-
-	}*/
+	// pub fn parse_claim_instructions(&self, instructions: &str) -> Result<..., ...> {
+	//
+	// }
 
 	/// Estimates the fees required to pay a [`PaymentInstructions`]
 	pub async fn estimate_fee(&self, _payment_info: &PaymentInstructions) -> Amount {
@@ -1225,7 +1221,7 @@ impl Wallet {
 			}
 		}
 
-		//TODO: Try to MPP the payment using both trusted and LN funds
+		// TODO: Try to MPP the payment using both trusted and LN funds
 
 		// Finally, try trusted on-chain first,
 		for method in methods.clone() {

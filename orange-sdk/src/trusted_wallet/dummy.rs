@@ -390,7 +390,7 @@ impl TrustedWalletInterface for DummyTrustedWallet {
 							debug_assert!(hash.0 == payment_hash, "Payment Hash mismatch");
 							counterparty_skimmed_fee_msat
 						},
-						_ => return None, // Ignore other payment kinds, we only care about the one we just sent.
+						_ => return None, /* Ignore other payment kinds, we only care about the one we just sent. */
 					};
 					match payment.status {
 						PaymentStatus::Succeeded => {
