@@ -189,7 +189,8 @@ pub enum RebalancerEvent {
 /// Trait for handling rebalancer events
 pub trait EventHandler: Send + Sync {
 	/// Handle a rebalancer event
-	fn handle_event(&self, event: RebalancerEvent);
+	fn handle_event(&self, event: RebalancerEvent)
+		-> Pin<Box<dyn Future<Output = ()> + Send + '_>>;
 }
 
 /// A no-op event handler that discards all events
@@ -197,7 +198,10 @@ pub trait EventHandler: Send + Sync {
 pub struct IgnoringEventHandler;
 
 impl EventHandler for IgnoringEventHandler {
-	fn handle_event(&self, _event: RebalancerEvent) {
+	fn handle_event(
+		&self, _event: RebalancerEvent,
+	) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
+		Box::pin(async move {})
 		// Do nothing
 	}
 }
@@ -273,11 +277,13 @@ where
 						rebalance_id.as_hex()
 					);
 
-					self.event_handler.handle_event(RebalancerEvent::RebalanceInitiated {
-						trigger_id: params.id,
-						trusted_rebalance_payment_id: rebalance_id,
-						amount_msat: transfer_amt.milli_sats(),
-					});
+					self.event_handler
+						.handle_event(RebalancerEvent::RebalanceInitiated {
+							trigger_id: params.id,
+							trusted_rebalance_payment_id: rebalance_id,
+							amount_msat: transfer_amt.milli_sats(),
+						})
+						.await;
 
 					let ln_payment = match self
 						.ln_wallet
@@ -310,14 +316,16 @@ where
 						ln_payment.id.as_hex(),
 					);
 
-					self.event_handler.handle_event(RebalancerEvent::RebalanceSuccessful {
-						trigger_id: params.id,
-						trusted_rebalance_payment_id: rebalance_id,
-						ln_rebalance_payment_id: ln_payment.id,
-						amount_msat: transfer_amt.milli_sats(),
-						fee_msat: ln_payment.fee_paid_msat.unwrap_or_default()
-							+ trusted_payment.fee_paid_msat.unwrap_or_default(),
-					});
+					self.event_handler
+						.handle_event(RebalancerEvent::RebalanceSuccessful {
+							trigger_id: params.id,
+							trusted_rebalance_payment_id: rebalance_id,
+							ln_rebalance_payment_id: ln_payment.id,
+							amount_msat: transfer_amt.milli_sats(),
+							fee_msat: ln_payment.fee_paid_msat.unwrap_or_default()
+								+ trusted_payment.fee_paid_msat.unwrap_or_default(),
+						})
+						.await;
 				},
 				Err(e) => {
 					log_info!(self.logger, "Rebalance trusted transaction failed with {e:?}",);
@@ -368,11 +376,13 @@ where
 			(channel_outpoint, user_chan_id)
 		};
 
-		self.event_handler.handle_event(RebalancerEvent::OnChainRebalanceInitiated {
-			trigger_id: params.id,
-			user_channel_id,
-			channel_outpoint,
-		});
+		self.event_handler
+			.handle_event(RebalancerEvent::OnChainRebalanceInitiated {
+				trigger_id: params.id,
+				user_channel_id,
+				channel_outpoint,
+			})
+			.await;
 	}
 
 	/// Stops the rebalancer, waits for any active rebalances to complete

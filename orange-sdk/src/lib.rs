@@ -1305,7 +1305,7 @@ impl Wallet {
 	/// **Caution:** Users must handle events as quickly as possible to prevent a large event backlog,
 	/// which can increase the memory footprint of [`Wallet`].
 	pub fn next_event(&self) -> Option<Event> {
-		self.inner.event_queue.next_event()
+		self.inner.runtime.block_on(self.inner.event_queue.next_event())
 	}
 
 	/// Returns the next event in the event queue.
@@ -1339,7 +1339,7 @@ impl Wallet {
 	///
 	/// **Note:** This **MUST** be called after each event has been handled.
 	pub fn event_handled(&self) -> Result<(), ()> {
-		self.inner.event_queue.event_handled().map_err(|e| {
+		self.inner.runtime.block_on(self.inner.event_queue.event_handled()).map_err(|e| {
 			log_error!(
 				self.inner.logger,
 				"Couldn't mark event handled due to persistence failure: {e}"

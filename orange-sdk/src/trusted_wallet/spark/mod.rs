@@ -341,12 +341,12 @@ impl EventListener for SparkEventHandler {
 				log_info!(self.logger, "Spark wallet claimed deposits! {claimed_deposits:?}");
 			},
 			SdkEvent::PaymentSucceeded { payment } => {
-				if let Err(e) = self.handle_payment_succeeded(payment) {
+				if let Err(e) = self.handle_payment_succeeded(payment).await {
 					log_error!(self.logger, "Failed to handle payment succeeded: {e:?}");
 				}
 			},
 			SdkEvent::PaymentFailed { payment } => {
-				if let Err(e) = self.handle_payment_failed(payment) {
+				if let Err(e) = self.handle_payment_failed(payment).await {
 					log_error!(self.logger, "Failed to handle payment succeeded: {e:?}");
 				}
 			},
@@ -361,7 +361,7 @@ impl EventListener for SparkEventHandler {
 }
 
 impl SparkEventHandler {
-	fn handle_payment_succeeded(
+	async fn handle_payment_succeeded(
 		&self, payment: breez_sdk_spark::Payment,
 	) -> Result<(), TrustedError> {
 		log_info!(self.logger, "Spark payment succeeded: {payment:?}");
@@ -409,12 +409,14 @@ impl SparkEventHandler {
 							);
 						}
 
-						self.event_queue.add_event(Event::PaymentSuccessful {
-							payment_id,
-							payment_hash: PaymentHash(payment_hash),
-							payment_preimage: PaymentPreimage(preimage),
-							fee_paid_msat: Some((payment.fees * 1_000) as u64), // convert to msats
-						})?;
+						self.event_queue
+							.add_event(Event::PaymentSuccessful {
+								payment_id,
+								payment_hash: PaymentHash(payment_hash),
+								payment_preimage: PaymentPreimage(preimage),
+								fee_paid_msat: Some((payment.fees * 1_000) as u64), // convert to msats
+							})
+							.await?;
 
 						self.payment_success_sender.send(()).unwrap();
 					},
@@ -437,13 +439,15 @@ impl SparkEventHandler {
 							Some((payment.fees * 1_000) as u64) // convert to msats
 						};
 
-						self.event_queue.add_event(Event::PaymentReceived {
-							payment_id: PaymentId::Trusted(id),
-							payment_hash: PaymentHash(payment_hash),
-							amount_msat: (payment.amount * 1_000) as u64, // convert to msats
-							custom_records: vec![],
-							lsp_fee_msats,
-						})?;
+						self.event_queue
+							.add_event(Event::PaymentReceived {
+								payment_id: PaymentId::Trusted(id),
+								payment_hash: PaymentHash(payment_hash),
+								amount_msat: (payment.amount * 1_000) as u64, // convert to msats
+								custom_records: vec![],
+								lsp_fee_msats,
+							})
+							.await?;
 					},
 					_ => {
 						log_debug!(
@@ -458,7 +462,9 @@ impl SparkEventHandler {
 		Ok(())
 	}
 
-	fn handle_payment_failed(&self, payment: breez_sdk_spark::Payment) -> Result<(), TrustedError> {
+	async fn handle_payment_failed(
+		&self, payment: breez_sdk_spark::Payment,
+	) -> Result<(), TrustedError> {
 		log_info!(self.logger, "Spark payment failed: {payment:?}");
 
 		let id = parse_payment_id(&payment.id)?;
@@ -484,11 +490,13 @@ impl SparkEventHandler {
 						TrustedError::Other(format!("Invalid payment_hash hex: {e:?}"))
 					})?;
 
-					self.event_queue.add_event(Event::PaymentFailed {
-						payment_id,
-						payment_hash: Some(PaymentHash(payment_hash)),
-						reason: None,
-					})?;
+					self.event_queue
+						.add_event(Event::PaymentFailed {
+							payment_id,
+							payment_hash: Some(PaymentHash(payment_hash)),
+							reason: None,
+						})
+						.await?;
 				},
 				_ => {
 					log_debug!(self.logger, "Unsupported payment details for Send: {payment:?}")
