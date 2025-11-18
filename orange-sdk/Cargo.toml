@@ -28,7 +28,7 @@ bitcoin-payment-instructions = { workspace = true }
 chrono = { version = "0.4", default-features = false }
 rand = { version = "0.8.5", optional = true }
 reqwest = { version = "0.12.23", default-features = false, features = ["rustls-tls"] }
-breez-sdk-spark = { git = "https://github.com/breez/spark-sdk.git", rev = "1c3dd78a40ae50a88d743110a79fa4a95d93d932", default-features = false, features = ["rustls-tls"], optional = true }
+breez-sdk-spark = { git = "https://github.com/breez/spark-sdk.git", rev = "1f2e9995230cd582d6b4aa7d06d76b99defb635e", default-features = false, features = ["rustls-tls"], optional = true }
 tokio = { version = "1.0", default-features = false, features = ["rt-multi-thread", "sync"] }
 uuid = { version = "1.0", default-features = false, optional = true }
 cdk = { git = "https://github.com/benthecarman/cdk.git", rev = "39c1206a4a1dda2adc1f3e23628136ef645f6c6b", default-features = false, features = ["wallet"], optional = true }

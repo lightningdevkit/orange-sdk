@@ -70,9 +70,13 @@ impl SparkWalletConfig {
 			network,
 			sync_interval_secs: self.sync_interval_secs,
 			prefer_spark_over_lightning: self.prefer_spark_over_lightning,
+			external_input_parsers: None,
+			use_default_external_input_parsers: false,
+			real_time_sync_server_url: None,
 			api_key: Some(BREEZ_API_KEY.to_string()),
 			max_deposit_claim_fee: None,
 			lnurl_domain: None,
+			private_enabled_default: true,
 		})
 	}
 }
@@ -91,7 +95,7 @@ impl TrustedWalletInterface for Spark {
 		&self,
 	) -> Pin<Box<dyn Future<Output = Result<Amount, TrustedError>> + Send + '_>> {
 		Box::pin(async move {
-			let info = self.spark_wallet.get_info(GetInfoRequest {}).await?;
+			let info = self.spark_wallet.get_info(GetInfoRequest { ensure_synced: None }).await?;
 			Amount::from_sats(info.balance_sats).map_err(|_| TrustedError::AmountError)
 		})
 	}
@@ -138,10 +142,7 @@ impl TrustedWalletInterface for Spark {
 		&self,
 	) -> Pin<Box<dyn Future<Output = Result<Vec<Payment>, TrustedError>> + Send + '_>> {
 		Box::pin(async move {
-			let resp = self
-				.spark_wallet
-				.list_payments(ListPaymentsRequest { limit: None, offset: None })
-				.await?;
+			let resp = self.spark_wallet.list_payments(ListPaymentsRequest::default()).await?;
 
 			let payments =
 				resp.payments.into_iter().map(|p| p.try_into()).collect::<Result<_, _>>()?;
@@ -163,7 +164,8 @@ impl TrustedWalletInterface for Spark {
 
 				let params = PrepareSendPaymentRequest {
 					payment_request: invoice.to_string(),
-					amount_sats: Some(sats),
+					amount: Some(sats.into()),
+					token_identifier: None,
 				};
 				let prepare = self.spark_wallet.prepare_send_payment(params).await?;
 				match prepare.payment_method {
@@ -194,7 +196,8 @@ impl TrustedWalletInterface for Spark {
 
 				let params = PrepareSendPaymentRequest {
 					payment_request: invoice.to_string(),
-					amount_sats: Some(sats),
+					amount: Some(sats.into()),
+					token_identifier: None,
 				};
 				let prepare = self.spark_wallet.prepare_send_payment(params).await?;
 
@@ -218,11 +221,8 @@ impl TrustedWalletInterface for Spark {
 	) -> Pin<Box<dyn Future<Output = Option<ReceivedLightningPayment>> + Send + '_>> {
 		Box::pin(async move {
 			loop {
-				let res = self
-					.spark_wallet
-					.list_payments(ListPaymentsRequest { offset: None, limit: None })
-					.await
-					.ok()?;
+				let res =
+					self.spark_wallet.list_payments(ListPaymentsRequest::default()).await.ok()?;
 
 				let tx = res.payments.into_iter().find(|p| {
 					if let Some(PaymentDetails::Lightning { payment_hash: ph, .. }) = &p.details {
@@ -236,7 +236,7 @@ impl TrustedWalletInterface for Spark {
 				if tx.status == PaymentStatus::Completed {
 					return Some(ReceivedLightningPayment {
 						id: payment_hash,
-						fee_paid_msat: Some(tx.fees * 1_000),
+						fee_paid_msat: Some((tx.fees * 1_000) as u64),
 					});
 				}
 
@@ -270,8 +270,8 @@ impl Spark {
 			},
 		};
 
-		let spark_store = spark_store::SparkStore(store);
-		let builder = SdkBuilder::new(spark_config, seed, Arc::new(spark_store));
+		let spark_store = Arc::new(spark_store::SparkStore(store));
+		let builder = SdkBuilder::new(spark_config, seed).with_storage(spark_store);
 
 		let spark_wallet = Arc::new(builder.build().await.map_err(|e| {
 			log_error!(logger, "Failed to initialize Spark wallet: {e:?}");
@@ -290,13 +290,13 @@ impl Spark {
 			logger: Arc::clone(&logger),
 		};
 
-		let listener_id = spark_wallet.add_event_listener(Box::new(listener));
-		log_info!(logger, "Added Spark event listener with ID: {}", listener_id);
+		let listener_id = spark_wallet.add_event_listener(Box::new(listener)).await;
+		log_info!(logger, "Added Spark event listener with ID: {listener_id}");
 		let w = Arc::clone(&spark_wallet);
 		let mut shutdown_recv = shutdown_receiver.clone();
 		runtime.spawn(async move {
 			let _ = shutdown_recv.changed().await;
-			w.remove_event_listener(&listener_id);
+			w.remove_event_listener(&listener_id).await;
 		});
 
 		log_info!(logger, "Spark wallet initialized");
@@ -318,19 +318,26 @@ struct SparkEventHandler {
 	logger: Arc<Logger>,
 }
 
+#[async_trait::async_trait]
 impl EventListener for SparkEventHandler {
-	fn on_event(&self, event: SdkEvent) {
+	async fn on_event(&self, event: SdkEvent) {
 		match event {
 			SdkEvent::Synced => {
 				log_debug!(self.logger, "Spark wallet synced");
 			},
-			SdkEvent::ClaimDepositsFailed { unclaimed_deposits } => {
+			SdkEvent::DataSynced { did_pull_new_records } => {
+				log_debug!(
+					self.logger,
+					"Spark wallet data synced, did_pull_new_records: {did_pull_new_records}"
+				);
+			},
+			SdkEvent::UnclaimedDeposits { unclaimed_deposits } => {
 				log_warn!(
 					self.logger,
 					"Spark wallet failed to claim deposits! {unclaimed_deposits:?}"
 				);
 			},
-			SdkEvent::ClaimDepositsSucceeded { claimed_deposits } => {
+			SdkEvent::ClaimedDeposits { claimed_deposits } => {
 				log_info!(self.logger, "Spark wallet claimed deposits! {claimed_deposits:?}");
 			},
 			SdkEvent::PaymentSucceeded { payment } => {
@@ -342,6 +349,12 @@ impl EventListener for SparkEventHandler {
 				if let Err(e) = self.handle_payment_failed(payment) {
 					log_error!(self.logger, "Failed to handle payment succeeded: {e:?}");
 				}
+			},
+			SdkEvent::PaymentPending { payment } => {
+				log_debug!(
+					self.logger,
+					"Spark payment pending event received for payment: {payment:?}"
+				);
 			},
 		}
 	}
@@ -400,7 +413,7 @@ impl SparkEventHandler {
 							payment_id,
 							payment_hash: PaymentHash(payment_hash),
 							payment_preimage: PaymentPreimage(preimage),
-							fee_paid_msat: Some(payment.fees * 1_000), // convert to msats
+							fee_paid_msat: Some((payment.fees * 1_000) as u64), // convert to msats
 						})?;
 
 						self.payment_success_sender.send(()).unwrap();
@@ -421,13 +434,13 @@ impl SparkEventHandler {
 						let lsp_fee_msats = if payment.fees == 0 {
 							None
 						} else {
-							Some(payment.fees * 1_000) // convert to msats
+							Some((payment.fees * 1_000) as u64) // convert to msats
 						};
 
 						self.event_queue.add_event(Event::PaymentReceived {
 							payment_id: PaymentId::Trusted(id),
 							payment_hash: PaymentHash(payment_hash),
-							amount_msat: payment.amount * 1_000, // convert to msats
+							amount_msat: (payment.amount * 1_000) as u64, // convert to msats
 							custom_records: vec![],
 							lsp_fee_msats,
 						})?;
@@ -537,8 +550,9 @@ impl TryFrom<breez_sdk_spark::Payment> for Payment {
 
 		Ok(Payment {
 			id,
-			amount: Amount::from_sats(value.amount).map_err(|_| TrustedError::AmountError)?,
-			fee: Amount::from_sats(value.fees).map_err(|_| TrustedError::AmountError)?,
+			amount: Amount::from_sats(value.amount as u64)
+				.map_err(|_| TrustedError::AmountError)?,
+			fee: Amount::from_sats(value.fees as u64).map_err(|_| TrustedError::AmountError)?,
 			status: value.status.into(),
 			outbound: value.payment_type == PaymentType::Send,
 			time_since_epoch: Duration::from_secs(value.timestamp),

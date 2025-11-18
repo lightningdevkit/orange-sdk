@@ -4,7 +4,11 @@ use std::sync::Arc;
 
 use crate::{KVStore, io};
 
-use breez_sdk_spark::{DepositInfo, PaymentMetadata, StorageError, UpdateDepositPayload};
+use breez_sdk_spark::{
+	DepositInfo, ListPaymentsRequest, Payment, PaymentDetails, PaymentMetadata, StorageError,
+	UpdateDepositPayload,
+};
+use ldk_node::lightning::util::persist::KVSTORE_NAMESPACE_KEY_MAX_LEN;
 
 const SPARK_PRIMARY_NAMESPACE: &str = "spark";
 const SPARK_CACHE_NAMESPACE: &str = "cache";
@@ -14,9 +18,19 @@ const SPARK_DEPOSITS_NAMESPACE: &str = "deposit";
 #[derive(Clone)]
 pub(crate) struct SparkStore(pub(crate) Arc<dyn KVStore + Send + Sync>);
 
+/// The Spark sdk can produce keys that are too long, we just truncate them here
+fn sanitize_key(key: String) -> String {
+	if key.len() > KVSTORE_NAMESPACE_KEY_MAX_LEN {
+		key[..KVSTORE_NAMESPACE_KEY_MAX_LEN].to_string()
+	} else {
+		key
+	}
+}
+
 #[async_trait::async_trait]
 impl breez_sdk_spark::Storage for SparkStore {
 	async fn delete_cached_item(&self, key: String) -> Result<(), StorageError> {
+		let key = sanitize_key(key);
 		self.0
 			.remove(SPARK_PRIMARY_NAMESPACE, SPARK_CACHE_NAMESPACE, &key, false)
 			.map_err(|e| StorageError::Implementation(format!("{e:?}")))?;
@@ -24,6 +38,7 @@ impl breez_sdk_spark::Storage for SparkStore {
 	}
 
 	async fn get_cached_item(&self, key: String) -> Result<Option<String>, StorageError> {
+		let key = sanitize_key(key);
 		match self.0.read(SPARK_PRIMARY_NAMESPACE, SPARK_CACHE_NAMESPACE, &key) {
 			Ok(bytes) => Ok(Some(String::from_utf8(bytes).map_err(|e| {
 				StorageError::Serialization(format!("Invalid UTF-8 in cached item: {e:?}"))
@@ -39,6 +54,7 @@ impl breez_sdk_spark::Storage for SparkStore {
 	}
 
 	async fn set_cached_item(&self, key: String, value: String) -> Result<(), StorageError> {
+		let key = sanitize_key(key);
 		self.0
 			.write(SPARK_PRIMARY_NAMESPACE, SPARK_CACHE_NAMESPACE, &key, value.as_bytes())
 			.map_err(|e| StorageError::Implementation(format!("{e:?}")))?;
@@ -46,7 +62,7 @@ impl breez_sdk_spark::Storage for SparkStore {
 	}
 
 	async fn list_payments(
-		&self, offset: Option<u32>, limit: Option<u32>,
+		&self, request: ListPaymentsRequest,
 	) -> Result<Vec<breez_sdk_spark::Payment>, StorageError> {
 		let keys = self
 			.0
@@ -64,12 +80,17 @@ impl breez_sdk_spark::Storage for SparkStore {
 				.map_err(|e| StorageError::Serialization(format!("{e:?}")))?;
 			payments.push(payment);
 		}
-		// sort
-		payments.sort_by_key(|p| p.timestamp);
+
+		let sort_ascending = request.sort_ascending.unwrap_or(false);
+		if sort_ascending {
+			payments.sort_by_key(|p| p.timestamp);
+		} else {
+			payments.sort_by_key(|p| std::cmp::Reverse(p.timestamp));
+		}
 
 		// apply offset and limit
-		let start = offset.unwrap_or(0) as usize;
-		let end = if let Some(l) = limit {
+		let start = request.offset.unwrap_or(0) as usize;
+		let end = if let Some(l) = request.limit {
 			(start + l as usize).min(payments.len())
 		} else {
 			payments.len()
@@ -108,6 +129,35 @@ impl breez_sdk_spark::Storage for SparkStore {
 		let payment: breez_sdk_spark::Payment = serde_json::from_slice(&data)
 			.map_err(|e| StorageError::Serialization(format!("{e:?}")))?;
 		Ok(payment)
+	}
+
+	async fn get_payment_by_invoice(
+		&self, invoice: String,
+	) -> Result<Option<Payment>, StorageError> {
+		let payments = self.list_payments(ListPaymentsRequest::default()).await?;
+
+		let p = payments.into_iter().find(|p| {
+			if let Some(details) = p.details.as_ref() {
+				match details {
+					PaymentDetails::Spark { invoice_details } => {
+						if invoice_details.as_ref().is_some_and(|i| i.invoice == invoice) {
+							return true;
+						}
+					},
+					PaymentDetails::Token { .. } => {},
+					PaymentDetails::Lightning { invoice: inv, .. } => {
+						if *inv == invoice {
+							return true;
+						}
+					},
+					PaymentDetails::Withdraw { .. } => {},
+					PaymentDetails::Deposit { .. } => {},
+				}
+			}
+			false
+		});
+
+		Ok(p)
 	}
 
 	async fn add_deposit(
