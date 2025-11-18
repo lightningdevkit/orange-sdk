@@ -64,7 +64,7 @@ orange-sdk = "0.1"
 
 ### Basic Example
 
-```rust
+```rust,no_run
 use orange_sdk::bitcoin::Network;
 use orange_sdk::bitcoin_payment_instructions::amount::Amount;
 use orange_sdk::trusted_wallet::spark::SparkWalletConfig;
@@ -73,7 +73,7 @@ use orange_sdk::{ExtraConfig, LoggerType, Mnemonic, Seed};
 use std::str::FromStr;
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+async fn main() {
     // Configure the wallet
     let config = WalletConfig {
         storage_config: StorageConfig::LocalSQLite("./wallet".to_string()),
@@ -81,47 +81,47 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         chain_source: ChainSource::Electrum(
             "ssl://electrum.blockstream.info:60002".to_string(),
         ),
-        lsp: ("127.0.0.1:9735".parse()?, "03abcd...".parse()?, None),
+        lsp: ("127.0.0.1:9735".parse().unwrap(), "03abcd...".parse().unwrap(), None),
         scorer_url: None,
         rgs_url: None,
         network: Network::Bitcoin,
         seed: Seed::Mnemonic {
-            mnemonic: Mnemonic::from_str("your mnemonic words here")?,
+            mnemonic: Mnemonic::from_str("your mnemonic words here").unwrap(),
             passphrase: None,
         },
         tunables: Tunables {
-            trusted_balance_limit: Amount::from_sats(100_000)?,
-            rebalance_min: Amount::from_sats(5_000)?,
-            onchain_receive_threshold: Amount::from_sats(10_000)?,
+            trusted_balance_limit: Amount::from_sats(100_000).unwrap(),
+            rebalance_min: Amount::from_sats(5_000).unwrap(),
+            onchain_receive_threshold: Amount::from_sats(10_000).unwrap(),
             enable_amountless_receive_on_chain: true,
         },
         extra_config: ExtraConfig::Spark(SparkWalletConfig::default()),
     };
 
     // Initialize the wallet
-    let wallet = Wallet::new(config).await?;
+    let wallet = Wallet::new(config).await.unwrap();
 
     // Check balance
-    let balance = wallet.get_balance().await?;
-    println!("Available: {}", balance.available_balance());
-    println!("Trusted: {}", balance.trusted);
-    println!("Lightning: {}", balance.lightning);
-    println!("Pending: {}", balance.pending_balance);
+    let balance = wallet.get_balance().await.unwrap();
+    println!("Available: {:?}", balance.available_balance());
+    println!("Trusted: {:?}", balance.trusted);
+    println!("Lightning: {:?}", balance.lightning);
+    println!("Pending: {:?}", balance.pending_balance);
 
     // Generate a receive URI
-    let uri = wallet.get_single_use_receive_uri(Some(Amount::from_sats(50_000)?)).await?;
+    let uri = wallet.get_single_use_receive_uri(Some(Amount::from_sats(50_000).unwrap())).await.unwrap();
     println!("Pay me: {}", uri);
 
     // Parse and pay an invoice
-    let instructions = wallet.parse_payment_instructions("lnbc...").await?;
-    let payment_info = orange_sdk::PaymentInfo::build(instructions, Some(Amount::from_sats(1_000)?))?;
-    wallet.pay(&payment_info).await?;
+    let instructions = wallet.parse_payment_instructions("lnbc...").await.unwrap();
+    let payment_info = orange_sdk::PaymentInfo::build(instructions, Some(Amount::from_sats(1_000).unwrap())).unwrap();
+    wallet.pay(&payment_info).await.unwrap();
 
     // Listen for events
     loop {
         let event = wallet.next_event_async().await;
         println!("Event: {:?}", event);
-        wallet.event_handled()?;
+        wallet.event_handled().unwrap();
     }
 }
 ```
@@ -160,4 +160,4 @@ Contributions are welcome! Please feel free to submit a Pull Request.
 
 ## License
 
-*(Specify the license for the project)*
+See [LICENSE](LICENSE.md) for details.
