@@ -18,10 +18,10 @@ use ldk_node::{Event, Node};
 use rand::RngCore;
 use std::env::temp_dir;
 use std::pin::Pin;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, RwLock};
 use std::time::Duration;
-use tokio::sync::watch;
+use tokio::sync::{RwLock, watch};
 use uuid::Uuid;
 
 /// A dummy implementation of `TrustedWalletInterface` for testing purposes.
@@ -99,7 +99,7 @@ impl DummyTrustedWallet {
 						// convert id
 						let id = mangle_payment_id(payment_id.unwrap().0);
 
-						let mut payments = pays.write().unwrap();
+						let mut payments = pays.write().await;
 						let item = payments.iter_mut().find(|p| p.id == id);
 						if let Some(payment) = item {
 							payment.status = TxStatus::Completed;
@@ -129,6 +129,7 @@ impl DummyTrustedWallet {
 									payment_preimage: payment_preimage.unwrap(), // safe
 									fee_paid_msat,
 								})
+								.await
 								.unwrap();
 						}
 
@@ -138,7 +139,7 @@ impl DummyTrustedWallet {
 						// convert id
 						let id = mangle_payment_id(payment_id.unwrap().0);
 
-						let mut payments = pays.write().unwrap();
+						let mut payments = pays.write().await;
 						let item = payments.iter().cloned().enumerate().find(|(_, p)| p.id == id);
 						if let Some((idx, payment)) = item {
 							// remove from list and refund balance
@@ -160,6 +161,7 @@ impl DummyTrustedWallet {
 									payment_hash,
 									reason,
 								})
+								.await
 								.unwrap();
 						}
 					},
@@ -167,7 +169,7 @@ impl DummyTrustedWallet {
 						// convert id
 						let id = mangle_payment_id(payment_id.unwrap().0);
 
-						let mut payments = pays.write().unwrap();
+						let mut payments = pays.write().await;
 						// We create invoices on the fly without adding the payment to our list
 						// We need to insert it into our payments list
 
@@ -196,6 +198,7 @@ impl DummyTrustedWallet {
 								custom_records: vec![],
 								lsp_fee_msats: None,
 							})
+							.await
 							.unwrap();
 					},
 					Event::PaymentForwarded { .. } => {},
@@ -307,7 +310,7 @@ impl TrustedWalletInterface for DummyTrustedWallet {
 	fn list_payments(
 		&self,
 	) -> Pin<Box<dyn Future<Output = Result<Vec<Payment>, TrustedError>> + Send + '_>> {
-		Box::pin(async move { Ok(self.payments.read().unwrap().clone()) })
+		Box::pin(async move { Ok(self.payments.read().await.clone()) })
 	}
 
 	fn estimate_fee(
@@ -360,7 +363,7 @@ impl TrustedWalletInterface for DummyTrustedWallet {
 				.as_secs();
 
 			// add to payments
-			let mut list = self.payments.write().unwrap();
+			let mut list = self.payments.write().await;
 			list.push(Payment {
 				id,
 				amount,

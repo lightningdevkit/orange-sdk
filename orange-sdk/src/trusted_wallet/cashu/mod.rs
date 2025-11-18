@@ -377,12 +377,14 @@ impl TrustedWalletInterface for Cashu {
 								}
 
 								let fee_paid_sat: u64 = res.fee_paid.into();
-								let _ = event_queue.add_event(Event::PaymentSuccessful {
-									payment_id,
-									payment_hash: hash,
-									payment_preimage,
-									fee_paid_msat: Some(fee_paid_sat * 1_000), // convert to msats
-								});
+								let _ = event_queue
+									.add_event(Event::PaymentSuccessful {
+										payment_id,
+										payment_hash: hash,
+										payment_preimage,
+										fee_paid_msat: Some(fee_paid_sat * 1_000), // convert to msats
+									})
+									.await;
 
 								payment_success_sender.send(()).unwrap();
 							},
@@ -395,11 +397,13 @@ impl TrustedWalletInterface for Cashu {
 								};
 
 								if !is_rebalance {
-									let _ = event_queue.add_event(Event::PaymentFailed {
-										payment_id,
-										payment_hash,
-										reason: None,
-									});
+									let _ = event_queue
+										.add_event(Event::PaymentFailed {
+											payment_id,
+											payment_hash,
+											reason: None,
+										})
+										.await;
 								}
 							},
 							state => {
@@ -420,11 +424,13 @@ impl TrustedWalletInterface for Cashu {
 						};
 
 						if !is_rebalance {
-							let _ = event_queue.add_event(Event::PaymentFailed {
-								payment_id,
-								payment_hash,
-								reason: None,
-							});
+							let _ = event_queue
+								.add_event(Event::PaymentFailed {
+									payment_id,
+									payment_hash,
+									reason: None,
+								})
+								.await;
 						}
 					},
 				}
@@ -688,6 +694,7 @@ impl Cashu {
 					custom_records: vec![],
 					lsp_fee_msats: None,
 				})
+				.await
 				.map_err(|e| TrustedError::Other(format!("Failed to add event: {e}")))?;
 
 			log_info!(logger, "Sent PaymentReceived event for mint quote: {}", mint_quote.id);
