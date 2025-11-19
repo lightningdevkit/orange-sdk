@@ -142,6 +142,7 @@ fn create_lsp(uuid: Uuid, bitcoind: &Bitcoind) -> Arc<Node> {
 		min_channel_lifetime: 10_000,
 		min_channel_opening_fee_msat: 0,
 		max_client_to_self_delay: 1024,
+		client_trusts_lsp: true,
 	};
 	builder.set_liquidity_provider_lsps2(lsps2_service_config);
 
