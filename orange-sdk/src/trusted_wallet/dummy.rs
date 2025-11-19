@@ -338,7 +338,7 @@ impl TrustedWalletInterface for DummyTrustedWallet {
 					let id = self
 						.ldk_node
 						.bolt12_payment()
-						.send_using_amount(&offer, amount.milli_sats(), None, None)
+						.send_using_amount(&offer, amount.milli_sats(), None, None, None)
 						.unwrap()
 						.0;
 

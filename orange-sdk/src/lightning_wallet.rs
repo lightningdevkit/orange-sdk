@@ -302,7 +302,7 @@ impl LightningWallet {
 				.inner
 				.ldk_node
 				.bolt12_payment()
-				.send_using_amount(offer, amount.milli_sats(), None, None),
+				.send_using_amount(offer, amount.milli_sats(), None, None, None),
 			PaymentMethod::OnChain(address) => {
 				let amount_sats = amount.sats().map_err(|_| NodeError::InvalidAmount)?;
 
@@ -332,7 +332,7 @@ impl LightningWallet {
 							self.inner.ldk_node.splice_out(
 								&chan.user_channel_id,
 								chan.counterparty_node_id,
-								address.clone(),
+								address,
 								amount_sats,
 							)?;
 
