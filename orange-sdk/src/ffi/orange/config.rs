@@ -57,7 +57,7 @@ impl TryInto<OrangeSeed> for Seed {
 #[derive(Debug, Clone, uniffi::Enum)]
 pub enum VssAuth {
 	/// Authentication using an LNURL-auth server.
-	LNURLAuthServer(String),
+	LNURLAuthServer(String, HashMap<String, String>),
 	/// Authentication using a fixed set of HTTP headers.
 	FixedHeaders(HashMap<String, String>),
 }
@@ -65,7 +65,7 @@ pub enum VssAuth {
 impl From<VssAuth> for OrangeVssAuth {
 	fn from(auth: VssAuth) -> Self {
 		match auth {
-			VssAuth::LNURLAuthServer(url) => OrangeVssAuth::LNURLAuthServer(url),
+			VssAuth::LNURLAuthServer(url, headers) => OrangeVssAuth::LNURLAuthServer(url, headers),
 			VssAuth::FixedHeaders(headers) => OrangeVssAuth::FixedHeaders(headers),
 		}
 	}
@@ -74,7 +74,7 @@ impl From<VssAuth> for OrangeVssAuth {
 impl From<OrangeVssAuth> for VssAuth {
 	fn from(auth: OrangeVssAuth) -> Self {
 		match auth {
-			OrangeVssAuth::LNURLAuthServer(url) => VssAuth::LNURLAuthServer(url),
+			OrangeVssAuth::LNURLAuthServer(url, headers) => VssAuth::LNURLAuthServer(url, headers),
 			OrangeVssAuth::FixedHeaders(headers) => VssAuth::FixedHeaders(headers),
 		}
 	}

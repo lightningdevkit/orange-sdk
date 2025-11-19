@@ -18,15 +18,19 @@ use crate::trusted_wallet::spark::Spark;
 use crate::trusted_wallet::{DynTrustedWalletInterface, WalletTrusted};
 use graduated_rebalancer::GraduatedRebalancer;
 use ldk_node::bitcoin::Network;
+use ldk_node::bitcoin::bip32::{ChildNumber, Xpriv};
 use ldk_node::bitcoin::hashes::Hash;
 use ldk_node::bitcoin::io;
+use ldk_node::bitcoin::key::Secp256k1;
 use ldk_node::bitcoin::secp256k1::PublicKey;
 use ldk_node::io::sqlite_store::SqliteStore;
+use ldk_node::io::vss_store::VssStore;
 use ldk_node::lightning::ln::msgs::SocketAddress;
 use ldk_node::lightning::util::logger::Logger as _;
 use ldk_node::lightning::{log_debug, log_error, log_info, log_trace, log_warn};
 use ldk_node::lightning_invoice::Bolt11Invoice;
 use ldk_node::payment::{PaymentDirection, PaymentKind};
+use ldk_node::vss_client::headers::{FixedHeaders, LnurlAuthToJwtProvider, VssHeaderProvider};
 use ldk_node::{BuildError, ChannelDetails, DynStore, NodeError};
 
 use std::collections::HashMap;
@@ -155,7 +159,7 @@ pub enum Seed {
 #[derive(Debug, Clone)]
 pub enum VssAuth {
 	/// Authentication using an LNURL-auth server.
-	LNURLAuthServer(String),
+	LNURLAuthServer(String, HashMap<String, String>),
 	/// Authentication using a fixed set of HTTP headers.
 	FixedHeaders(HashMap<String, String>),
 }
@@ -177,7 +181,8 @@ pub struct VssConfig {
 pub enum StorageConfig {
 	/// Local SQLite database configuration.
 	LocalSQLite(String),
-	// todo VSS(VssConfig),
+	/// Versioned Storage Service (VSS) configuration.
+	VSS(VssConfig),
 }
 
 /// Configuration for the blockchain data source.
@@ -518,9 +523,58 @@ impl Wallet {
 			BuildError::RuntimeSetupFailed
 		})?);
 
-		let store: Arc<DynStore> = match &config.storage_config {
+		let store: Arc<DynStore> = match config.storage_config.clone() {
 			StorageConfig::LocalSQLite(path) => {
 				Arc::new(SqliteStore::new(path.into(), Some("orange.sqlite".to_owned()), None)?)
+			},
+			StorageConfig::VSS(vss_cfg) => {
+				let seed_bytes = match &config.seed {
+					Seed::Mnemonic { mnemonic, passphrase } => {
+						mnemonic.to_seed(passphrase.as_deref().unwrap_or(""))
+					},
+					Seed::Seed64(bytes) => *bytes,
+				};
+
+				let xprv = Xpriv::new_master(config.network, &seed_bytes).map_err(|e| {
+					log_error!(logger, "Failed to derive master secret: {}", e);
+					BuildError::InvalidSeedBytes
+				})?;
+
+				let secp = Secp256k1::new();
+
+				let vss_xprv = xprv
+					.derive_priv(&secp, &[ChildNumber::Hardened { index: 877 }]) // todo use const
+					.map_err(|e| {
+						log_error!(logger, "Failed to derive VSS secret: {}", e);
+						BuildError::InvalidSeedBytes
+					})?;
+
+				let vss_seed_bytes: [u8; 32] = vss_xprv.private_key.secret_bytes();
+
+				let headers: Arc<dyn VssHeaderProvider> = match vss_cfg.headers {
+					VssAuth::FixedHeaders(h) => Arc::new(FixedHeaders::new(h)),
+					VssAuth::LNURLAuthServer(url, headers) => {
+						let lnurl_auth_xprv = vss_xprv
+							.derive_priv(&secp, &[ChildNumber::Hardened { index: 138 }]) // todo use const
+							.map_err(|e| {
+								log_error!(logger, "Failed to derive VSS secret: {}", e);
+								BuildError::KVStoreSetupFailed
+							})?;
+
+						let lnurl_auth_jwt_provider = LnurlAuthToJwtProvider::new(
+							lnurl_auth_xprv,
+							url,
+							headers,
+						)
+						.map_err(|e| {
+							log_error!(logger, "Failed to create LnurlAuthToJwtProvider: {e}");
+							BuildError::KVStoreSetupFailed
+						})?;
+
+						Arc::new(lnurl_auth_jwt_provider)
+					},
+				};
+				Arc::new(VssStore::new(vss_cfg.vss_url, vss_cfg.store_id, vss_seed_bytes, headers)?)
 			},
 		};
 
