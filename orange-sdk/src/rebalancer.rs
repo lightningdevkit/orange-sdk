@@ -354,9 +354,6 @@ impl graduated_rebalancer::EventHandler for OrangeRebalanceEventHandler {
 				} => {
 					let chan_txid = channel_outpoint.txid;
 					let triggering_txid = Txid::from_byte_array(trigger_id);
-					println!(
-						"Marking {chan_txid} as onchain rebalance initiated for triggering txid {triggering_txid}"
-					);
 					let trigger_id = PaymentId::SelfCustodial(triggering_txid.to_byte_array());
 					self.tx_metadata
 						.set_tx_caused_rebalance(&trigger_id)
