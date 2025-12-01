@@ -581,7 +581,6 @@ impl graduated_rebalancer::LightningWallet for LightningWallet {
 					.find(|c| c.user_channel_id.0 == channel_id && c.funding_txo.is_some());
 				match chan {
 					Some(c) => {
-						println!("\nRETURNING HERE\n");
 						return c.funding_txo.expect("channel has no funding txo");
 					},
 					None => {

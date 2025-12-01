@@ -482,7 +482,6 @@ impl LdkEventHandler {
 				}
 			},
 			ldk_node::Event::SpliceFailed { .. } => {
-				println!("===========splice failed============");
 				log_warn!(self.logger, "Received SpliceFailed event: {event:?}");
 			},
 		}
