@@ -1,6 +1,6 @@
 #![cfg(feature = "_test-utils")]
 
-use crate::test_utils::{generate_blocks, open_channel_from_lsp, wait_next_event};
+use crate::test_utils::{generate_blocks, open_channel_from_lsp, wait_for_tx, wait_next_event};
 use bitcoin_payment_instructions::amount::Amount;
 use bitcoin_payment_instructions::http_resolver::HTTPHrnResolver;
 use bitcoin_payment_instructions::{ParseError, PaymentInstructions};
@@ -370,12 +370,14 @@ async fn test_receive_to_ln() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn test_receive_to_onchain() {
+#[test_log::test]
+async fn test_receive_onchain() {
 	test_utils::run_test(|params| async move {
 		let wallet = Arc::clone(&params.wallet);
 		let lsp = Arc::clone(&params.lsp);
 		let bitcoind = Arc::clone(&params.bitcoind);
 		let third_party = Arc::clone(&params.third_party);
+		let electrsd = Arc::clone(&params.electrsd);
 
 		let starting_bal = wallet.get_balance().await.unwrap();
 		assert_eq!(starting_bal.available_balance(), Amount::ZERO);
@@ -389,8 +391,10 @@ async fn test_receive_to_onchain() {
 			.send_to_address(&uri.address.unwrap(), recv_amt.sats().unwrap(), None)
 			.unwrap();
 
+		wait_for_tx(&electrsd.client, sent_txid).await;
+
 		// confirm transaction
-		generate_blocks(&bitcoind, 6);
+		generate_blocks(&bitcoind, &electrsd, 6).await;
 
 		// check we received on-chain, should be pending
 		// wait for payment success
@@ -435,9 +439,9 @@ async fn test_receive_to_onchain() {
 
 		// a rebalance should be initiated, we need to mine the channel opening transaction
 		// for it to be confirmed and reflected in the wallet's history
-		generate_blocks(&bitcoind, 6);
+		generate_blocks(&bitcoind, &electrsd, 6).await;
 		tokio::time::sleep(Duration::from_secs(5)).await; // wait for sync
-		generate_blocks(&bitcoind, 6); // confirm the channel opening transaction
+		generate_blocks(&bitcoind, &electrsd, 6).await; // confirm the channel opening transaction
 		tokio::time::sleep(Duration::from_secs(5)).await; // wait for sync
 
 		//  wait for rebalance to be initiated
@@ -482,13 +486,14 @@ async fn test_receive_to_onchain() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-// #[test_log::test]
+#[test_log::test]
 async fn test_receive_to_onchain_with_channel() {
 	test_utils::run_test(|params| async move {
 		let wallet = Arc::clone(&params.wallet);
 		let lsp = Arc::clone(&params.lsp);
 		let bitcoind = Arc::clone(&params.bitcoind);
 		let third_party = Arc::clone(&params.third_party);
+		let electrsd = Arc::clone(&params.electrsd);
 
 		let start = open_channel_from_lsp(&wallet, Arc::clone(&third_party)).await;
 
@@ -508,10 +513,13 @@ async fn test_receive_to_onchain_with_channel() {
 			.send_to_address(&uri.address.unwrap(), recv_amt.sats().unwrap(), None)
 			.unwrap();
 
-		println!("Sent txid: {}", sent_txid);
+		println!("Sent txid: {sent_txid}");
+
+		wait_for_tx(&electrsd.client, sent_txid).await;
 
 		// confirm transaction
-		generate_blocks(&bitcoind, 6);
+		generate_blocks(&bitcoind, &electrsd, 6).await;
+		wallet.sync_ln_wallet().unwrap();
 
 		// check we received on-chain, should be pending
 		// wait for payment success
@@ -521,6 +529,7 @@ async fn test_receive_to_onchain_with_channel() {
 		})
 		.await;
 
+		println!("waiting for onchain recv event");
 		let event = wait_next_event(&wallet).await;
 		match event {
 			Event::OnchainPaymentReceived { txid, amount_sat, status, .. } => {
@@ -531,6 +540,7 @@ async fn test_receive_to_onchain_with_channel() {
 			ev => panic!("Expected OnchainPaymentReceived event, got {ev:?}"),
 		}
 
+		println!("waiting for splice pending event");
 		let event = wait_next_event(&wallet).await;
 		match event {
 			Event::SplicePending { counterparty_node_id, .. } => {
@@ -540,7 +550,7 @@ async fn test_receive_to_onchain_with_channel() {
 		}
 
 		// confirm splice
-		generate_blocks(&bitcoind, 6);
+		generate_blocks(&bitcoind, &electrsd, 6).await;
 		tokio::time::sleep(Duration::from_secs(5)).await;
 
 		let event = wait_next_event(&wallet).await;
@@ -589,12 +599,13 @@ async fn run_test_pay_lightning_from_self_custody(amountless: bool) {
 		let wallet = Arc::clone(&params.wallet);
 		let bitcoind = Arc::clone(&params.bitcoind);
 		let third_party = Arc::clone(&params.third_party);
+		let electrsd = Arc::clone(&params.electrsd);
 
 		// get a channel so we can make a payment
 		open_channel_from_lsp(&wallet, Arc::clone(&third_party)).await;
 
 		// wait for sync
-		generate_blocks(&bitcoind, 6);
+		generate_blocks(&bitcoind, &electrsd, 6).await;
 		test_utils::wait_for_condition("wallet sync after channel open", || async {
 			wallet.channels().iter().any(|a| a.confirmations.is_some_and(|c| c > 0) && a.is_usable)
 				&& third_party
@@ -692,12 +703,13 @@ async fn run_test_pay_bolt12_from_self_custody(amountless: bool) {
 		let wallet = Arc::clone(&params.wallet);
 		let bitcoind = Arc::clone(&params.bitcoind);
 		let third_party = Arc::clone(&params.third_party);
+		let electrsd = Arc::clone(&params.electrsd);
 
 		// get a channel so we can make a payment
 		open_channel_from_lsp(&wallet, Arc::clone(&third_party)).await;
 
 		// wait for sync
-		generate_blocks(&bitcoind, 6);
+		generate_blocks(&bitcoind, &electrsd, 6).await;
 		test_utils::wait_for_condition("wallet sync after channel open", || async {
 			wallet.channels().iter().any(|a| a.confirmations.is_some_and(|c| c > 0) && a.is_usable)
 				&& third_party
@@ -786,6 +798,7 @@ async fn test_pay_onchain_from_self_custody() {
 		let wallet = Arc::clone(&params.wallet);
 		let bitcoind = Arc::clone(&params.bitcoind);
 		let third_party = Arc::clone(&params.third_party);
+		let electrsd = Arc::clone(&params.electrsd);
 
 		// disable rebalancing so we have on-chain funds
 		wallet.set_rebalance_enabled(false);
@@ -806,7 +819,7 @@ async fn test_pay_onchain_from_self_custody() {
 			.unwrap();
 
 		// confirm tx
-		generate_blocks(&bitcoind, 6);
+		generate_blocks(&bitcoind, &electrsd, 6).await;
 
 		// wait for node to sync and see the balance update
 		test_utils::wait_for_condition("wallet sync after on-chain receive", || async {
@@ -826,7 +839,7 @@ async fn test_pay_onchain_from_self_custody() {
 		tokio::time::sleep(Duration::from_secs(1)).await;
 
 		// confirm the tx
-		generate_blocks(&bitcoind, 6);
+		generate_blocks(&bitcoind, &electrsd, 6).await;
 
 		// sleep for a second to wait for sync
 		tokio::time::sleep(Duration::from_secs(1)).await;
@@ -901,6 +914,7 @@ async fn test_pay_onchain_from_channel() {
 		let wallet = Arc::clone(&params.wallet);
 		let bitcoind = Arc::clone(&params.bitcoind);
 		let third_party = Arc::clone(&params.third_party);
+		let electrsd = Arc::clone(&params.electrsd);
 
 		// get a channel so we can make a payment
 		let recv = open_channel_from_lsp(&wallet, Arc::clone(&third_party)).await;
@@ -913,7 +927,7 @@ async fn test_pay_onchain_from_channel() {
 		assert_eq!(starting_bal.pending_balance, Amount::ZERO);
 
 		// wait for sync
-		generate_blocks(&bitcoind, 6);
+		generate_blocks(&bitcoind, &electrsd, 6).await;
 		test_utils::wait_for_condition("wallet sync after channel open", || async {
 			wallet.channels().iter().any(|a| a.confirmations.is_some_and(|c| c > 0) && a.is_usable)
 		})
@@ -931,7 +945,7 @@ async fn test_pay_onchain_from_channel() {
 		tokio::time::sleep(Duration::from_secs(1)).await;
 
 		// confirm the tx
-		generate_blocks(&bitcoind, 6);
+		generate_blocks(&bitcoind, &electrsd, 6).await;
 
 		// sleep for a second to wait for sync
 		tokio::time::sleep(Duration::from_secs(1)).await;
@@ -1010,6 +1024,7 @@ async fn test_force_close_handling() {
 		let lsp = Arc::clone(&params.lsp);
 		let bitcoind = Arc::clone(&params.bitcoind);
 		let third_party = Arc::clone(&params.third_party);
+		let electrsd = Arc::clone(&params.electrsd);
 
 		let starting_bal = wallet.get_balance().await.unwrap();
 		assert_eq!(starting_bal.available_balance(), Amount::ZERO);
@@ -1022,7 +1037,7 @@ async fn test_force_close_handling() {
 		open_channel_from_lsp(&wallet, Arc::clone(&third_party)).await;
 
 		// mine some blocks to ensure the channel is confirmed
-		generate_blocks(&bitcoind, 6);
+		generate_blocks(&bitcoind, &electrsd, 6).await;
 
 		// get channel details
 		let channel = lsp
@@ -1058,6 +1073,7 @@ async fn test_close_all_channels() {
 		let lsp = Arc::clone(&params.lsp);
 		let bitcoind = Arc::clone(&params.bitcoind);
 		let third_party = Arc::clone(&params.third_party);
+		let electrsd = Arc::clone(&params.electrsd);
 
 		let starting_bal = wallet.get_balance().await.unwrap();
 		assert_eq!(starting_bal.available_balance(), Amount::ZERO);
@@ -1070,7 +1086,7 @@ async fn test_close_all_channels() {
 		open_channel_from_lsp(&wallet, Arc::clone(&third_party)).await;
 
 		// mine some blocks to ensure the channel is confirmed
-		generate_blocks(&bitcoind, 6);
+		generate_blocks(&bitcoind, &electrsd, 6).await;
 
 		// init closing all channels
 		wallet.close_channels().unwrap();
@@ -1489,6 +1505,7 @@ async fn test_payment_network_mismatch() {
 	test_utils::run_test(|params| async move {
 		let wallet = Arc::clone(&params.wallet);
 		let bitcoind = Arc::clone(&params.bitcoind);
+		let electrsd = Arc::clone(&params.electrsd);
 
 		// disable rebalancing so we have on-chain funds
 		wallet.set_rebalance_enabled(false);
@@ -1505,7 +1522,7 @@ async fn test_payment_network_mismatch() {
 			.unwrap();
 
 		// confirm tx
-		generate_blocks(&bitcoind, 6);
+		generate_blocks(&bitcoind, &electrsd, 6).await;
 		test_utils::wait_for_condition("wallet sync after on-chain receive", || async {
 			wallet.get_balance().await.unwrap().pending_balance >= recv_amount
 		})
@@ -1550,13 +1567,14 @@ async fn test_concurrent_payments() {
 	test_utils::run_test(|params| async move {
 		let wallet = Arc::clone(&params.wallet);
 		let bitcoind = Arc::clone(&params.bitcoind);
+		let electrsd = Arc::clone(&params.electrsd);
 		let third_party = Arc::clone(&params.third_party);
 
 		// First, build up sufficient balance for concurrent sending
 		let _channel_amount = open_channel_from_lsp(&wallet, Arc::clone(&third_party)).await;
 
 		// Wait for sync
-		generate_blocks(&bitcoind, 6);
+		generate_blocks(&bitcoind, &electrsd, 6).await;
 		test_utils::wait_for_condition("wallet sync after channel open", || async {
 			wallet.channels().iter().any(|a| a.confirmations.is_some_and(|c| c > 0) && a.is_usable)
 				&& third_party
@@ -2145,13 +2163,14 @@ async fn test_lsp_connectivity_fallback() {
 		let wallet = Arc::clone(&params.wallet);
 		let lsp = Arc::clone(&params.lsp);
 		let bitcoind = Arc::clone(&params.bitcoind);
+		let electrsd = Arc::clone(&params.electrsd);
 		let third_party = Arc::clone(&params.third_party);
 
 		// open a channel with the LSP
 		open_channel_from_lsp(&wallet, Arc::clone(&third_party)).await;
 
 		// confirm channel
-		generate_blocks(&bitcoind, 6);
+		generate_blocks(&bitcoind, &electrsd, 6).await;
 		test_utils::wait_for_condition("wallet sync after channel open", || async {
 			wallet.channels().iter().any(|a| a.confirmations.is_some_and(|c| c > 0) && a.is_usable)
 				&& third_party

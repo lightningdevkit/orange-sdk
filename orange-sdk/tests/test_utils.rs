@@ -9,11 +9,14 @@ use cdk::types::FeeReserve;
 use cdk_ldk_node::{BitcoinRpcConfig, GossipSource};
 use corepc_node::client::bitcoin::Network;
 use corepc_node::{Conf, Node as Bitcoind, get_available_port};
+use electrsd::ElectrsD;
+use electrsd::electrum_client::ElectrumApi;
 use ldk_node::bitcoin::hashes::Hash;
 use ldk_node::lightning::ln::msgs::SocketAddress;
 use ldk_node::liquidity::LSPS2ServiceConfig;
 use ldk_node::payment::PaymentStatus;
 use ldk_node::{Node, bitcoin};
+use orange_sdk::bitcoin::Txid;
 #[cfg(not(feature = "_cashu-tests"))]
 use orange_sdk::trusted_wallet::dummy::DummyTrustedWalletExtraConfig;
 use orange_sdk::{
@@ -61,16 +64,25 @@ pub async fn wait_next_event(wallet: &orange_sdk::Wallet) -> orange_sdk::Event {
 	event
 }
 
-fn create_bitcoind(uuid: Uuid) -> Bitcoind {
+async fn create_bitcoind(uuid: Uuid) -> (Arc<Bitcoind>, Arc<ElectrsD>) {
 	let mut conf = Conf::default();
-	conf.args.push("-txindex");
+	// conf.args.push("-txindex");
+	conf.args.push("-rest");
 	conf.args.push("-rpcworkqueue=200");
+	conf.args.push("-fallbackfee=0.00002");
 	conf.staticdir = Some(temp_dir().join(format!("orange-test-{uuid}/bitcoind")));
 	let bitcoind = Bitcoind::with_conf(corepc_node::downloaded_exe_path().unwrap(), &conf)
 		.unwrap_or_else(|_| panic!("Failed to start bitcoind for test {uuid}"));
 
-	// Wait for bitcoind to be ready before returning
+	// Wait for bitcoind to be ready before electrsd starts
 	wait_for_bitcoind_ready(&bitcoind);
+
+	let mut electrsd_conf = electrsd::Conf::default();
+	electrsd_conf.http_enabled = true;
+	electrsd_conf.network = "regtest";
+	let electrsd =
+		ElectrsD::with_conf(electrsd::downloaded_exe_path().unwrap(), &bitcoind, &electrsd_conf)
+			.unwrap_or_else(|_| panic!("Failed to start electrsd for test {uuid}"));
 
 	// mine 101 blocks to get some spendable funds, split it up into multiple calls
 	// to avoid potentially hitting RPC timeouts on slower CI systems
@@ -79,7 +91,9 @@ fn create_bitcoind(uuid: Uuid) -> Bitcoind {
 		let _block_hashes = bitcoind.client.generate_to_address(1, &address).unwrap();
 	}
 
-	bitcoind
+	wait_for_block(&electrsd.client, 101).await;
+
+	(Arc::new(bitcoind), Arc::new(electrsd))
 }
 
 fn wait_for_bitcoind_ready(bitcoind: &Bitcoind) {
@@ -103,12 +117,18 @@ fn wait_for_bitcoind_ready(bitcoind: &Bitcoind) {
 	}
 }
 
-pub fn generate_blocks(bitcoind: &Bitcoind, num: usize) {
+pub async fn generate_blocks(bitcoind: &Bitcoind, electrs: &ElectrsD, num: usize) {
+	let blockchain_info =
+		bitcoind.client.get_blockchain_info().expect("failed to get blockchain info");
+	let cur_height = blockchain_info.blocks;
+
 	let address = bitcoind.client.new_address().unwrap();
 	let _block_hashes = bitcoind
 		.client
 		.generate_to_address(num, &address)
 		.unwrap_or_else(|_| panic!("failed to generate {num} blocks"));
+
+	wait_for_block(&electrs.client, cur_height as usize + num).await;
 }
 
 fn create_lsp(uuid: Uuid, bitcoind: &Bitcoind) -> Arc<Node> {
@@ -213,10 +233,10 @@ fn create_third_party(uuid: Uuid, bitcoind: &Bitcoind) -> Arc<Node> {
 	ldk_node
 }
 
-fn fund_node(node: &Node, bitcoind: &Bitcoind) {
+async fn fund_node(node: &Node, bitcoind: &Bitcoind, electrsd: &ElectrsD) {
 	let addr = node.onchain_payment().new_address().unwrap();
 	bitcoind.client.send_to_address(&addr, bitcoin::Amount::from_btc(1.0).unwrap()).unwrap();
-	generate_blocks(bitcoind, 6);
+	generate_blocks(bitcoind, electrsd, 6).await;
 }
 
 #[derive(Clone)]
@@ -225,6 +245,7 @@ pub struct TestParams {
 	pub lsp: Arc<Node>,
 	pub third_party: Arc<Node>,
 	pub bitcoind: Arc<Bitcoind>,
+	pub electrsd: Arc<ElectrsD>,
 	#[cfg(feature = "_cashu-tests")]
 	pub _mint: Arc<cdk::Mint>,
 }
@@ -262,13 +283,13 @@ where
 
 async fn build_test_nodes() -> TestParams {
 	let test_id = Uuid::now_v7();
-	let bitcoind = Arc::new(create_bitcoind(test_id));
+	let (bitcoind, electrsd) = create_bitcoind(test_id).await;
 
 	let lsp = create_lsp(test_id, &bitcoind);
-	fund_node(&lsp, &bitcoind);
+	fund_node(&lsp, &bitcoind, &electrsd).await;
 	let third_party = create_third_party(test_id, &bitcoind);
 	let start_bal = third_party.list_balances().total_onchain_balance_sats;
-	fund_node(&third_party, &bitcoind);
+	fund_node(&third_party, &bitcoind, &electrsd).await;
 
 	// wait for node to sync (needs blocking wait as we are not in async context here)
 	let third = Arc::clone(&third_party);
@@ -283,7 +304,7 @@ async fn build_test_nodes() -> TestParams {
 	// open a channel from payer to LSP
 	third_party.open_channel(lsp.node_id(), lsp_listen.clone(), 10_000_000, None, None).unwrap();
 	wait_for_tx_broadcast(&bitcoind);
-	generate_blocks(&bitcoind, 6);
+	generate_blocks(&bitcoind, &electrsd, 6).await;
 
 	// wait for channel ready (needs blocking wait as we are not in async context here)
 	let third_party_clone = Arc::clone(&third_party);
@@ -309,9 +330,11 @@ async fn build_test_nodes() -> TestParams {
 		};
 
 		let tmp = temp_dir().join(format!("orange-test-{test_id}/ldk-node"));
-		let cookie = bitcoind.params.get_cookie_values().unwrap().unwrap();
 
-		let bitcoind_port = bitcoind.params.rpc_socket.port();
+		// take esplora url and just get the port, as we know it's running on localhost
+		let base_url = electrsd.esplora_url.as_ref().unwrap();
+		let port = base_url.split(':').last().unwrap();
+		let esplora_url = format!("http://localhost:{port}");
 
 		let wallet_config = WalletConfig {
 			storage_config: StorageConfig::LocalSQLite(tmp.to_str().unwrap().to_string()),
@@ -319,12 +342,7 @@ async fn build_test_nodes() -> TestParams {
 			scorer_url: None,
 			rgs_url: None,
 			tunables: Tunables::default(),
-			chain_source: ChainSource::BitcoindRPC {
-				host: "127.0.0.1".to_string(),
-				port: bitcoind_port,
-				user: cookie.user,
-				password: cookie.password,
-			},
+			chain_source: ChainSource::Esplora { url: esplora_url, username: None, password: None },
 			lsp: (lsp_listen, lsp_node_id, None),
 			network: Network::Regtest,
 			seed: Seed::Seed64(seed),
@@ -418,7 +436,7 @@ async fn build_test_nodes() -> TestParams {
 				.client
 				.send_to_address(&addr, bitcoin::Amount::from_btc(1.0).unwrap())
 				.unwrap();
-			generate_blocks(&bitcoind_clone, 6);
+			generate_blocks(&bitcoind_clone, &electrsd, 6).await;
 
 			// wait for cdk node to sync
 			wait_for_condition("cdk node sync after funding", || {
@@ -438,7 +456,7 @@ async fn build_test_nodes() -> TestParams {
 				)
 				.unwrap();
 			wait_for_tx_broadcast(&bitcoind_clone);
-			generate_blocks(&bitcoind_clone, 6);
+			generate_blocks(&bitcoind_clone, &electrsd, 6).await;
 
 			// wait for sync/channel ready
 			wait_for_condition("cdk channel to become usable", || {
@@ -450,18 +468,14 @@ async fn build_test_nodes() -> TestParams {
 			mint
 		};
 
+		let esplora_url = format!("http://{}", electrsd.esplora_url.as_ref().unwrap());
 		let tmp = temp_dir().join(format!("orange-test-{test_id}/wallet"));
 		let wallet_config = WalletConfig {
 			storage_config: StorageConfig::LocalSQLite(tmp.to_str().unwrap().to_string()),
 			logger_type: LoggerType::LogFacade,
 			scorer_url: None,
 			tunables: Tunables::default(),
-			chain_source: ChainSource::BitcoindRPC {
-				host: "127.0.0.1".to_string(),
-				port: bitcoind_port,
-				user: cookie.user,
-				password: cookie.password,
-			},
+			chain_source: ChainSource::Esplora { url: esplora_url, username: None, password: None },
 			lsp: (lsp_listen, lsp_node_id, None),
 			rgs_url: None,
 			network: Network::Regtest,
@@ -473,11 +487,11 @@ async fn build_test_nodes() -> TestParams {
 		};
 		let wallet = Arc::new(Wallet::new(wallet_config).await.unwrap());
 
-		return TestParams { wallet, lsp, third_party, bitcoind, _mint: mint };
+		return TestParams { wallet, lsp, third_party, bitcoind, electrsd, _mint: mint };
 	};
 
 	#[cfg(not(feature = "_cashu-tests"))]
-	TestParams { wallet, lsp, third_party, bitcoind }
+	TestParams { wallet, lsp, third_party, bitcoind, electrsd }
 }
 
 pub async fn open_channel_from_lsp(wallet: &orange_sdk::Wallet, payer: Arc<Node>) -> Amount {
@@ -530,5 +544,61 @@ fn wait_for_tx_broadcast(bitcoind: &Bitcoind) {
 			break;
 		}
 		std::thread::sleep(Duration::from_millis(250));
+	}
+}
+
+pub(crate) async fn wait_for_block<E: ElectrumApi>(electrs: &E, min_height: usize) {
+	let mut header = match electrs.block_headers_subscribe() {
+		Ok(header) => header,
+		Err(_) => {
+			// While subscribing should succeed the first time around, we ran into some cases where
+			// it didn't. Since we can't proceed without subscribing, we try again after a delay
+			// and panic if it still fails.
+			tokio::time::sleep(Duration::from_secs(3)).await;
+			electrs.block_headers_subscribe().expect("failed to subscribe to block headers")
+		},
+	};
+	loop {
+		if header.height >= min_height {
+			break;
+		}
+		header = exponential_backoff_poll(|| {
+			electrs.ping().expect("failed to ping electrs");
+			electrs.block_headers_pop().expect("failed to pop block header")
+		})
+		.await;
+	}
+}
+
+pub(crate) async fn wait_for_tx<E: ElectrumApi>(electrs: &E, txid: Txid) {
+	if electrs.transaction_get(&txid).is_ok() {
+		return;
+	}
+
+	exponential_backoff_poll(|| {
+		electrs.ping().unwrap();
+		electrs.transaction_get(&txid).ok()
+	})
+	.await;
+}
+
+pub(crate) async fn exponential_backoff_poll<T, F>(mut poll: F) -> T
+where
+	F: FnMut() -> Option<T>,
+{
+	let mut delay = Duration::from_millis(64);
+	let mut tries = 0;
+	loop {
+		match poll() {
+			Some(data) => break data,
+			None if delay.as_millis() < 512 => {
+				delay = delay.mul_f32(2.0);
+			},
+
+			None => {},
+		}
+		assert!(tries < 20, "Reached max tries.");
+		tries += 1;
+		tokio::time::sleep(delay).await;
 	}
 }

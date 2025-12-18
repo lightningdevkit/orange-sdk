@@ -785,13 +785,17 @@ impl Wallet {
 				},
 				_ => None,
 			};
-			let fee = match payment.fee_paid_msat {
-				None => lightning_receive_fee,
-				Some(fee) => Some(
-					Amount::from_milli_sats(fee)
-						.unwrap()
-						.saturating_add(lightning_receive_fee.unwrap_or(Amount::ZERO)),
-				),
+			let fee = if payment.direction == PaymentDirection::Outbound {
+				match payment.fee_paid_msat {
+					None => Some(lightning_receive_fee.unwrap_or(Amount::ZERO)),
+					Some(fee) => Some(
+						Amount::from_milli_sats(fee)
+							.unwrap()
+							.saturating_add(lightning_receive_fee.unwrap_or(Amount::ZERO)),
+					),
+				}
+			} else {
+				Some(lightning_receive_fee.unwrap_or(Amount::ZERO))
 			};
 			if let Some(tx_metadata) = tx_metadata.get(&PaymentId::SelfCustodial(payment.id.0)) {
 				match &tx_metadata.ty {
@@ -1356,5 +1360,14 @@ impl Wallet {
 
 		// Wait until non-cancellable background tasks (mod LDK's background processor) are done.
 		self.inner.runtime.wait_on_background_tasks();
+	}
+
+	/// Manually sync the LDK and BDK wallets with the current chain state and update the fee rate cache.
+	///
+	/// This is done automatically in the background, but can be triggered manually if needed. Often useful for
+	/// testing purposes.
+	pub fn sync_ln_wallet(&self) -> Result<(), WalletError> {
+		self.inner.ln_wallet.inner.ldk_node.sync_wallets()?;
+		Ok(())
 	}
 }

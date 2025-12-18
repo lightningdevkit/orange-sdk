@@ -110,22 +110,42 @@ impl LightningWallet {
 		let (lsp_socket_addr, lsp_node_id, lsp_token) = config.lsp;
 		builder.set_liquidity_source_lsps2(lsp_node_id, lsp_socket_addr.clone(), lsp_token);
 		match config.chain_source {
-			ChainSource::Esplora { url, username, password } => match (&username, &password) {
-				(Some(username), Some(password)) => {
-					let mut headers = HashMap::with_capacity(1);
-					headers.insert(
-						"Authorization".to_string(),
-						format!(
-							"Basic {}",
-							BASE64_STANDARD.encode(format!("{}:{}", username, password))
-						),
-					);
-					builder.set_chain_source_esplora_with_headers(url, headers, None)
-				},
-				(None, None) => builder.set_chain_source_esplora(url, None),
-				_ => {
-					return Err(InitFailure::LdkNodeStartFailure(NodeError::WalletOperationFailed));
-				},
+			ChainSource::Esplora { url, username, password } => {
+				let sync_config = if config.network == Network::Regtest {
+					ldk_node::config::EsploraSyncConfig {
+						background_sync_config: Some(BackgroundSyncConfig {
+							onchain_wallet_sync_interval_secs: 2,
+							lightning_wallet_sync_interval_secs: 2,
+							fee_rate_cache_update_interval_secs: 30,
+						}),
+					}
+				} else {
+					ldk_node::config::EsploraSyncConfig::default()
+				};
+
+				match (&username, &password) {
+					(Some(username), Some(password)) => {
+						let mut headers = HashMap::with_capacity(1);
+						headers.insert(
+							"Authorization".to_string(),
+							format!(
+								"Basic {}",
+								BASE64_STANDARD.encode(format!("{username}:{password}"))
+							),
+						);
+						builder.set_chain_source_esplora_with_headers(
+							url,
+							headers,
+							Some(sync_config),
+						)
+					},
+					(None, None) => builder.set_chain_source_esplora(url, Some(sync_config)),
+					_ => {
+						return Err(InitFailure::LdkNodeStartFailure(
+							NodeError::WalletOperationFailed,
+						));
+					},
+				}
 			},
 			ChainSource::Electrum(url) => builder.set_chain_source_electrum(url, None),
 			ChainSource::BitcoindRPC { host, port, user, password } => {
