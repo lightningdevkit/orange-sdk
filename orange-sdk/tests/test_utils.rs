@@ -235,7 +235,9 @@ fn create_third_party(uuid: Uuid, bitcoind: &Bitcoind) -> Arc<Node> {
 
 async fn fund_node(node: &Node, bitcoind: &Bitcoind, electrsd: &ElectrsD) {
 	let addr = node.onchain_payment().new_address().unwrap();
-	bitcoind.client.send_to_address(&addr, bitcoin::Amount::from_btc(1.0).unwrap()).unwrap();
+	let res =
+		bitcoind.client.send_to_address(&addr, bitcoin::Amount::from_btc(1.0).unwrap()).unwrap();
+	wait_for_tx(&electrsd.client, res.txid().unwrap()).await;
 	generate_blocks(bitcoind, electrsd, 6).await;
 }
 
@@ -333,7 +335,7 @@ async fn build_test_nodes() -> TestParams {
 
 		// take esplora url and just get the port, as we know it's running on localhost
 		let base_url = electrsd.esplora_url.as_ref().unwrap();
-		let port = base_url.split(':').last().unwrap();
+		let port = base_url.split(':').next_back().unwrap();
 		let esplora_url = format!("http://localhost:{port}");
 
 		let wallet_config = WalletConfig {
@@ -468,7 +470,11 @@ async fn build_test_nodes() -> TestParams {
 			mint
 		};
 
-		let esplora_url = format!("http://{}", electrsd.esplora_url.as_ref().unwrap());
+		// take esplora url and just get the port, as we know it's running on localhost
+		let base_url = electrsd.esplora_url.as_ref().unwrap();
+		let port = base_url.split(':').next_back().unwrap();
+		let esplora_url = format!("http://localhost:{port}");
+
 		let tmp = temp_dir().join(format!("orange-test-{test_id}/wallet"));
 		let wallet_config = WalletConfig {
 			storage_config: StorageConfig::LocalSQLite(tmp.to_str().unwrap().to_string()),

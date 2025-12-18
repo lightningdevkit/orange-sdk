@@ -3,14 +3,14 @@
 use std::sync::Arc;
 
 use crate::io;
-use ldk_node::DynStore;
-use ldk_node::lightning::util::persist::KVStore;
 
 use breez_sdk_spark::{
 	DepositInfo, ListPaymentsRequest, Payment, PaymentDetails, PaymentMetadata, StorageError,
 	UpdateDepositPayload,
 };
+use ldk_node::DynStore;
 use ldk_node::lightning::util::persist::KVSTORE_NAMESPACE_KEY_MAX_LEN;
+use ldk_node::lightning::util::persist::KVStore;
 
 const SPARK_PRIMARY_NAMESPACE: &str = "spark";
 const SPARK_CACHE_NAMESPACE: &str = "cache";

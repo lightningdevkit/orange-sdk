@@ -393,15 +393,12 @@ impl LightningWallet {
 		let channels = self.inner.ldk_node.list_channels();
 		let channel = channels.iter().find(|c| c.counterparty_node_id == self.inner.lsp_node_id);
 
-		// todo fix this, for now leave some onchain balance for fees
-		let amt = amount.saturating_sub(Amount::from_sats(10_000).unwrap());
-
 		match channel {
 			Some(chan) => {
 				self.inner.ldk_node.splice_in(
 					&chan.user_channel_id,
 					chan.counterparty_node_id,
-					amt.sats_rounding_up(),
+					amount.sats_rounding_up(),
 				)?;
 				Ok(chan.user_channel_id)
 			},
@@ -561,6 +558,18 @@ impl graduated_rebalancer::LightningWallet for LightningWallet {
 	fn splice_to_lsp_channel(
 		&self, amt: Amount,
 	) -> Pin<Box<dyn Future<Output = Result<u128, Self::Error>> + Send + '_>> {
+		let bal = self.inner.ldk_node.list_balances();
+		// if we don't have enough onchain balance, return error
+		// if we are within 1,000 sats of the amount, reduce the amount to account for fees
+		if bal.spendable_onchain_balance_sats < amt.sats_rounding_up() {
+			return Box::pin(async move { Err(NodeError::InsufficientFunds) });
+		} else if bal.spendable_onchain_balance_sats < amt.sats_rounding_up() + 1_000 {
+			let reduced_amt = amt.saturating_sub(Amount::from_sats(1_000).expect("valid amount"));
+			return Box::pin(async move {
+				self.splice_balance_into_channel(reduced_amt).await.map(|c| c.0)
+			});
+		}
+
 		Box::pin(async move { self.splice_balance_into_channel(amt).await.map(|c| c.0) })
 	}
 

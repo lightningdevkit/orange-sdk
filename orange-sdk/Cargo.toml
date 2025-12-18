@@ -25,7 +25,7 @@ graduated-rebalancer = { path = "../graduated-rebalancer", version = "0.1.0" }
 
 ldk-node = { version = "0.7.0" }
 lightning-macros = "0.2.0"
-bitcoin-payment-instructions = { workspace = true }
+bitcoin-payment-instructions = { workspace = true, features = ["http"] }
 chrono = { version = "0.4", default-features = false }
 rand = { version = "0.8.5", optional = true }
 breez-sdk-spark = { git = "https://github.com/breez/spark-sdk.git", rev = "1f2e9995230cd582d6b4aa7d06d76b99defb635e", default-features = false, features = ["rustls-tls"], optional = true }
@@ -36,8 +36,8 @@ serde_json = { version = "1.0", optional = true }
 async-trait = "0.1"
 log = "0.4.28"
 
-corepc-node = { version = "0.10.1", features = ["27_2", "download"], optional = true }
-electrsd = { version = "0.36.1", default-features = false, features = ["esplora_a33e97e1", "corepc-node_27_2"], optional = true }
+corepc-node = { version = "0.10.1", features = ["29_0", "download"], optional = true }
+electrsd = { version = "0.36.1", default-features = false, features = ["esplora_a33e97e1", "corepc-node_29_0"], optional = true }
 cdk-ldk-node = { version = "0.14.2", optional = true }
 cdk-sqlite = { version = "0.14.2", optional = true }
 cdk-axum = { version = "0.14.2", optional = true }
