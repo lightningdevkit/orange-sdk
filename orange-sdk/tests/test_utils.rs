@@ -427,8 +427,15 @@ async fn build_test_nodes() -> TestParams {
 			})
 			.await;
 
+			let lsp_listen = lsp_listen_clone.to_string();
 			cdk.node()
-				.open_channel(lsp_node_id, lsp_listen_clone, 10_000_000, Some(5_000_000_000), None)
+				.open_channel(
+					lsp_node_id,
+					lsp_listen.parse().unwrap(),
+					10_000_000,
+					Some(5_000_000_000),
+					None,
+				)
 				.unwrap();
 			wait_for_tx_broadcast(&bitcoind_clone);
 			generate_blocks(&bitcoind_clone, 6);

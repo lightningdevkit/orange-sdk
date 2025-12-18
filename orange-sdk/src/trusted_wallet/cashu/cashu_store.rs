@@ -765,6 +765,13 @@ impl WalletDatabase for CashuKvDatabase {
 		Ok(filtered_proofs)
 	}
 
+	async fn get_balance(
+		&self, mint_url: Option<MintUrl>, unit: Option<CurrencyUnit>, state: Option<Vec<State>>,
+	) -> Result<u64, Self::Err> {
+		let proofs = self.get_proofs(mint_url, unit, state, None).await?;
+		Ok(proofs.iter().map(|p| u64::from(p.proof.amount)).sum())
+	}
+
 	async fn update_proofs_state(&self, ys: Vec<PublicKey>, state: State) -> Result<(), Self::Err> {
 		// Update proofs in storage and cache
 		for y in &ys {

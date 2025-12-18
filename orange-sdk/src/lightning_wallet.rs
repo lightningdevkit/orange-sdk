@@ -13,16 +13,16 @@ use ldk_node::bitcoin::base64::Engine;
 use ldk_node::bitcoin::base64::prelude::BASE64_STANDARD;
 use ldk_node::bitcoin::secp256k1::PublicKey;
 use ldk_node::bitcoin::{Address, Network};
+use ldk_node::config::{AsyncPaymentsRole, BackgroundSyncConfig};
 use ldk_node::lightning::ln::channelmanager::PaymentId;
 use ldk_node::lightning::ln::msgs::SocketAddress;
 use ldk_node::lightning::util::logger::Logger as _;
-use ldk_node::lightning::util::persist::KVStore;
 use ldk_node::lightning::{log_debug, log_error, log_info};
 use ldk_node::lightning_invoice::{Bolt11Invoice, Bolt11InvoiceDescription, Description};
 use ldk_node::payment::{
 	ConfirmationStatus, PaymentDetails, PaymentDirection, PaymentKind, PaymentStatus,
 };
-use ldk_node::{DynStore, NodeError, UserChannelId, lightning};
+use ldk_node::{DynStore, NodeError, UserChannelId};
 
 use graduated_rebalancer::{LightningBalance, ReceivedLightningPayment};
 
@@ -133,37 +133,14 @@ impl LightningWallet {
 			},
 		};
 
+		builder.set_async_payments_role(Some(AsyncPaymentsRole::Client))?;
+
 		builder.set_custom_logger(Arc::clone(&logger) as Arc<dyn ldk_node::logger::LogWriter>);
 
 		builder.set_runtime(runtime.get_handle());
 
-		// download scorer and write to storage
-		// todo switch to https://github.com/lightningdevkit/ldk-node/pull/449 once available
 		if let Some(url) = config.scorer_url {
-			let fetch = tokio::time::timeout(std::time::Duration::from_secs(10), reqwest::get(url));
-			let res = fetch.await.map_err(|e| {
-				log_error!(logger, "Timed out downloading scorer: {e}");
-				InitFailure::LdkNodeStartFailure(NodeError::InvalidUri)
-			})?;
-
-			let req = res.map_err(|e| {
-				log_error!(logger, "Failed to download scorer: {e}");
-				InitFailure::LdkNodeStartFailure(NodeError::InvalidUri)
-			})?;
-
-			let bytes = req.bytes().await.map_err(|e| {
-				log_debug!(logger, "Failed to read scorer bytes: {e}");
-				InitFailure::LdkNodeStartFailure(NodeError::InvalidUri)
-			})?;
-
-			KVStore::write(
-				store.as_ref(),
-				lightning::util::persist::SCORER_PERSISTENCE_PRIMARY_NAMESPACE,
-				lightning::util::persist::SCORER_PERSISTENCE_SECONDARY_NAMESPACE,
-				lightning::util::persist::SCORER_PERSISTENCE_KEY,
-				bytes.to_vec(),
-			)
-			.await?;
+			builder.set_pathfinding_scores_source(url);
 		}
 
 		let ldk_node = Arc::new(builder.build_with_store(Arc::clone(&store))?);
