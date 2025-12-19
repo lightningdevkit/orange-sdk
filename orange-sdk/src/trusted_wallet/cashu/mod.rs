@@ -584,6 +584,15 @@ impl Cashu {
 			}
 		}
 
+		// spawn background task to check all pending mint quotes
+		let c = Arc::clone(&cashu_wallet);
+		let l = Arc::clone(&logger);
+		runtime.spawn_cancellable_background_task(async move {
+			if let Err(e) = c.check_all_mint_quotes().await {
+				log_error!(l, "Failed to check pending mint quotes: {e}");
+			}
+		});
+
 		// spawn background task to recover funds if first time initializing
 		let has_recovered = read_has_recovered(&store).await?;
 		if !has_recovered {
