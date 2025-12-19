@@ -88,6 +88,7 @@ impl_into_core_type!(SingleUseReceiveUri, OrangeSingleUseReceiveUri);
 #[derive(Clone, uniffi::Object)]
 pub struct Wallet {
 	inner: Arc<OrangeWallet>,
+	_rt: Arc<tokio::runtime::Runtime>,
 }
 
 #[uniffi::export(async_runtime = "tokio")]
@@ -100,7 +101,7 @@ impl Wallet {
 
 		let inner = rt.block_on(async move { OrangeWallet::new(config).await })?;
 
-		Ok(Wallet { inner: Arc::new(inner) })
+		Ok(Wallet { inner: Arc::new(inner), _rt: rt })
 	}
 
 	pub fn node_id(&self) -> String {
