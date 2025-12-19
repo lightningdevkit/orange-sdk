@@ -2,6 +2,7 @@
 
 use crate::EventQueue;
 use crate::bitcoin::hashes::Hash;
+use crate::runtime::Runtime;
 use crate::store::{PaymentId, TxMetadataStore, TxStatus};
 use crate::trusted_wallet::{Payment, TrustedError, TrustedWalletInterface};
 use bitcoin_payment_instructions::PaymentMethod;
@@ -17,11 +18,10 @@ use ldk_node::{Event, Node};
 use rand::RngCore;
 use std::env::temp_dir;
 use std::pin::Pin;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, RwLock};
 use std::time::Duration;
-use tokio::runtime::Runtime;
-use tokio::sync::watch;
+use tokio::sync::{RwLock, watch};
 use uuid::Uuid;
 
 /// A dummy implementation of `TrustedWalletInterface` for testing purposes.
@@ -44,8 +44,6 @@ pub struct DummyTrustedWalletExtraConfig {
 	pub lsp: Arc<Node>,
 	/// The Bitcoind node to connect to
 	pub bitcoind: Arc<Bitcoind>,
-	/// The runtime to use for async tasks
-	pub rt: Arc<Runtime>,
 }
 
 impl DummyTrustedWallet {
@@ -78,7 +76,7 @@ impl DummyTrustedWallet {
 
 		let ldk_node = Arc::new(builder.build().unwrap());
 
-		ldk_node.start_with_runtime(Arc::clone(&rt)).unwrap();
+		ldk_node.start().unwrap();
 
 		let current_bal_msats = Arc::new(AtomicU64::new(0));
 		let payments: Arc<RwLock<Vec<Payment>>> = Arc::new(RwLock::new(vec![]));
@@ -88,7 +86,7 @@ impl DummyTrustedWallet {
 		let events_ref = Arc::clone(&ldk_node);
 		let bal = Arc::clone(&current_bal_msats);
 		let pays = Arc::clone(&payments);
-		rt.spawn(async move {
+		rt.spawn_cancellable_background_task(async move {
 			loop {
 				let event = events_ref.next_event_async().await;
 				match event {
@@ -101,7 +99,7 @@ impl DummyTrustedWallet {
 						// convert id
 						let id = mangle_payment_id(payment_id.unwrap().0);
 
-						let mut payments = pays.write().unwrap();
+						let mut payments = pays.write().await;
 						let item = payments.iter_mut().find(|p| p.id == id);
 						if let Some(payment) = item {
 							payment.status = TxStatus::Completed;
@@ -131,6 +129,7 @@ impl DummyTrustedWallet {
 									payment_preimage: payment_preimage.unwrap(), // safe
 									fee_paid_msat,
 								})
+								.await
 								.unwrap();
 						}
 
@@ -140,7 +139,7 @@ impl DummyTrustedWallet {
 						// convert id
 						let id = mangle_payment_id(payment_id.unwrap().0);
 
-						let mut payments = pays.write().unwrap();
+						let mut payments = pays.write().await;
 						let item = payments.iter().cloned().enumerate().find(|(_, p)| p.id == id);
 						if let Some((idx, payment)) = item {
 							// remove from list and refund balance
@@ -162,6 +161,7 @@ impl DummyTrustedWallet {
 									payment_hash,
 									reason,
 								})
+								.await
 								.unwrap();
 						}
 					},
@@ -169,7 +169,7 @@ impl DummyTrustedWallet {
 						// convert id
 						let id = mangle_payment_id(payment_id.unwrap().0);
 
-						let mut payments = pays.write().unwrap();
+						let mut payments = pays.write().await;
 						// We create invoices on the fly without adding the payment to our list
 						// We need to insert it into our payments list
 
@@ -198,6 +198,7 @@ impl DummyTrustedWallet {
 								custom_records: vec![],
 								lsp_fee_msats: None,
 							})
+							.await
 							.unwrap();
 					},
 					Event::PaymentForwarded { .. } => {},
@@ -205,6 +206,8 @@ impl DummyTrustedWallet {
 					Event::ChannelPending { .. } => {},
 					Event::ChannelReady { .. } => {},
 					Event::ChannelClosed { .. } => {},
+					Event::SplicePending { .. } => {},
+					Event::SpliceFailed { .. } => {},
 				}
 				println!("dummy: {event:?}");
 				if let Err(e) = events_ref.event_handled() {
@@ -216,7 +219,7 @@ impl DummyTrustedWallet {
 		// wait for ldk to be ready
 		let iterations = if std::env::var("CI").is_ok() { 120 } else { 10 };
 		for _ in 0..iterations {
-			if ldk_node.status().is_listening {
+			if ldk_node.status().is_running {
 				break;
 			}
 			tokio::time::sleep(Duration::from_secs(1)).await;
@@ -307,7 +310,7 @@ impl TrustedWalletInterface for DummyTrustedWallet {
 	fn list_payments(
 		&self,
 	) -> Pin<Box<dyn Future<Output = Result<Vec<Payment>, TrustedError>> + Send + '_>> {
-		Box::pin(async move { Ok(self.payments.read().unwrap().clone()) })
+		Box::pin(async move { Ok(self.payments.read().await.clone()) })
 	}
 
 	fn estimate_fee(
@@ -335,7 +338,7 @@ impl TrustedWalletInterface for DummyTrustedWallet {
 					let id = self
 						.ldk_node
 						.bolt12_payment()
-						.send_using_amount(&offer, amount.milli_sats(), None, None)
+						.send_using_amount(&offer, amount.milli_sats(), None, None, None)
 						.unwrap()
 						.0;
 
@@ -360,7 +363,7 @@ impl TrustedWalletInterface for DummyTrustedWallet {
 				.as_secs();
 
 			// add to payments
-			let mut list = self.payments.write().unwrap();
+			let mut list = self.payments.write().await;
 			list.push(Payment {
 				id,
 				amount,

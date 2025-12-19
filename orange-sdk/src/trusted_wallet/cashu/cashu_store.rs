@@ -5,9 +5,11 @@ use std::sync::{Arc, RwLock};
 
 use async_trait::async_trait;
 use cdk::cdk_database::WalletDatabase;
+use ldk_node::DynStore;
 use ldk_node::lightning::io;
 use ldk_node::lightning::util::persist::KVStore;
 
+use crate::trusted_wallet::TrustedError;
 use cdk::mint_url::MintUrl;
 use cdk::nuts::{
 	CurrencyUnit, Id, KeySet, KeySetInfo, Keys, MintInfo, PublicKey, SpendingConditions, State,
@@ -20,8 +22,6 @@ use cdk::wallet::{
 };
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
-
-use crate::trusted_wallet::TrustedError;
 
 // Constants for organizing data in the KV store
 const CASHU_PRIMARY_KEY: &str = "cashu_wallet";
@@ -110,7 +110,7 @@ impl From<DatabaseError> for cdk::cdk_database::Error {
 
 /// A KV store-based implementation of the Cashu WalletDatabase trait
 pub struct CashuKvDatabase {
-	store: Arc<dyn KVStore + Send + Sync>,
+	store: Arc<DynStore>,
 	// In-memory caches for frequently accessed data
 	mints_cache: Arc<RwLock<HashMap<MintUrl, Option<MintInfo>>>>,
 	proofs_cache: Arc<RwLock<Vec<ProofInfo>>>,
@@ -140,7 +140,7 @@ impl CashuKvDatabase {
 	///
 	/// Returns a `Result` containing the initialized database or a `DatabaseError` if
 	/// initialization fails.
-	pub fn new(store: Arc<dyn KVStore + Send + Sync>) -> Result<Self, DatabaseError> {
+	pub async fn new(store: Arc<DynStore>) -> Result<Self, DatabaseError> {
 		let database = Self {
 			store,
 			mints_cache: Arc::new(RwLock::new(HashMap::new())),
@@ -148,20 +148,20 @@ impl CashuKvDatabase {
 		};
 
 		// Initialize caches from persistent storage
-		database.load_caches()?;
+		database.load_caches().await?;
 
 		Ok(database)
 	}
 
-	fn load_caches(&self) -> Result<(), DatabaseError> {
+	async fn load_caches(&self) -> Result<(), DatabaseError> {
 		// Load mints cache
-		if let Ok(mints) = self.load_mints_from_store() {
+		if let Ok(mints) = self.load_mints_from_store().await {
 			let mut cache = self.mints_cache.write().unwrap();
 			*cache = mints;
 		}
 
 		// Load proofs cache
-		if let Ok(proofs) = self.load_proofs_from_store() {
+		if let Ok(proofs) = self.load_proofs_from_store().await {
 			let mut cache = self.proofs_cache.write().unwrap();
 			*cache = proofs;
 		}
@@ -169,20 +169,25 @@ impl CashuKvDatabase {
 		Ok(())
 	}
 
-	fn load_mints_from_store(&self) -> Result<HashMap<MintUrl, Option<MintInfo>>, DatabaseError> {
-		let keys = self.store.list(CASHU_PRIMARY_KEY, MINTS_KEY).map_err(DatabaseError::Io)?;
+	async fn load_mints_from_store(
+		&self,
+	) -> Result<HashMap<MintUrl, Option<MintInfo>>, DatabaseError> {
+		let keys = KVStore::list(self.store.as_ref(), CASHU_PRIMARY_KEY, MINTS_KEY)
+			.await
+			.map_err(DatabaseError::Io)?;
 
-		let mut mints = HashMap::new();
+		let mut mints = HashMap::with_capacity(keys.len());
 		for key in keys {
-			let data =
-				self.store.read(CASHU_PRIMARY_KEY, MINTS_KEY, &key).map_err(DatabaseError::Io)?;
+			let data = KVStore::read(self.store.as_ref(), CASHU_PRIMARY_KEY, MINTS_KEY, &key)
+				.await
+				.map_err(DatabaseError::Io)?;
 
 			if !data.is_empty() {
 				let mint_url: MintUrl = serde_json::from_slice(&data)
 					.map_err(|e| DatabaseError::Serialization(e.to_string()))?;
 
 				// Try to load mint info
-				let mint_info = self.load_mint_info(&mint_url).ok().flatten();
+				let mint_info = self.load_mint_info(&mint_url).await.ok().flatten();
 				mints.insert(mint_url, mint_info);
 			}
 		}
@@ -190,13 +195,16 @@ impl CashuKvDatabase {
 		Ok(mints)
 	}
 
-	fn load_proofs_from_store(&self) -> Result<Vec<ProofInfo>, DatabaseError> {
-		let keys = self.store.list(CASHU_PRIMARY_KEY, PROOFS_KEY).map_err(DatabaseError::Io)?;
+	async fn load_proofs_from_store(&self) -> Result<Vec<ProofInfo>, DatabaseError> {
+		let keys = KVStore::list(self.store.as_ref(), CASHU_PRIMARY_KEY, PROOFS_KEY)
+			.await
+			.map_err(DatabaseError::Io)?;
 
-		let mut proofs = Vec::new();
+		let mut proofs = Vec::with_capacity(keys.len());
 		for key in keys {
-			let data =
-				self.store.read(CASHU_PRIMARY_KEY, PROOFS_KEY, &key).map_err(DatabaseError::Io)?;
+			let data = KVStore::read(self.store.as_ref(), CASHU_PRIMARY_KEY, PROOFS_KEY, &key)
+				.await
+				.map_err(DatabaseError::Io)?;
 
 			if !data.is_empty() {
 				let proof: ProofInfo = serde_json::from_slice(&data)
@@ -209,9 +217,9 @@ impl CashuKvDatabase {
 		Ok(proofs)
 	}
 
-	fn load_mint_info(&self, mint_url: &MintUrl) -> Result<Option<MintInfo>, DatabaseError> {
+	async fn load_mint_info(&self, mint_url: &MintUrl) -> Result<Option<MintInfo>, DatabaseError> {
 		let key = Self::generate_mint_info_key(mint_url);
-		match self.store.read(CASHU_PRIMARY_KEY, MINTS_KEY, &key) {
+		match KVStore::read(self.store.as_ref(), CASHU_PRIMARY_KEY, MINTS_KEY, &key).await {
 			Ok(data) => {
 				if data.is_empty() {
 					return Ok(None);
@@ -225,14 +233,16 @@ impl CashuKvDatabase {
 		}
 	}
 
-	fn save_mint_info(
+	async fn save_mint_info(
 		&self, mint_url: &MintUrl, mint_info: &MintInfo,
 	) -> Result<(), DatabaseError> {
 		let key = Self::generate_mint_info_key(mint_url);
 		let data = serde_json::to_vec(mint_info)
 			.map_err(|e| DatabaseError::Serialization(e.to_string()))?;
 
-		self.store.write(CASHU_PRIMARY_KEY, MINTS_KEY, &key, &data).map_err(DatabaseError::Io)
+		KVStore::write(self.store.as_ref(), CASHU_PRIMARY_KEY, MINTS_KEY, &key, data)
+			.await
+			.map_err(DatabaseError::Io)
 	}
 
 	fn generate_proof_key(proof: &ProofInfo) -> String {
@@ -277,13 +287,13 @@ impl WalletDatabase for CashuKvDatabase {
 		let mint_data = serde_json::to_vec(&mint_url)
 			.map_err(|e| DatabaseError::Serialization(e.to_string()))?;
 
-		self.store
-			.write(CASHU_PRIMARY_KEY, MINTS_KEY, &mint_key, &mint_data)
+		KVStore::write(self.store.as_ref(), CASHU_PRIMARY_KEY, MINTS_KEY, &mint_key, mint_data)
+			.await
 			.map_err(DatabaseError::Io)?;
 
 		// Save mint info if provided
 		if let Some(info) = &mint_info {
-			self.save_mint_info(&mint_url, info)?;
+			self.save_mint_info(&mint_url, info).await?;
 		}
 
 		// Update cache
@@ -299,21 +309,27 @@ impl WalletDatabase for CashuKvDatabase {
 		let mint_key = Self::generate_mint_key(&mint_url);
 
 		// Remove mint URL by writing empty data
-		self.store
-			.write(CASHU_PRIMARY_KEY, MINTS_KEY, &mint_key, &[])
+		KVStore::remove(self.store.as_ref(), CASHU_PRIMARY_KEY, MINTS_KEY, &mint_key, false)
+			.await
 			.map_err(DatabaseError::Io)?;
 
 		// Remove mint info
 		let info_key = Self::generate_mint_info_key(&mint_url);
-		self.store
-			.write(CASHU_PRIMARY_KEY, MINTS_KEY, &info_key, &[])
+		KVStore::remove(self.store.as_ref(), CASHU_PRIMARY_KEY, MINTS_KEY, &info_key, false)
+			.await
 			.map_err(DatabaseError::Io)?;
 
 		// Remove mint keysets
 		let keysets_key = Self::generate_mint_keysets_key(&mint_url);
-		self.store
-			.write(CASHU_PRIMARY_KEY, MINT_KEYSETS_KEY, &keysets_key, &[])
-			.map_err(DatabaseError::Io)?;
+		KVStore::remove(
+			self.store.as_ref(),
+			CASHU_PRIMARY_KEY,
+			MINT_KEYSETS_KEY,
+			&keysets_key,
+			false,
+		)
+		.await
+		.map_err(DatabaseError::Io)?;
 
 		// Update cache
 		{
@@ -334,7 +350,7 @@ impl WalletDatabase for CashuKvDatabase {
 		}
 
 		// Load from storage
-		self.load_mint_info(&mint_url).map_err(Into::into)
+		self.load_mint_info(&mint_url).await.map_err(Into::into)
 	}
 
 	async fn get_mints(&self) -> Result<HashMap<MintUrl, Option<MintInfo>>, Self::Err> {
@@ -374,19 +390,32 @@ impl WalletDatabase for CashuKvDatabase {
 		for keyset in keysets {
 			// Check if keyset already exists in individual keysets table
 			let keyset_key = format!("keyset_{}", keyset.id);
-			let existing_keyset =
-				match self.store.read(CASHU_PRIMARY_KEY, KEYSETS_TABLE_KEY, &keyset_key) {
-					Ok(data) if !data.is_empty() => {
-						let existing: KeySetInfo = serde_json::from_slice(&data)
-							.map_err(|e| DatabaseError::Serialization(e.to_string()))?;
-						Some(existing)
-					},
-					_ => None,
-				};
+			let existing_keyset = match KVStore::read(
+				self.store.as_ref(),
+				CASHU_PRIMARY_KEY,
+				KEYSETS_TABLE_KEY,
+				&keyset_key,
+			)
+			.await
+			{
+				Ok(data) if !data.is_empty() => {
+					let existing: KeySetInfo = serde_json::from_slice(&data)
+						.map_err(|e| DatabaseError::Serialization(e.to_string()))?;
+					Some(existing)
+				},
+				_ => None,
+			};
 
 			// Check u32 mapping for conflicts
 			let u32_key = format!("u32_{}", u32::from(keyset.id));
-			match self.store.read(CASHU_PRIMARY_KEY, KEYSET_U32_MAPPING_KEY, &u32_key) {
+			match KVStore::read(
+				self.store.as_ref(),
+				CASHU_PRIMARY_KEY,
+				KEYSET_U32_MAPPING_KEY,
+				&u32_key,
+			)
+			.await
+			{
 				Ok(data) if !data.is_empty() => {
 					let existing_id_str = String::from_utf8(data.to_vec())
 						.map_err(|e| DatabaseError::Serialization(e.to_string()))?;
@@ -401,9 +430,15 @@ impl WalletDatabase for CashuKvDatabase {
 				_ => {
 					// No existing mapping, create one
 					let id_data = keyset.id.to_string().as_bytes().to_vec();
-					self.store
-						.write(CASHU_PRIMARY_KEY, KEYSET_U32_MAPPING_KEY, &u32_key, &id_data)
-						.map_err(DatabaseError::Io)?;
+					KVStore::write(
+						self.store.as_ref(),
+						CASHU_PRIMARY_KEY,
+						KEYSET_U32_MAPPING_KEY,
+						&u32_key,
+						id_data,
+					)
+					.await
+					.map_err(DatabaseError::Io)?;
 				},
 			}
 
@@ -420,9 +455,15 @@ impl WalletDatabase for CashuKvDatabase {
 			// Store individual keyset
 			let keyset_data = serde_json::to_vec(&final_keyset)
 				.map_err(|e| DatabaseError::Serialization(e.to_string()))?;
-			self.store
-				.write(CASHU_PRIMARY_KEY, KEYSETS_TABLE_KEY, &keyset_key, &keyset_data)
-				.map_err(DatabaseError::Io)?;
+			KVStore::write(
+				self.store.as_ref(),
+				CASHU_PRIMARY_KEY,
+				KEYSETS_TABLE_KEY,
+				&keyset_key,
+				keyset_data,
+			)
+			.await
+			.map_err(DatabaseError::Io)?;
 
 			updated_keysets.push(final_keyset);
 		}
@@ -453,8 +494,8 @@ impl WalletDatabase for CashuKvDatabase {
 		let data = serde_json::to_vec(&all_mint_keysets)
 			.map_err(|e| DatabaseError::Serialization(e.to_string()))?;
 
-		self.store
-			.write(CASHU_PRIMARY_KEY, MINT_KEYSETS_KEY, &key, &data)
+		KVStore::write(self.store.as_ref(), CASHU_PRIMARY_KEY, MINT_KEYSETS_KEY, &key, data)
+			.await
 			.map_err(DatabaseError::Io)?;
 
 		Ok(())
@@ -465,7 +506,7 @@ impl WalletDatabase for CashuKvDatabase {
 	) -> Result<Option<Vec<KeySetInfo>>, Self::Err> {
 		let key = Self::generate_mint_keysets_key(&mint_url);
 
-		match self.store.read(CASHU_PRIMARY_KEY, MINT_KEYSETS_KEY, &key) {
+		match KVStore::read(self.store.as_ref(), CASHU_PRIMARY_KEY, MINT_KEYSETS_KEY, &key).await {
 			Ok(data) => {
 				if data.is_empty() {
 					return Ok(None);
@@ -482,7 +523,7 @@ impl WalletDatabase for CashuKvDatabase {
 	async fn get_keyset_by_id(&self, keyset_id: &Id) -> Result<Option<KeySetInfo>, Self::Err> {
 		// Read directly from the dedicated KEYSETS_TABLE keyed by the keyset ID for efficiency
 		let key = format!("keyset_{}", keyset_id);
-		match self.store.read(CASHU_PRIMARY_KEY, KEYSETS_TABLE_KEY, &key) {
+		match KVStore::read(self.store.as_ref(), CASHU_PRIMARY_KEY, KEYSETS_TABLE_KEY, &key).await {
 			Ok(data) if !data.is_empty() => {
 				let keyset: KeySetInfo = serde_json::from_slice(&data)
 					.map_err(|e| DatabaseError::Serialization(e.to_string()))?;
@@ -499,15 +540,16 @@ impl WalletDatabase for CashuKvDatabase {
 		let data =
 			serde_json::to_vec(&quote).map_err(|e| DatabaseError::Serialization(e.to_string()))?;
 
-		self.store
-			.write(CASHU_PRIMARY_KEY, MINT_QUOTES_KEY, &key, &data)
+		KVStore::write(self.store.as_ref(), CASHU_PRIMARY_KEY, MINT_QUOTES_KEY, &key, data)
+			.await
 			.map_err(DatabaseError::Io)?;
 
 		Ok(())
 	}
 
 	async fn get_mint_quote(&self, quote_id: &str) -> Result<Option<MintQuote>, Self::Err> {
-		match self.store.read(CASHU_PRIMARY_KEY, MINT_QUOTES_KEY, quote_id) {
+		match KVStore::read(self.store.as_ref(), CASHU_PRIMARY_KEY, MINT_QUOTES_KEY, quote_id).await
+		{
 			Ok(data) => {
 				if data.is_empty() {
 					return Ok(None);
@@ -522,14 +564,14 @@ impl WalletDatabase for CashuKvDatabase {
 	}
 
 	async fn get_mint_quotes(&self) -> Result<Vec<MintQuote>, Self::Err> {
-		let keys =
-			self.store.list(CASHU_PRIMARY_KEY, MINT_QUOTES_KEY).map_err(DatabaseError::Io)?;
+		let keys = KVStore::list(self.store.as_ref(), CASHU_PRIMARY_KEY, MINT_QUOTES_KEY)
+			.await
+			.map_err(DatabaseError::Io)?;
 
-		let mut quotes = Vec::new();
+		let mut quotes = Vec::with_capacity(keys.len());
 		for key in keys {
-			let data = self
-				.store
-				.read(CASHU_PRIMARY_KEY, MINT_QUOTES_KEY, &key)
+			let data = KVStore::read(self.store.as_ref(), CASHU_PRIMARY_KEY, MINT_QUOTES_KEY, &key)
+				.await
 				.map_err(DatabaseError::Io)?;
 
 			if !data.is_empty() {
@@ -544,8 +586,8 @@ impl WalletDatabase for CashuKvDatabase {
 
 	async fn remove_mint_quote(&self, quote_id: &str) -> Result<(), Self::Err> {
 		// Mark as removed by writing empty data
-		self.store
-			.write(CASHU_PRIMARY_KEY, MINT_QUOTES_KEY, quote_id, &[])
+		KVStore::remove(self.store.as_ref(), CASHU_PRIMARY_KEY, MINT_QUOTES_KEY, quote_id, false)
+			.await
 			.map_err(DatabaseError::Io)?;
 
 		Ok(())
@@ -556,15 +598,16 @@ impl WalletDatabase for CashuKvDatabase {
 		let data =
 			serde_json::to_vec(&quote).map_err(|e| DatabaseError::Serialization(e.to_string()))?;
 
-		self.store
-			.write(CASHU_PRIMARY_KEY, MELT_QUOTES_KEY, &key, &data)
+		KVStore::write(self.store.as_ref(), CASHU_PRIMARY_KEY, MELT_QUOTES_KEY, &key, data)
+			.await
 			.map_err(DatabaseError::Io)?;
 
 		Ok(())
 	}
 
 	async fn get_melt_quote(&self, quote_id: &str) -> Result<Option<MeltQuote>, Self::Err> {
-		match self.store.read(CASHU_PRIMARY_KEY, MELT_QUOTES_KEY, quote_id) {
+		match KVStore::read(self.store.as_ref(), CASHU_PRIMARY_KEY, MELT_QUOTES_KEY, quote_id).await
+		{
 			Ok(data) => {
 				if data.is_empty() {
 					return Ok(None);
@@ -579,14 +622,14 @@ impl WalletDatabase for CashuKvDatabase {
 	}
 
 	async fn get_melt_quotes(&self) -> Result<Vec<MeltQuote>, Self::Err> {
-		let keys =
-			self.store.list(CASHU_PRIMARY_KEY, MELT_QUOTES_KEY).map_err(DatabaseError::Io)?;
+		let keys = KVStore::list(self.store.as_ref(), CASHU_PRIMARY_KEY, MELT_QUOTES_KEY)
+			.await
+			.map_err(DatabaseError::Io)?;
 
-		let mut quotes = Vec::new();
+		let mut quotes = Vec::with_capacity(keys.len());
 		for key in keys {
-			let data = self
-				.store
-				.read(CASHU_PRIMARY_KEY, MELT_QUOTES_KEY, &key)
+			let data = KVStore::read(self.store.as_ref(), CASHU_PRIMARY_KEY, MELT_QUOTES_KEY, &key)
+				.await
 				.map_err(DatabaseError::Io)?;
 
 			if !data.is_empty() {
@@ -600,8 +643,8 @@ impl WalletDatabase for CashuKvDatabase {
 	}
 
 	async fn remove_melt_quote(&self, quote_id: &str) -> Result<(), Self::Err> {
-		self.store
-			.write(CASHU_PRIMARY_KEY, MELT_QUOTES_KEY, quote_id, &[])
+		KVStore::remove(self.store.as_ref(), CASHU_PRIMARY_KEY, MELT_QUOTES_KEY, quote_id, false)
+			.await
 			.map_err(DatabaseError::Io)?;
 
 		Ok(())
@@ -618,7 +661,9 @@ impl WalletDatabase for CashuKvDatabase {
 		let data =
 			serde_json::to_vec(&keyset).map_err(|e| DatabaseError::Serialization(e.to_string()))?;
 
-		self.store.write(CASHU_PRIMARY_KEY, KEYS_KEY, &key, &data).map_err(DatabaseError::Io)?;
+		KVStore::write(self.store.as_ref(), CASHU_PRIMARY_KEY, KEYS_KEY, &key, data)
+			.await
+			.map_err(DatabaseError::Io)?;
 
 		Ok(())
 	}
@@ -626,7 +671,7 @@ impl WalletDatabase for CashuKvDatabase {
 	async fn get_keys(&self, id: &Id) -> Result<Option<Keys>, Self::Err> {
 		let key = id.to_string();
 
-		match self.store.read(CASHU_PRIMARY_KEY, KEYS_KEY, &key) {
+		match KVStore::read(self.store.as_ref(), CASHU_PRIMARY_KEY, KEYS_KEY, &key).await {
 			Ok(data) => {
 				if data.is_empty() {
 					return Ok(None);
@@ -643,7 +688,9 @@ impl WalletDatabase for CashuKvDatabase {
 	async fn remove_keys(&self, id: &Id) -> Result<(), Self::Err> {
 		let key = id.to_string();
 
-		self.store.write(CASHU_PRIMARY_KEY, KEYS_KEY, &key, &[]).map_err(DatabaseError::Io)?;
+		KVStore::remove(self.store.as_ref(), CASHU_PRIMARY_KEY, KEYS_KEY, &key, false)
+			.await
+			.map_err(DatabaseError::Io)?;
 
 		Ok(())
 	}
@@ -657,8 +704,8 @@ impl WalletDatabase for CashuKvDatabase {
 			let data = serde_json::to_vec(proof)
 				.map_err(|e| DatabaseError::Serialization(e.to_string()))?;
 
-			self.store
-				.write(CASHU_PRIMARY_KEY, PROOFS_KEY, &key, &data)
+			KVStore::write(self.store.as_ref(), CASHU_PRIMARY_KEY, PROOFS_KEY, &key, data)
+				.await
 				.map_err(DatabaseError::Io)?;
 		}
 
@@ -666,8 +713,8 @@ impl WalletDatabase for CashuKvDatabase {
 		for y in &removed_ys {
 			let key = format!("proof_{}", hex::encode(y.serialize()));
 
-			self.store
-				.write(CASHU_PRIMARY_KEY, PROOFS_KEY, &key, &[])
+			KVStore::remove(self.store.as_ref(), CASHU_PRIMARY_KEY, PROOFS_KEY, &key, false)
+				.await
 				.map_err(DatabaseError::Io)?;
 		}
 
@@ -718,13 +765,20 @@ impl WalletDatabase for CashuKvDatabase {
 		Ok(filtered_proofs)
 	}
 
+	async fn get_balance(
+		&self, mint_url: Option<MintUrl>, unit: Option<CurrencyUnit>, state: Option<Vec<State>>,
+	) -> Result<u64, Self::Err> {
+		let proofs = self.get_proofs(mint_url, unit, state, None).await?;
+		Ok(proofs.iter().map(|p| u64::from(p.proof.amount)).sum())
+	}
+
 	async fn update_proofs_state(&self, ys: Vec<PublicKey>, state: State) -> Result<(), Self::Err> {
 		// Update proofs in storage and cache
 		for y in &ys {
 			let key = format!("proof_{}", hex::encode(y.serialize()));
 
 			// Read existing proof
-			match self.store.read(CASHU_PRIMARY_KEY, PROOFS_KEY, &key) {
+			match KVStore::read(self.store.as_ref(), CASHU_PRIMARY_KEY, PROOFS_KEY, &key).await {
 				Ok(data) if !data.is_empty() => {
 					let mut proof: ProofInfo = serde_json::from_slice(&data)
 						.map_err(|e| DatabaseError::Serialization(e.to_string()))?;
@@ -736,9 +790,15 @@ impl WalletDatabase for CashuKvDatabase {
 					let updated_data = serde_json::to_vec(&proof)
 						.map_err(|e| DatabaseError::Serialization(e.to_string()))?;
 
-					self.store
-						.write(CASHU_PRIMARY_KEY, PROOFS_KEY, &key, &updated_data)
-						.map_err(DatabaseError::Io)?;
+					KVStore::write(
+						self.store.as_ref(),
+						CASHU_PRIMARY_KEY,
+						PROOFS_KEY,
+						&key,
+						updated_data,
+					)
+					.await
+					.map_err(DatabaseError::Io)?;
 				},
 				_ => continue, // Proof not found, skip
 			}
@@ -761,11 +821,14 @@ impl WalletDatabase for CashuKvDatabase {
 		let key = keyset_id.to_string();
 
 		// Read current counter
-		let current_count = match self.store.read(CASHU_PRIMARY_KEY, KEYSET_COUNTERS_KEY, &key) {
-			Ok(data) if !data.is_empty() => serde_json::from_slice::<u32>(&data)
-				.map_err(|e| DatabaseError::Serialization(e.to_string()))?,
-			_ => 0, // Default to 0 if not found
-		};
+		let current_count =
+			match KVStore::read(self.store.as_ref(), CASHU_PRIMARY_KEY, KEYSET_COUNTERS_KEY, &key)
+				.await
+			{
+				Ok(data) if !data.is_empty() => serde_json::from_slice::<u32>(&data)
+					.map_err(|e| DatabaseError::Serialization(e.to_string()))?,
+				_ => 0, // Default to 0 if not found
+			};
 
 		let new_count = current_count + count;
 
@@ -773,8 +836,8 @@ impl WalletDatabase for CashuKvDatabase {
 		let data = serde_json::to_vec(&new_count)
 			.map_err(|e| DatabaseError::Serialization(e.to_string()))?;
 
-		self.store
-			.write(CASHU_PRIMARY_KEY, KEYSET_COUNTERS_KEY, &key, &data)
+		KVStore::write(self.store.as_ref(), CASHU_PRIMARY_KEY, KEYSET_COUNTERS_KEY, &key, data)
+			.await
 			.map_err(DatabaseError::Io)?;
 
 		Ok(new_count)
@@ -785,8 +848,8 @@ impl WalletDatabase for CashuKvDatabase {
 		let data = serde_json::to_vec(&transaction)
 			.map_err(|e| DatabaseError::Serialization(e.to_string()))?;
 
-		self.store
-			.write(CASHU_PRIMARY_KEY, TRANSACTIONS_KEY, &key, &data)
+		KVStore::write(self.store.as_ref(), CASHU_PRIMARY_KEY, TRANSACTIONS_KEY, &key, data)
+			.await
 			.map_err(DatabaseError::Io)?;
 
 		Ok(())
@@ -797,7 +860,7 @@ impl WalletDatabase for CashuKvDatabase {
 	) -> Result<Option<Transaction>, Self::Err> {
 		let key = transaction_id.to_string();
 
-		match self.store.read(CASHU_PRIMARY_KEY, TRANSACTIONS_KEY, &key) {
+		match KVStore::read(self.store.as_ref(), CASHU_PRIMARY_KEY, TRANSACTIONS_KEY, &key).await {
 			Ok(data) => {
 				if data.is_empty() {
 					return Ok(None);
@@ -815,15 +878,16 @@ impl WalletDatabase for CashuKvDatabase {
 		&self, mint_url: Option<MintUrl>, direction: Option<TransactionDirection>,
 		unit: Option<CurrencyUnit>,
 	) -> Result<Vec<Transaction>, Self::Err> {
-		let keys =
-			self.store.list(CASHU_PRIMARY_KEY, TRANSACTIONS_KEY).map_err(DatabaseError::Io)?;
+		let keys = KVStore::list(self.store.as_ref(), CASHU_PRIMARY_KEY, TRANSACTIONS_KEY)
+			.await
+			.map_err(DatabaseError::Io)?;
 
-		let mut transactions = Vec::new();
+		let mut transactions = Vec::with_capacity(keys.len());
 		for key in keys {
-			let data = self
-				.store
-				.read(CASHU_PRIMARY_KEY, TRANSACTIONS_KEY, &key)
-				.map_err(DatabaseError::Io)?;
+			let data =
+				KVStore::read(self.store.as_ref(), CASHU_PRIMARY_KEY, TRANSACTIONS_KEY, &key)
+					.await
+					.map_err(DatabaseError::Io)?;
 
 			if !data.is_empty() {
 				let transaction: Transaction = serde_json::from_slice(&data)
@@ -862,18 +926,16 @@ impl WalletDatabase for CashuKvDatabase {
 	async fn remove_transaction(&self, transaction_id: TransactionId) -> Result<(), Self::Err> {
 		let key = transaction_id.to_string();
 
-		self.store
-			.write(CASHU_PRIMARY_KEY, TRANSACTIONS_KEY, &key, &[])
+		KVStore::remove(self.store.as_ref(), CASHU_PRIMARY_KEY, TRANSACTIONS_KEY, &key, false)
+			.await
 			.map_err(DatabaseError::Io)?;
 
 		Ok(())
 	}
 }
 
-pub(super) fn read_has_recovered(
-	store: &Arc<dyn KVStore + Send + Sync>,
-) -> Result<bool, TrustedError> {
-	match store.read(CASHU_PRIMARY_KEY, "", HAS_RECOVERED_KEY) {
+pub(super) async fn read_has_recovered(store: &Arc<DynStore>) -> Result<bool, TrustedError> {
+	match KVStore::read(store.as_ref(), CASHU_PRIMARY_KEY, "", HAS_RECOVERED_KEY).await {
 		Ok(data) => {
 			if data.is_empty() {
 				return Ok(false);
@@ -885,10 +947,12 @@ pub(super) fn read_has_recovered(
 	}
 }
 
-pub(super) fn write_has_recovered(
-	store: &Arc<dyn KVStore + Send + Sync>, has_recovered: bool,
+pub(super) async fn write_has_recovered(
+	store: &Arc<DynStore>, has_recovered: bool,
 ) -> Result<(), TrustedError> {
 	let data = vec![if has_recovered { 1 } else { 0 }];
 
-	store.write(CASHU_PRIMARY_KEY, "", HAS_RECOVERED_KEY, &data).map_err(TrustedError::IOError)
+	KVStore::write(store.as_ref(), CASHU_PRIMARY_KEY, "", HAS_RECOVERED_KEY, data)
+		.await
+		.map_err(TrustedError::IOError)
 }

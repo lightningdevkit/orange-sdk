@@ -2,15 +2,16 @@
 
 use crate::bitcoin::hex::DisplayHex;
 use crate::logging::Logger;
+use crate::runtime::Runtime;
 use crate::store::{PaymentId, TxMetadataStore, TxStatus};
 use crate::trusted_wallet::{Payment, TrustedError, TrustedWalletInterface};
 use crate::{Event, EventQueue, InitFailure, Seed, WalletConfig};
 
+use ldk_node::DynStore;
 use ldk_node::bitcoin::hashes::Hash;
 use ldk_node::bitcoin::hashes::sha256::Hash as Sha256;
 use ldk_node::bitcoin::hex::FromHex;
 use ldk_node::lightning::util::logger::Logger as _;
-use ldk_node::lightning::util::persist::KVStore;
 use ldk_node::lightning::{log_error, log_info};
 use ldk_node::lightning_invoice::Bolt11Invoice;
 use ldk_node::lightning_types::payment::{PaymentHash, PaymentPreimage};
@@ -37,7 +38,6 @@ use std::pin::Pin;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::runtime::Runtime;
 
 /// Cashu KV store implementation
 pub mod cashu_store;
@@ -298,7 +298,7 @@ impl TrustedWalletInterface for Cashu {
 			let tx_metadata = self.tx_metadata.clone();
 			let quote_id = quote.id.clone();
 			let payment_success_sender = self.payment_success_sender.clone();
-			self.runtime.spawn(async move {
+			self.runtime.spawn_background_task(async move {
 				let mut metadata = HashMap::new();
 				if let Some(hash) = &payment_hash {
 					metadata.insert(PAYMENT_HASH_METADATA_KEY.to_string(), hash.to_string());
@@ -377,12 +377,14 @@ impl TrustedWalletInterface for Cashu {
 								}
 
 								let fee_paid_sat: u64 = res.fee_paid.into();
-								let _ = event_queue.add_event(Event::PaymentSuccessful {
-									payment_id,
-									payment_hash: hash,
-									payment_preimage,
-									fee_paid_msat: Some(fee_paid_sat * 1_000), // convert to msats
-								});
+								let _ = event_queue
+									.add_event(Event::PaymentSuccessful {
+										payment_id,
+										payment_hash: hash,
+										payment_preimage,
+										fee_paid_msat: Some(fee_paid_sat * 1_000), // convert to msats
+									})
+									.await;
 
 								payment_success_sender.send(()).unwrap();
 							},
@@ -395,11 +397,13 @@ impl TrustedWalletInterface for Cashu {
 								};
 
 								if !is_rebalance {
-									let _ = event_queue.add_event(Event::PaymentFailed {
-										payment_id,
-										payment_hash,
-										reason: None,
-									});
+									let _ = event_queue
+										.add_event(Event::PaymentFailed {
+											payment_id,
+											payment_hash,
+											reason: None,
+										})
+										.await;
 								}
 							},
 							state => {
@@ -420,11 +424,13 @@ impl TrustedWalletInterface for Cashu {
 						};
 
 						if !is_rebalance {
-							let _ = event_queue.add_event(Event::PaymentFailed {
-								payment_id,
-								payment_hash,
-								reason: None,
-							});
+							let _ = event_queue
+								.add_event(Event::PaymentFailed {
+									payment_id,
+									payment_hash,
+									reason: None,
+								})
+								.await;
 						}
 					},
 				}
@@ -475,7 +481,7 @@ const PAYMENT_HASH_METADATA_KEY: &str = "payment_hash";
 
 impl Cashu {
 	pub(crate) async fn init(
-		config: &WalletConfig, cashu_config: CashuConfig, store: Arc<dyn KVStore + Sync + Send>,
+		config: &WalletConfig, cashu_config: CashuConfig, store: Arc<DynStore>,
 		event_queue: Arc<EventQueue>, tx_metadata: TxMetadataStore, logger: Arc<Logger>,
 		runtime: Arc<Runtime>,
 	) -> Result<Self, InitFailure> {
@@ -505,7 +511,7 @@ impl Cashu {
 			},
 		};
 
-		let db = Arc::new(CashuKvDatabase::new(Arc::clone(&store)).map_err(|e| {
+		let db = Arc::new(CashuKvDatabase::new(Arc::clone(&store)).await.map_err(|e| {
 			InitFailure::TrustedFailure(TrustedError::Other(format!(
 				"Failed to create Cashu database: {e}"
 			)))
@@ -542,7 +548,7 @@ impl Cashu {
 		let logger_for_monitoring = Arc::clone(&logger);
 		let eq_for_monitoring = Arc::clone(&event_queue);
 		let rt_for_monitoring = Arc::clone(&runtime);
-		runtime.spawn(async move {
+		runtime.spawn_cancellable_background_task(async move {
 			loop {
 				tokio::select! {
 					_ = shutdown_receiver.changed() => {
@@ -556,7 +562,7 @@ impl Cashu {
 						let wallet = Arc::clone(&wallet_for_monitoring);
 						let event_queue = Arc::clone(&eq_for_monitoring);
 						let logger = Arc::clone(&logger_for_monitoring);
-						rt_for_monitoring.spawn(async move {
+						rt_for_monitoring.spawn_cancellable_background_task(async move {
 							if let Err(e) = Self::monitor_mint_quote(wallet, event_queue, &logger, mint_quote).await {
 								log_error!(logger, "Failed to monitor mint quote: {e:?}");
 							}
@@ -579,18 +585,18 @@ impl Cashu {
 		}
 
 		// spawn background task to recover funds if first time initializing
-		let has_recovered = read_has_recovered(&store)?;
+		let has_recovered = read_has_recovered(&store).await?;
 		if !has_recovered {
 			let w = Arc::clone(&cashu_wallet);
 			let l = Arc::clone(&logger);
-			runtime.spawn(async move {
+			runtime.spawn_background_task(async move {
 				match w.restore().await {
 					Err(e) => log_error!(l, "Failed to restore cashu mint: {e}"),
 					Ok(amt) => {
 						if amt > cdk::Amount::ZERO {
 							log_info!(l, "Restored cashu mint: {}, amt: {amt}", w.mint_url);
 						}
-						if let Err(e) = write_has_recovered(&store, true) {
+						if let Err(e) = write_has_recovered(&store, true).await {
 							log_error!(l, "Failed to write has_recovered flag: {e:?}");
 						}
 					},
@@ -688,6 +694,7 @@ impl Cashu {
 					custom_records: vec![],
 					lsp_fee_msats: None,
 				})
+				.await
 				.map_err(|e| TrustedError::Other(format!("Failed to add event: {e}")))?;
 
 			log_info!(logger, "Sent PaymentReceived event for mint quote: {}", mint_quote.id);

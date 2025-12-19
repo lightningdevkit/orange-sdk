@@ -11,12 +11,12 @@ use ldk_node::lightning::util::ser::{Writeable, Writer};
 use ldk_node::lightning::{impl_writeable_tlv_based_enum, log_debug, log_error, log_warn};
 use ldk_node::lightning_types::payment::{PaymentHash, PaymentPreimage};
 use ldk_node::payment::{ConfirmationStatus, PaymentKind};
-use ldk_node::{CustomTlvRecord, UserChannelId};
+use ldk_node::{CustomTlvRecord, DynStore, UserChannelId};
 
 use std::collections::VecDeque;
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::Arc;
 use std::task::{Poll, Waker};
-use tokio::sync::watch;
+use tokio::sync::{Mutex, watch};
 
 /// The event queue will be persisted under this key.
 pub(crate) const EVENT_QUEUE_PERSISTENCE_PRIMARY_NAMESPACE: &str = "";
@@ -131,6 +131,17 @@ pub enum Event {
 		/// The fee paid, in msats, for the rebalance payment.
 		fee_msat: u64,
 	},
+	/// We have initiated a splice and are waiting for it to confirm.
+	SplicePending {
+		/// The `channel_id` of the channel.
+		channel_id: ChannelId,
+		/// The `user_channel_id` of the channel.
+		user_channel_id: UserChannelId,
+		/// The `node_id` of the channel counterparty.
+		counterparty_node_id: PublicKey,
+		/// The outpoint of the channel's splice funding transaction.
+		new_funding_txo: OutPoint,
+	},
 }
 
 impl_writeable_tlv_based_enum!(Event,
@@ -182,6 +193,12 @@ impl_writeable_tlv_based_enum!(Event,
 		(6, amount_msat, required),
 		(8, fee_msat, required),
 	},
+	(8, SplicePending) => {
+		(1, channel_id, required),
+		(3, counterparty_node_id, required),
+		(5, user_channel_id, required),
+		(7, new_funding_txo, required),
+	},
 );
 
 /// A queue for events emitted by the [`Wallet`].
@@ -190,36 +207,34 @@ impl_writeable_tlv_based_enum!(Event,
 pub struct EventQueue {
 	queue: Arc<Mutex<VecDeque<Event>>>,
 	waker: Arc<Mutex<Option<Waker>>>,
-	notifier: Condvar,
-	kv_store: Arc<dyn KVStore + Send + Sync>,
+	kv_store: Arc<DynStore>,
 	logger: Arc<Logger>,
 }
 
 impl EventQueue {
-	pub(crate) fn new(kv_store: Arc<dyn KVStore + Send + Sync>, logger: Arc<Logger>) -> Self {
+	pub(crate) fn new(kv_store: Arc<DynStore>, logger: Arc<Logger>) -> Self {
 		let queue = Arc::new(Mutex::new(VecDeque::new()));
 		let waker = Arc::new(Mutex::new(None));
-		let notifier = Condvar::new();
-		Self { queue, waker, notifier, kv_store, logger }
+		Self { queue, waker, kv_store, logger }
 	}
 
-	pub(crate) fn add_event(&self, event: Event) -> Result<(), ldk_node::lightning::io::Error> {
+	pub(crate) async fn add_event(
+		&self, event: Event,
+	) -> Result<(), ldk_node::lightning::io::Error> {
 		{
-			let mut locked_queue = self.queue.lock().unwrap();
+			let mut locked_queue = self.queue.lock().await;
 			locked_queue.push_back(event);
-			self.persist_queue(&locked_queue)?;
+			self.persist_queue(&locked_queue).await?;
 		}
 
-		self.notifier.notify_one();
-
-		if let Some(waker) = self.waker.lock().unwrap().take() {
+		if let Some(waker) = self.waker.lock().await.take() {
 			waker.wake();
 		}
 		Ok(())
 	}
 
-	pub(crate) fn next_event(&self) -> Option<Event> {
-		let locked_queue = self.queue.lock().unwrap();
+	pub(crate) async fn next_event(&self) -> Option<Event> {
+		let locked_queue = self.queue.lock().await;
 		locked_queue.front().cloned()
 	}
 
@@ -227,48 +242,42 @@ impl EventQueue {
 		EventFuture { event_queue: Arc::clone(&self.queue), waker: Arc::clone(&self.waker) }.await
 	}
 
-	pub(crate) fn wait_next_event(&self) -> Event {
-		let locked_queue =
-			self.notifier.wait_while(self.queue.lock().unwrap(), |queue| queue.is_empty()).unwrap();
-		locked_queue.front().unwrap().clone()
-	}
-
-	pub(crate) fn event_handled(&self) -> Result<(), ldk_node::lightning::io::Error> {
+	pub(crate) async fn event_handled(&self) -> Result<(), ldk_node::lightning::io::Error> {
 		{
-			let mut locked_queue = self.queue.lock().unwrap();
+			let mut locked_queue = self.queue.lock().await;
 			locked_queue.pop_front();
-			self.persist_queue(&locked_queue)?;
+			self.persist_queue(&locked_queue).await?;
 		}
-		self.notifier.notify_one();
 
-		if let Some(waker) = self.waker.lock().unwrap().take() {
+		if let Some(waker) = self.waker.lock().await.take() {
 			waker.wake();
 		}
 		Ok(())
 	}
 
-	fn persist_queue(
+	async fn persist_queue(
 		&self, locked_queue: &VecDeque<Event>,
 	) -> Result<(), ldk_node::lightning::io::Error> {
 		let data = EventQueueSerWrapper(locked_queue).encode();
-		self.kv_store
-			.write(
+		KVStore::write(
+			self.kv_store.as_ref(),
+			EVENT_QUEUE_PERSISTENCE_PRIMARY_NAMESPACE,
+			EVENT_QUEUE_PERSISTENCE_SECONDARY_NAMESPACE,
+			EVENT_QUEUE_PERSISTENCE_KEY,
+			data,
+		)
+		.await
+		.map_err(|e| {
+			log_error!(
+				self.logger.as_ref(),
+				"Write for key {}/{}/{} failed due to: {}",
 				EVENT_QUEUE_PERSISTENCE_PRIMARY_NAMESPACE,
 				EVENT_QUEUE_PERSISTENCE_SECONDARY_NAMESPACE,
 				EVENT_QUEUE_PERSISTENCE_KEY,
-				&data,
-			)
-			.map_err(|e| {
-				log_error!(
-					self.logger.as_ref(),
-					"Write for key {}/{}/{} failed due to: {}",
-					EVENT_QUEUE_PERSISTENCE_PRIMARY_NAMESPACE,
-					EVENT_QUEUE_PERSISTENCE_SECONDARY_NAMESPACE,
-					EVENT_QUEUE_PERSISTENCE_KEY,
-					e
-				);
 				e
-			})?;
+			);
+			e
+		})?;
 		Ok(())
 	}
 }
@@ -296,10 +305,12 @@ impl Future for EventFuture {
 	fn poll(
 		self: core::pin::Pin<&mut Self>, cx: &mut core::task::Context<'_>,
 	) -> Poll<Self::Output> {
-		if let Some(event) = self.event_queue.lock().unwrap().front() {
-			Poll::Ready(event.clone())
+		if let Some(event) = self.event_queue.try_lock().ok().and_then(|q| q.front().cloned()) {
+			Poll::Ready(event)
 		} else {
-			*self.waker.lock().unwrap() = Some(cx.waker().clone());
+			if let Ok(mut waker) = self.waker.try_lock() {
+				*waker = Some(cx.waker().clone());
+			}
 			Poll::Pending
 		}
 	}
@@ -312,11 +323,12 @@ pub(crate) struct LdkEventHandler {
 	pub(crate) tx_metadata: store::TxMetadataStore,
 	pub(crate) payment_receipt_sender: watch::Sender<()>,
 	pub(crate) channel_pending_sender: watch::Sender<u128>,
+	pub(crate) splice_pending_sender: watch::Sender<u128>,
 	pub(crate) logger: Arc<Logger>,
 }
 
 impl LdkEventHandler {
-	pub(crate) fn handle_ldk_node_event(&self, event: ldk_node::Event) {
+	pub(crate) async fn handle_ldk_node_event(&self, event: ldk_node::Event) {
 		match event {
 			ldk_node::Event::PaymentSuccessful {
 				payment_id,
@@ -331,22 +343,30 @@ impl LdkEventHandler {
 					log_error!(self.logger, "Failed to set preimage for payment {payment_id:?}");
 				}
 
-				if let Err(e) = self.event_queue.add_event(Event::PaymentSuccessful {
-					payment_id,
-					payment_hash,
-					payment_preimage: preimage,
-					fee_paid_msat,
-				}) {
+				if let Err(e) = self
+					.event_queue
+					.add_event(Event::PaymentSuccessful {
+						payment_id,
+						payment_hash,
+						payment_preimage: preimage,
+						fee_paid_msat,
+					})
+					.await
+				{
 					log_error!(self.logger, "Failed to add PaymentSuccessful event: {e:?}");
 					return;
 				}
 			},
 			ldk_node::Event::PaymentFailed { payment_id, payment_hash, reason } => {
-				if let Err(e) = self.event_queue.add_event(Event::PaymentFailed {
-					payment_id: PaymentId::SelfCustodial(payment_id.unwrap().0), // safe
-					payment_hash,
-					reason,
-				}) {
+				if let Err(e) = self
+					.event_queue
+					.add_event(Event::PaymentFailed {
+						payment_id: PaymentId::SelfCustodial(payment_id.unwrap().0), // safe
+						payment_hash,
+						reason,
+					})
+					.await
+				{
 					log_error!(self.logger, "Failed to add PaymentFailed event: {e:?}");
 					return;
 				}
@@ -366,13 +386,17 @@ impl LdkEventHandler {
 					}
 				});
 
-				if let Err(e) = self.event_queue.add_event(Event::PaymentReceived {
-					payment_id: PaymentId::SelfCustodial(payment_id.0),
-					payment_hash,
-					amount_msat,
-					custom_records,
-					lsp_fee_msats,
-				}) {
+				if let Err(e) = self
+					.event_queue
+					.add_event(Event::PaymentReceived {
+						payment_id: PaymentId::SelfCustodial(payment_id.0),
+						payment_hash,
+						amount_msat,
+						custom_records,
+						lsp_fee_msats,
+					})
+					.await
+				{
 					log_error!(self.logger, "Failed to add PaymentReceived event: {e:?}");
 				}
 				let _ = self.payment_receipt_sender.send(());
@@ -387,21 +411,24 @@ impl LdkEventHandler {
 			ldk_node::Event::ChannelPending { .. } => {
 				log_debug!(self.logger, "Received ChannelPending event");
 			},
-			ldk_node::Event::ChannelReady { channel_id, user_channel_id, counterparty_node_id } => {
-				let funding_txo = self
-					.ldk_node
-					.list_channels()
-					.iter()
-					.find(|c| c.user_channel_id == user_channel_id)
-					.and_then(|c| c.funding_txo)
-					.unwrap();
+			ldk_node::Event::ChannelReady {
+				channel_id,
+				user_channel_id,
+				counterparty_node_id,
+				funding_txo,
+			} => {
+				let funding_txo = funding_txo.unwrap(); // safe
 
-				if let Err(e) = self.event_queue.add_event(Event::ChannelOpened {
-					channel_id,
-					user_channel_id,
-					counterparty_node_id: counterparty_node_id.unwrap(), // safe
-					funding_txo,
-				}) {
+				if let Err(e) = self
+					.event_queue
+					.add_event(Event::ChannelOpened {
+						channel_id,
+						user_channel_id,
+						counterparty_node_id: counterparty_node_id.unwrap(), // safe
+						funding_txo,
+					})
+					.await
+				{
 					log_error!(self.logger, "Failed to add ChannelOpened event: {e:?}");
 					return;
 				}
@@ -417,15 +444,45 @@ impl LdkEventHandler {
 				// try to reopen the channel.
 				store::set_rebalance_enabled(self.event_queue.kv_store.as_ref(), false);
 
-				if let Err(e) = self.event_queue.add_event(Event::ChannelClosed {
-					channel_id,
-					user_channel_id,
-					counterparty_node_id: counterparty_node_id.unwrap(), // safe
-					reason,
-				}) {
+				if let Err(e) = self
+					.event_queue
+					.add_event(Event::ChannelClosed {
+						channel_id,
+						user_channel_id,
+						counterparty_node_id: counterparty_node_id.unwrap(), // safe
+						reason,
+					})
+					.await
+				{
 					log_error!(self.logger, "Failed to add ChannelClosed event: {e:?}");
 					return;
 				}
+			},
+			ldk_node::Event::SplicePending {
+				channel_id,
+				user_channel_id,
+				counterparty_node_id,
+				new_funding_txo,
+			} => {
+				log_debug!(self.logger, "Received SplicePending event {event:?}");
+				let _ = self.splice_pending_sender.send(user_channel_id.0);
+
+				if let Err(e) = self
+					.event_queue
+					.add_event(Event::SplicePending {
+						channel_id,
+						user_channel_id,
+						counterparty_node_id,
+						new_funding_txo,
+					})
+					.await
+				{
+					log_error!(self.logger, "Failed to add SplicePending event: {e:?}");
+					return;
+				}
+			},
+			ldk_node::Event::SpliceFailed { .. } => {
+				log_warn!(self.logger, "Received SpliceFailed event: {event:?}");
 			},
 		}
 

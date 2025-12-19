@@ -13,14 +13,16 @@
 
 use bitcoin_payment_instructions::amount::Amount;
 
+use ldk_node::DynStore;
 use ldk_node::bitcoin::Txid;
 use ldk_node::bitcoin::hex::{DisplayHex, FromHex};
 use ldk_node::lightning::io;
 use ldk_node::lightning::ln::msgs::DecodeError;
 use ldk_node::lightning::types::payment::PaymentPreimage;
-use ldk_node::lightning::util::persist::KVStore;
+use ldk_node::lightning::util::persist::{KVStore, KVStoreSync};
 use ldk_node::lightning::util::ser::{Readable, Writeable, Writer};
 use ldk_node::lightning::{impl_writeable_tlv_based, impl_writeable_tlv_based_enum};
+use ldk_node::payment::PaymentDetails;
 
 use std::collections::HashMap;
 use std::fmt;
@@ -30,6 +32,7 @@ use std::time::Duration;
 
 const STORE_PRIMARY_KEY: &str = "orange_sdk";
 const STORE_SECONDARY_KEY: &str = "payment_store";
+const SPLICE_OUT_SECONDARY_KEY: &str = "splice_out";
 
 /// The status of a transaction. This is used to track the state of a transaction
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -292,19 +295,20 @@ impl_writeable_tlv_based!(TxMetadata, { (0, ty, required), (2, time, required) }
 #[derive(Clone)]
 pub(crate) struct TxMetadataStore {
 	tx_metadata: Arc<RwLock<HashMap<PaymentId, TxMetadata>>>,
-	store: Arc<dyn KVStore + Send + Sync>,
+	store: Arc<DynStore>,
 }
 
 impl TxMetadataStore {
-	pub fn new(store: Arc<dyn KVStore + Send + Sync>) -> TxMetadataStore {
-		let keys = store
-			.list(STORE_PRIMARY_KEY, STORE_SECONDARY_KEY)
+	pub async fn new(store: Arc<DynStore>) -> TxMetadataStore {
+		let keys = KVStore::list(store.as_ref(), STORE_PRIMARY_KEY, STORE_SECONDARY_KEY)
+			.await
 			.expect("We do not allow reads to fail");
 		let mut tx_metadata = HashMap::with_capacity(keys.len());
 		for key in keys {
-			let data_bytes = store
-				.read(STORE_PRIMARY_KEY, STORE_SECONDARY_KEY, &key)
-				.expect("We do not allow reads to fail");
+			let data_bytes =
+				KVStore::read(store.as_ref(), STORE_PRIMARY_KEY, STORE_SECONDARY_KEY, &key)
+					.await
+					.expect("We do not allow reads to fail");
 			let key =
 				PaymentId::from_str(&key).expect("Invalid key in transaction metadata storage");
 			let data = Readable::read(&mut &data_bytes[..])
@@ -323,9 +327,14 @@ impl TxMetadataStore {
 		let key_str = key.to_string();
 		let ser = value.encode();
 		let old = tx_metadata.insert(key, value);
-		self.store
-			.write(STORE_PRIMARY_KEY, STORE_SECONDARY_KEY, &key_str, &ser)
-			.expect("We do not allow writes to fail");
+		KVStoreSync::write(
+			self.store.as_ref(),
+			STORE_PRIMARY_KEY,
+			STORE_SECONDARY_KEY,
+			&key_str,
+			ser,
+		)
+		.expect("We do not allow writes to fail");
 		old.is_some()
 	}
 
@@ -345,9 +354,14 @@ impl TxMetadataStore {
 				metadata.ty = TxType::PaymentTriggeringTransferLightning { ty: *ty };
 				let key_str = payment_id.to_string();
 				let ser = metadata.encode();
-				self.store
-					.write(STORE_PRIMARY_KEY, STORE_SECONDARY_KEY, &key_str, &ser)
-					.expect("We do not allow writes to fail");
+				KVStoreSync::write(
+					self.store.as_ref(),
+					STORE_PRIMARY_KEY,
+					STORE_SECONDARY_KEY,
+					&key_str,
+					ser,
+				)
+				.expect("We do not allow writes to fail");
 				Ok(())
 			} else {
 				eprintln!("payment_id {payment_id} is not a payment, cannot set rebalance");
@@ -377,14 +391,14 @@ impl TxMetadataStore {
 								},
 							};
 
-							self.store
-								.write(
-									STORE_PRIMARY_KEY,
-									STORE_SECONDARY_KEY,
-									&payment_id.to_string(),
-									&metadata.encode(),
-								)
-								.expect("We do not allow writes to fail");
+							KVStoreSync::write(
+								self.store.as_ref(),
+								STORE_PRIMARY_KEY,
+								STORE_SECONDARY_KEY,
+								&payment_id.to_string(),
+								metadata.encode(),
+							)
+							.expect("We do not allow writes to fail");
 							Ok(())
 						}
 					},
@@ -398,14 +412,14 @@ impl TxMetadataStore {
 								},
 							};
 
-							self.store
-								.write(
-									STORE_PRIMARY_KEY,
-									STORE_SECONDARY_KEY,
-									&payment_id.to_string(),
-									&metadata.encode(),
-								)
-								.expect("We do not allow writes to fail");
+							KVStoreSync::write(
+								self.store.as_ref(),
+								STORE_PRIMARY_KEY,
+								STORE_SECONDARY_KEY,
+								&payment_id.to_string(),
+								metadata.encode(),
+							)
+							.expect("We do not allow writes to fail");
 							Ok(())
 						}
 					},
@@ -431,8 +445,8 @@ impl TxMetadataStore {
 
 const REBALANCE_ENABLED_KEY: &str = "rebalance_enabled";
 
-pub(crate) fn get_rebalance_enabled(store: &dyn KVStore) -> bool {
-	match store.read(STORE_PRIMARY_KEY, "", REBALANCE_ENABLED_KEY) {
+pub(crate) fn get_rebalance_enabled(store: &DynStore) -> bool {
+	match KVStoreSync::read(store, STORE_PRIMARY_KEY, "", REBALANCE_ENABLED_KEY) {
 		Ok(bytes) => Readable::read(&mut &bytes[..]).expect("Invalid data in rebalance_enabled"),
 		Err(e) if e.kind() == io::ErrorKind::NotFound => {
 			// if rebalance_enabled is not found, default to true
@@ -447,11 +461,36 @@ pub(crate) fn get_rebalance_enabled(store: &dyn KVStore) -> bool {
 	}
 }
 
-pub(crate) fn set_rebalance_enabled(store: &dyn KVStore, enabled: bool) {
+pub(crate) fn set_rebalance_enabled(store: &DynStore, enabled: bool) {
 	let bytes = enabled.encode();
-	store
-		.write(STORE_PRIMARY_KEY, "", REBALANCE_ENABLED_KEY, &bytes)
+	KVStoreSync::write(store, STORE_PRIMARY_KEY, "", REBALANCE_ENABLED_KEY, bytes)
 		.expect("Failed to write rebalance_enabled");
+}
+
+pub(crate) fn write_splice_out(store: &DynStore, details: &PaymentDetails) {
+	KVStoreSync::write(
+		store,
+		STORE_PRIMARY_KEY,
+		SPLICE_OUT_SECONDARY_KEY,
+		&details.id.0.to_lower_hex_string(),
+		details.encode(),
+	)
+	.expect("Failed to write splice out txid");
+}
+
+pub(crate) fn read_splice_outs(store: &DynStore) -> Vec<PaymentDetails> {
+	let keys = KVStoreSync::list(store, STORE_PRIMARY_KEY, SPLICE_OUT_SECONDARY_KEY)
+		.expect("We do not allow reads to fail");
+	let mut splice_outs = Vec::with_capacity(keys.len());
+	for key in keys {
+		let data_bytes =
+			KVStoreSync::read(store, STORE_PRIMARY_KEY, SPLICE_OUT_SECONDARY_KEY, &key)
+				.expect("We do not allow reads to fail");
+		let data =
+			Readable::read(&mut &data_bytes[..]).expect("Invalid data in splice out storage");
+		splice_outs.push(data);
+	}
+	splice_outs
 }
 
 #[cfg(test)]

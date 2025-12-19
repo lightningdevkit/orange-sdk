@@ -1,8 +1,10 @@
 use crate::bitcoin::OutPoint;
+use crate::bitcoin::hashes::Hash;
 use crate::event::{EventQueue, LdkEventHandler};
 use crate::logging::Logger;
+use crate::runtime::Runtime;
 use crate::store::{TxMetadataStore, TxStatus};
-use crate::{ChainSource, InitFailure, PaymentType, Seed, WalletConfig};
+use crate::{ChainSource, InitFailure, PaymentType, Seed, WalletConfig, store};
 
 use bitcoin_payment_instructions::PaymentMethod;
 use bitcoin_payment_instructions::amount::Amount;
@@ -10,15 +12,17 @@ use bitcoin_payment_instructions::amount::Amount;
 use ldk_node::bitcoin::base64::Engine;
 use ldk_node::bitcoin::base64::prelude::BASE64_STANDARD;
 use ldk_node::bitcoin::secp256k1::PublicKey;
-use ldk_node::bitcoin::{Address, Network, Script};
+use ldk_node::bitcoin::{Address, Network};
+use ldk_node::config::{AsyncPaymentsRole, BackgroundSyncConfig};
 use ldk_node::lightning::ln::channelmanager::PaymentId;
 use ldk_node::lightning::ln::msgs::SocketAddress;
 use ldk_node::lightning::util::logger::Logger as _;
-use ldk_node::lightning::util::persist::KVStore;
 use ldk_node::lightning::{log_debug, log_error, log_info};
 use ldk_node::lightning_invoice::{Bolt11Invoice, Bolt11InvoiceDescription, Description};
-use ldk_node::payment::{PaymentDetails, PaymentDirection, PaymentKind, PaymentStatus};
-use ldk_node::{NodeError, UserChannelId, lightning};
+use ldk_node::payment::{
+	ConfirmationStatus, PaymentDetails, PaymentDirection, PaymentKind, PaymentStatus,
+};
+use ldk_node::{DynStore, NodeError, UserChannelId};
 
 use graduated_rebalancer::{LightningBalance, ReceivedLightningPayment};
 
@@ -26,8 +30,7 @@ use std::collections::HashMap;
 use std::fmt::Debug;
 use std::pin::Pin;
 use std::sync::Arc;
-
-use tokio::runtime::Runtime;
+use std::time::SystemTime;
 use tokio::sync::watch;
 
 #[derive(Debug, Clone, Copy)]
@@ -38,8 +41,11 @@ pub(crate) struct LightningWalletBalance {
 
 pub(crate) struct LightningWalletImpl {
 	pub(crate) ldk_node: Arc<ldk_node::Node>,
+	logger: Arc<Logger>,
+	store: Arc<DynStore>,
 	payment_receipt_flag: watch::Receiver<()>,
 	channel_pending_receipt_flag: watch::Receiver<u128>,
+	splice_pending_receipt_flag: watch::Receiver<u128>,
 	lsp_node_id: PublicKey,
 	lsp_socket_addr: SocketAddress,
 }
@@ -52,7 +58,7 @@ const DEFAULT_INVOICE_EXPIRY_SECS: u32 = 86_400; // 24 hours
 
 impl LightningWallet {
 	pub(super) async fn init(
-		runtime: Arc<Runtime>, config: WalletConfig, store: Arc<dyn KVStore + Sync + Send>,
+		runtime: Arc<Runtime>, config: WalletConfig, store: Arc<DynStore>,
 		event_queue: Arc<EventQueue>, tx_metadata: TxMetadataStore, logger: Arc<Logger>,
 	) -> Result<Self, InitFailure> {
 		log_info!(logger, "Creating LDK node...");
@@ -104,22 +110,42 @@ impl LightningWallet {
 		let (lsp_socket_addr, lsp_node_id, lsp_token) = config.lsp;
 		builder.set_liquidity_source_lsps2(lsp_node_id, lsp_socket_addr.clone(), lsp_token);
 		match config.chain_source {
-			ChainSource::Esplora { url, username, password } => match (&username, &password) {
-				(Some(username), Some(password)) => {
-					let mut headers = HashMap::with_capacity(1);
-					headers.insert(
-						"Authorization".to_string(),
-						format!(
-							"Basic {}",
-							BASE64_STANDARD.encode(format!("{}:{}", username, password))
-						),
-					);
-					builder.set_chain_source_esplora_with_headers(url, headers, None)
-				},
-				(None, None) => builder.set_chain_source_esplora(url, None),
-				_ => {
-					return Err(InitFailure::LdkNodeStartFailure(NodeError::WalletOperationFailed));
-				},
+			ChainSource::Esplora { url, username, password } => {
+				let sync_config = if config.network == Network::Regtest {
+					ldk_node::config::EsploraSyncConfig {
+						background_sync_config: Some(BackgroundSyncConfig {
+							onchain_wallet_sync_interval_secs: 2,
+							lightning_wallet_sync_interval_secs: 2,
+							fee_rate_cache_update_interval_secs: 30,
+						}),
+					}
+				} else {
+					ldk_node::config::EsploraSyncConfig::default()
+				};
+
+				match (&username, &password) {
+					(Some(username), Some(password)) => {
+						let mut headers = HashMap::with_capacity(1);
+						headers.insert(
+							"Authorization".to_string(),
+							format!(
+								"Basic {}",
+								BASE64_STANDARD.encode(format!("{username}:{password}"))
+							),
+						);
+						builder.set_chain_source_esplora_with_headers(
+							url,
+							headers,
+							Some(sync_config),
+						)
+					},
+					(None, None) => builder.set_chain_source_esplora(url, Some(sync_config)),
+					_ => {
+						return Err(InitFailure::LdkNodeStartFailure(
+							NodeError::WalletOperationFailed,
+						));
+					},
+				}
 			},
 			ChainSource::Electrum(url) => builder.set_chain_source_electrum(url, None),
 			ChainSource::BitcoindRPC { host, port, user, password } => {
@@ -127,61 +153,47 @@ impl LightningWallet {
 			},
 		};
 
+		builder.set_async_payments_role(Some(AsyncPaymentsRole::Client))?;
+
 		builder.set_custom_logger(Arc::clone(&logger) as Arc<dyn ldk_node::logger::LogWriter>);
 
-		// download scorer and write to storage
-		// todo switch to https://github.com/lightningdevkit/ldk-node/pull/449 once available
+		builder.set_runtime(runtime.get_handle());
+
 		if let Some(url) = config.scorer_url {
-			let fetch = tokio::time::timeout(std::time::Duration::from_secs(10), reqwest::get(url));
-			let res = fetch.await.map_err(|e| {
-				log_error!(logger, "Timed out downloading scorer: {e}");
-				InitFailure::LdkNodeStartFailure(NodeError::InvalidUri)
-			})?;
-
-			let req = res.map_err(|e| {
-				log_error!(logger, "Failed to download scorer: {e}");
-				InitFailure::LdkNodeStartFailure(NodeError::InvalidUri)
-			})?;
-
-			let bytes = req.bytes().await.map_err(|e| {
-				log_debug!(logger, "Failed to read scorer bytes: {e}");
-				InitFailure::LdkNodeStartFailure(NodeError::InvalidUri)
-			})?;
-
-			store.write(
-				lightning::util::persist::SCORER_PERSISTENCE_PRIMARY_NAMESPACE,
-				lightning::util::persist::SCORER_PERSISTENCE_SECONDARY_NAMESPACE,
-				lightning::util::persist::SCORER_PERSISTENCE_KEY,
-				bytes.as_ref(),
-			)?;
+			builder.set_pathfinding_scores_source(url);
 		}
 
 		let ldk_node = Arc::new(builder.build_with_store(Arc::clone(&store))?);
 		let (payment_receipt_sender, payment_receipt_flag) = watch::channel(());
 		let (channel_pending_sender, channel_pending_receipt_flag) = watch::channel(0);
+		let (splice_pending_sender, splice_pending_receipt_flag) = watch::channel(0);
 		let ev_handler = Arc::new(LdkEventHandler {
 			event_queue,
 			ldk_node: Arc::clone(&ldk_node),
 			tx_metadata,
 			payment_receipt_sender,
 			channel_pending_sender,
-			logger,
+			splice_pending_sender,
+			logger: Arc::clone(&logger),
 		});
 		let inner = Arc::new(LightningWalletImpl {
 			ldk_node,
+			logger,
+			store,
 			payment_receipt_flag,
 			channel_pending_receipt_flag,
+			splice_pending_receipt_flag,
 			lsp_node_id,
 			lsp_socket_addr,
 		});
 
-		inner.ldk_node.start_with_runtime(Arc::clone(&runtime))?;
+		inner.ldk_node.start()?;
 
-		runtime.spawn(async move {
+		runtime.spawn_cancellable_background_task(async move {
 			loop {
 				let event = ev_handler.ldk_node.next_event_async().await;
-				log_debug!(ev_handler.logger, "Got ldk-node event {:?}", event);
-				ev_handler.handle_ldk_node_event(event);
+				log_debug!(ev_handler.logger, "Got ldk-node event {event:?}");
+				ev_handler.handle_ldk_node_event(event).await;
 			}
 		});
 
@@ -198,6 +210,12 @@ impl LightningWallet {
 		let mut flag = self.inner.channel_pending_receipt_flag.clone();
 		flag.mark_unchanged();
 		flag.wait_for(|t| t == &channel_id).await.expect("channel pending not received");
+	}
+
+	pub(crate) async fn await_splice_pending(&self, channel_id: u128) {
+		let mut flag = self.inner.splice_pending_receipt_flag.clone();
+		flag.mark_unchanged();
+		flag.wait_for(|t| t == &channel_id).await.expect("splice pending not received");
 	}
 
 	pub(crate) fn get_on_chain_address(&self) -> Result<Address, NodeError> {
@@ -281,13 +299,113 @@ impl LightningWallet {
 				.inner
 				.ldk_node
 				.bolt12_payment()
-				.send_using_amount(offer, amount.milli_sats(), None, None),
-			PaymentMethod::OnChain(address) => self
-				.inner
-				.ldk_node
-				.onchain_payment()
-				.send_to_address(address, amount.sats_rounding_up(), None)
-				.map(|txid| PaymentId(*txid.as_ref())),
+				.send_using_amount(offer, amount.milli_sats(), None, None, None),
+			PaymentMethod::OnChain(address) => {
+				let amount_sats = amount.sats().map_err(|_| NodeError::InvalidAmount)?;
+
+				let balance = self.inner.ldk_node.list_balances();
+
+				// if we have enough onchain balance, send onchain
+				if balance.spendable_onchain_balance_sats > amount_sats {
+					self.inner
+						.ldk_node
+						.onchain_payment()
+						.send_to_address(address, amount_sats, None)
+						.map(|txid| PaymentId(*txid.as_ref()))
+				} else {
+					// otherwise try to pay via splice out
+
+					// find existing channel to splice out of
+					let channels = self.inner.ldk_node.list_channels();
+					let channel =
+						channels.iter().find(|c| c.counterparty_node_id == self.inner.lsp_node_id);
+
+					match channel {
+						None => {
+							log_error!(self.inner.logger, "No existing channel to splice out of");
+							Err(NodeError::InsufficientFunds)
+						},
+						Some(chan) => {
+							self.inner.ldk_node.splice_out(
+								&chan.user_channel_id,
+								chan.counterparty_node_id,
+								address,
+								amount_sats,
+							)?;
+
+							loop {
+								self.await_splice_pending(chan.user_channel_id.0).await;
+								let channels = self.inner.ldk_node.list_channels();
+								let new_chan = channels
+									.iter()
+									.find(|c| c.user_channel_id == chan.user_channel_id);
+								match new_chan {
+									Some(c) => {
+										if c.funding_txo
+											.is_some_and(|f| f != chan.funding_txo.unwrap())
+										{
+											let funding_txo = c.funding_txo.unwrap();
+
+											let id = PaymentId(funding_txo.txid.to_byte_array());
+											let details = PaymentDetails {
+												id,
+												kind: PaymentKind::Onchain {
+													txid: funding_txo.txid,
+													status: ConfirmationStatus::Unconfirmed, // todo how do we update this?
+												},
+												amount_msat: Some(amount_sats * 1_000),
+												fee_paid_msat: Some(69), // todo get real fee
+												direction: PaymentDirection::Outbound,
+												status: PaymentStatus::Succeeded,
+												latest_update_timestamp: SystemTime::now()
+													.duration_since(SystemTime::UNIX_EPOCH)
+													.unwrap()
+													.as_secs(),
+											};
+
+											store::write_splice_out(
+												self.inner.store.as_ref(),
+												&details,
+											);
+											return Ok(id);
+										}
+									},
+									None => {
+										log_error!(
+											self.inner.logger,
+											"Channel disappeared while awaiting splice out"
+										);
+										return Err(NodeError::WalletOperationFailed);
+									},
+								}
+							}
+						},
+					}
+				}
+			},
+		}
+	}
+
+	pub(crate) async fn splice_balance_into_channel(
+		&self, amount: Amount,
+	) -> Result<UserChannelId, NodeError> {
+		// find existing channel to splice into
+		let channels = self.inner.ldk_node.list_channels();
+		let channel = channels.iter().find(|c| c.counterparty_node_id == self.inner.lsp_node_id);
+
+		match channel {
+			Some(chan) => {
+				self.inner.ldk_node.splice_in(
+					&chan.user_channel_id,
+					chan.counterparty_node_id,
+					amount.sats_rounding_up(),
+				)?;
+				Ok(chan.user_channel_id)
+			},
+			None => {
+				log_error!(self.inner.logger, "No existing channel to splice into");
+				Err(NodeError::WalletOperationFailed)
+			},
 		}
 	}
 
@@ -295,18 +413,20 @@ impl LightningWallet {
 		let bal = self.inner.ldk_node.list_balances().spendable_onchain_balance_sats;
 
 		// need a dummy p2wsh address to estimate the fee, p2wsh is used for LN channels
-		let fake_addr = Address::p2wsh(Script::new(), self.inner.ldk_node.config().network);
-
-		let fee = self
-			.inner
-			.ldk_node
-			.onchain_payment()
-			.estimate_send_all_to_address(&fake_addr, true, None)?;
+		// let fake_addr = Address::p2wsh(Script::new(), self.inner.ldk_node.config().network);
+		//
+		// let fee = self
+		// 	.inner
+		// 	.ldk_node
+		// 	.onchain_payment()
+		// 	.estimate_send_all_to_address(&fake_addr, true, None)?;
+		// todo get real fee
+		let fee = 1000;
 
 		let id = self.inner.ldk_node.open_channel(
 			self.inner.lsp_node_id,
 			self.inner.lsp_socket_addr.clone(),
-			bal - fee.to_sat(),
+			bal - fee,
 			None,
 			None,
 		)?;
@@ -401,6 +521,11 @@ impl graduated_rebalancer::LightningWallet for LightningWallet {
 		})
 	}
 
+	fn has_channel_with_lsp(&self) -> bool {
+		let channels = self.inner.ldk_node.list_channels();
+		channels.iter().any(|c| c.counterparty_node_id == self.inner.lsp_node_id)
+	}
+
 	fn open_channel_with_lsp(
 		&self, _amt: Amount,
 	) -> Pin<Box<dyn Future<Output = Result<u128, Self::Error>> + Send + '_>> {
@@ -423,6 +548,49 @@ impl graduated_rebalancer::LightningWallet for LightningWallet {
 					Some(c) => return c.funding_txo.expect("channel has no funding txo"),
 					None => {
 						self.await_channel_pending(channel_id).await;
+						// Wait for the next channel pending event
+					},
+				}
+			}
+		})
+	}
+
+	fn splice_to_lsp_channel(
+		&self, amt: Amount,
+	) -> Pin<Box<dyn Future<Output = Result<u128, Self::Error>> + Send + '_>> {
+		let bal = self.inner.ldk_node.list_balances();
+		// if we don't have enough onchain balance, return error
+		// if we are within 1,000 sats of the amount, reduce the amount to account for fees
+		if bal.spendable_onchain_balance_sats < amt.sats_rounding_up() {
+			return Box::pin(async move { Err(NodeError::InsufficientFunds) });
+		} else if bal.spendable_onchain_balance_sats < amt.sats_rounding_up() + 1_000 {
+			let reduced_amt = amt.saturating_sub(Amount::from_sats(1_000).expect("valid amount"));
+			return Box::pin(async move {
+				self.splice_balance_into_channel(reduced_amt).await.map(|c| c.0)
+			});
+		}
+
+		Box::pin(async move { self.splice_balance_into_channel(amt).await.map(|c| c.0) })
+	}
+
+	fn await_splice_pending(
+		&self, channel_id: u128,
+	) -> Pin<Box<dyn Future<Output = OutPoint> + Send + '_>> {
+		Box::pin(async move {
+			// todo since we can't see if we have any active splices, we just await the next splice pending event
+			// this is kinda race-y hopefully we can fix
+			self.await_splice_pending(channel_id).await;
+			loop {
+				let channels = self.inner.ldk_node.list_channels();
+				let chan = channels
+					.into_iter()
+					.find(|c| c.user_channel_id.0 == channel_id && c.funding_txo.is_some());
+				match chan {
+					Some(c) => {
+						return c.funding_txo.expect("channel has no funding txo");
+					},
+					None => {
+						self.await_splice_pending(channel_id).await;
 						// Wait for the next channel pending event
 					},
 				}

@@ -24,13 +24,10 @@ use ldk_node::bitcoin::secp256k1::PublicKey;
 use ldk_node::io::sqlite_store::SqliteStore;
 use ldk_node::lightning::ln::msgs::SocketAddress;
 use ldk_node::lightning::util::logger::Logger as _;
-use ldk_node::lightning::util::persist::KVStore;
 use ldk_node::lightning::{log_debug, log_error, log_info, log_trace, log_warn};
 use ldk_node::lightning_invoice::Bolt11Invoice;
-use ldk_node::payment::PaymentKind;
-use ldk_node::{BuildError, ChannelDetails, NodeError};
-
-use tokio::runtime::Runtime;
+use ldk_node::payment::{PaymentDirection, PaymentKind};
+use ldk_node::{BuildError, ChannelDetails, DynStore, NodeError};
 
 use std::collections::HashMap;
 use std::fmt::{self, Debug, Write};
@@ -43,6 +40,7 @@ mod ffi;
 mod lightning_wallet;
 pub(crate) mod logging;
 mod rebalancer;
+mod runtime;
 mod store;
 pub mod trusted_wallet;
 
@@ -51,6 +49,7 @@ use logging::Logger;
 use trusted_wallet::TrustedError;
 
 pub use crate::logging::LoggerType;
+use crate::runtime::Runtime;
 #[cfg(feature = "cashu")]
 pub use crate::trusted_wallet::cashu::CashuConfig;
 #[cfg(feature = "spark")]
@@ -113,7 +112,7 @@ struct WalletImpl {
 	/// Metadata store for tracking transactions.
 	tx_metadata: TxMetadataStore,
 	/// Key-value store for persistent storage.
-	store: Arc<dyn KVStore + Send + Sync>,
+	store: Arc<DynStore>,
 	/// Logger for logging wallet operations.
 	logger: Arc<Logger>,
 	/// The Tokio runtime for asynchronous operations.
@@ -508,28 +507,18 @@ impl Wallet {
 	/// Recovery ensures trusted wallet funds can be restored when reconstructed from the same seed
 	/// across different devices or installations.
 	pub async fn new(config: WalletConfig) -> Result<Wallet, InitFailure> {
-		let rt = tokio::runtime::Builder::new_multi_thread()
-			.enable_all()
-			.build()
-			.map_err(|e| InitFailure::IoError(e.into()))?;
-
-		Self::new_with_runtime(Arc::new(rt), config).await
-	}
-	/// Constructs a new Wallet with a runtime.
-	///
-	/// `runtime` must be a reference to the running `tokio` runtime which we are currently
-	/// operating in.
-	// TODO: WOW that is a terrible API lol
-	pub async fn new_with_runtime(
-		runtime: Arc<Runtime>, config: WalletConfig,
-	) -> Result<Wallet, InitFailure> {
 		let tunables = config.tunables;
 		let network = config.network;
 		let logger = Arc::new(Logger::new(&config.logger_type).expect("Failed to open log file"));
 
 		log_info!(logger, "Initializing orange on network: {network}");
 
-		let store: Arc<dyn KVStore + Send + Sync> = match &config.storage_config {
+		let runtime = Arc::new(Runtime::new(Arc::clone(&logger)).map_err(|e| {
+			log_error!(logger, "Failed to set up tokio runtime: {e}");
+			BuildError::RuntimeSetupFailed
+		})?);
+
+		let store: Arc<DynStore> = match &config.storage_config {
 			StorageConfig::LocalSQLite(path) => {
 				Arc::new(SqliteStore::new(path.into(), Some("orange.sqlite".to_owned()), None)?)
 			},
@@ -537,7 +526,7 @@ impl Wallet {
 
 		let event_queue = Arc::new(EventQueue::new(Arc::clone(&store), Arc::clone(&logger)));
 
-		let tx_metadata = TxMetadataStore::new(Arc::clone(&store));
+		let tx_metadata = TxMetadataStore::new(Arc::clone(&store)).await;
 
 		let trusted: Arc<Box<DynTrustedWalletInterface>> = match &config.extra_config {
 			#[cfg(feature = "spark")]
@@ -621,7 +610,7 @@ impl Wallet {
 		// Spawn a background thread that every second, we see if we should initiate a rebalance
 		// This will withdraw from the trusted balance to our LN balance, possibly opening a channel.
 		let rb = Arc::clone(&rebalancer);
-		runtime.spawn(async move {
+		runtime.spawn_cancellable_background_task(async move {
 			loop {
 				rb.do_rebalance_if_needed().await;
 
@@ -647,7 +636,7 @@ impl Wallet {
 
 	/// Sets whether the wallet should automatically rebalance from trusted/onchain to lightning.
 	pub fn set_rebalance_enabled(&self, value: bool) {
-		store::set_rebalance_enabled(self.inner.store.as_ref(), value);
+		store::set_rebalance_enabled(self.inner.store.as_ref(), value)
 	}
 
 	/// Whether the wallet should automatically rebalance from trusted/onchain to lightning.
@@ -673,9 +662,14 @@ impl Wallet {
 	/// Lists the transactions which have been made.
 	pub async fn list_transactions(&self) -> Result<Vec<Transaction>, WalletError> {
 		let trusted_payments = self.inner.trusted.list_payments().await?;
-		let lightning_payments = self.inner.ln_wallet.list_payments();
+		let mut lightning_payments = self.inner.ln_wallet.list_payments();
+		lightning_payments.sort_by_key(|l| l.latest_update_timestamp);
 
-		let mut res = Vec::with_capacity(trusted_payments.len() + lightning_payments.len());
+		let splice_outs = store::read_splice_outs(self.inner.store.as_ref());
+
+		let mut res = Vec::with_capacity(
+			trusted_payments.len() + lightning_payments.len() + splice_outs.len(),
+		);
 		let tx_metadata = self.inner.tx_metadata.read();
 
 		let mut internal_transfers = HashMap::new();
@@ -791,13 +785,17 @@ impl Wallet {
 				},
 				_ => None,
 			};
-			let fee = match payment.fee_paid_msat {
-				None => lightning_receive_fee,
-				Some(fee) => Some(
-					Amount::from_milli_sats(fee)
-						.unwrap()
-						.saturating_add(lightning_receive_fee.unwrap_or(Amount::ZERO)),
-				),
+			let fee = if payment.direction == PaymentDirection::Outbound {
+				match payment.fee_paid_msat {
+					None => Some(lightning_receive_fee.unwrap_or(Amount::ZERO)),
+					Some(fee) => Some(
+						Amount::from_milli_sats(fee)
+							.unwrap()
+							.saturating_add(lightning_receive_fee.unwrap_or(Amount::ZERO)),
+					),
+				}
+			} else {
+				Some(lightning_receive_fee.unwrap_or(Amount::ZERO))
 			};
 			if let Some(tx_metadata) = tx_metadata.get(&PaymentId::SelfCustodial(payment.id.0)) {
 				match &tx_metadata.ty {
@@ -892,6 +890,18 @@ impl Wallet {
 					time_since_epoch: Duration::from_secs(payment.latest_update_timestamp),
 				})
 			}
+		}
+
+		for details in splice_outs {
+			res.push(Transaction {
+				id: PaymentId::SelfCustodial(details.id.0),
+				status: details.status.into(),
+				outbound: details.direction == PaymentDirection::Outbound,
+				amount: details.amount_msat.map(|a| Amount::from_milli_sats(a).unwrap()),
+				fee: details.fee_paid_msat.map(|fee| Amount::from_milli_sats(fee).unwrap()),
+				payment_type: (&details).into(),
+				time_since_epoch: Duration::from_secs(details.latest_update_timestamp),
+			});
 		}
 
 		for (id, tx_info) in internal_transfers {
@@ -1023,7 +1033,8 @@ impl Wallet {
 	pub async fn parse_payment_instructions(
 		&self, instructions: &str,
 	) -> Result<PaymentInstructions, instructions::ParseError> {
-		PaymentInstructions::parse(instructions, self.inner.network, &HTTPHrnResolver, true).await
+		PaymentInstructions::parse(instructions, self.inner.network, &HTTPHrnResolver::new(), true)
+			.await
 	}
 
 	// /// Verifies instructions which allow us to claim funds given as:
@@ -1109,7 +1120,9 @@ impl Wallet {
 		let mut pay_lightning = async |method, ty: fn() -> PaymentType| {
 			let typ = ty();
 			let balance = if matches!(typ, PaymentType::OutgoingOnChain { .. }) {
-				ln_balance.onchain
+				// if we are paying on-chain, we can either use the on-chain balance or the
+				// lightning balance with a splice. Use the larger of the two.
+				ln_balance.onchain.max(ln_balance.lightning)
 			} else {
 				ln_balance.lightning
 			};
@@ -1134,7 +1147,7 @@ impl Wallet {
 									},
 								);
 								let inner_ref = Arc::clone(&self.inner);
-								self.inner.runtime.spawn(async move {
+								self.inner.runtime.spawn_cancellable_background_task(async move {
 									inner_ref.rebalancer.do_rebalance_if_needed().await;
 								});
 								return Ok(());
@@ -1152,7 +1165,8 @@ impl Wallet {
 
 		let methods = match &instructions.instructions {
 			PaymentInstructions::ConfigurableAmount(conf) => {
-				let res = conf.clone().set_amount(instructions.amount, &HTTPHrnResolver).await;
+				let res =
+					conf.clone().set_amount(instructions.amount, &HTTPHrnResolver::new()).await;
 				let fixed_instr = res.map_err(|e| {
 					log_error!(
 						self.inner.logger,
@@ -1263,13 +1277,13 @@ impl Wallet {
 		Ok(())
 	}
 
-	/// Authenticates the user via [LNURL-auth] for the given LNURL string.
-	///
-	/// [LNURL-auth]: https://github.com/lnurl/luds/blob/luds/04.md
-	pub fn lnurl_auth(&self, lnurl: &str) -> Result<(), WalletError> {
-		self.inner.ln_wallet.inner.ldk_node.lnurl_auth(lnurl)?;
-		Ok(())
-	}
+	// Authenticates the user via [LNURL-auth] for the given LNURL string.
+	//
+	// [LNURL-auth]: https://github.com/lnurl/luds/blob/luds/04.md
+	// pub fn lnurl_auth(&self, _lnurl: &str) -> Result<(), WalletError> {
+	// 	// todo wait for merge, self.inner.ln_wallet.inner.ldk_node.lnurl_auth(lnurl)?;
+	// 	Ok(())
+	// }
 
 	/// Returns the wallet's configured tunables.
 	pub fn get_tunables(&self) -> Tunables {
@@ -1285,7 +1299,7 @@ impl Wallet {
 	/// **Caution:** Users must handle events as quickly as possible to prevent a large event backlog,
 	/// which can increase the memory footprint of [`Wallet`].
 	pub fn next_event(&self) -> Option<Event> {
-		self.inner.event_queue.next_event()
+		self.inner.runtime.block_on(self.inner.event_queue.next_event())
 	}
 
 	/// Returns the next event in the event queue.
@@ -1309,14 +1323,17 @@ impl Wallet {
 	/// **Caution:** Users must handle events as quickly as possible to prevent a large event backlog,
 	/// which can increase the memory footprint of [`Wallet`].
 	pub fn wait_next_event(&self) -> Event {
-		self.inner.event_queue.wait_next_event()
+		let fut = self.inner.event_queue.next_event_async();
+		// We use our runtime for the sync variant to ensure `tokio::task::block_in_place` is
+		// always called if we'd ever hit this in an outer runtime context.
+		self.inner.runtime.block_on(fut)
 	}
 
 	/// Confirm the last retrieved event handled.
 	///
 	/// **Note:** This **MUST** be called after each event has been handled.
 	pub fn event_handled(&self) -> Result<(), ()> {
-		self.inner.event_queue.event_handled().map_err(|e| {
+		self.inner.runtime.block_on(self.inner.event_queue.event_handled()).map_err(|e| {
 			log_error!(
 				self.inner.logger,
 				"Couldn't mark event handled due to persistence failure: {e}"
@@ -1337,5 +1354,20 @@ impl Wallet {
 
 		log_debug!(self.inner.logger, "Stopping ln wallet...");
 		self.inner.ln_wallet.stop();
+
+		// Cancel cancellable background tasks
+		self.inner.runtime.abort_cancellable_background_tasks();
+
+		// Wait until non-cancellable background tasks (mod LDK's background processor) are done.
+		self.inner.runtime.wait_on_background_tasks();
+	}
+
+	/// Manually sync the LDK and BDK wallets with the current chain state and update the fee rate cache.
+	///
+	/// This is done automatically in the background, but can be triggered manually if needed. Often useful for
+	/// testing purposes.
+	pub fn sync_ln_wallet(&self) -> Result<(), WalletError> {
+		self.inner.ln_wallet.inner.ldk_node.sync_wallets()?;
+		Ok(())
 	}
 }
