@@ -16,7 +16,6 @@ use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use tokio::runtime::Runtime;
 use tokio::signal;
 
 const NETWORK: Network = Network::Bitcoin; // Supports Bitcoin and Regtest
@@ -227,16 +226,13 @@ async fn main() -> Result<()> {
 	println!("{}", "Type 'help' for available commands or 'exit' to quit".dimmed());
 	println!();
 
-	// Create runtime outside async context to avoid drop issues
-	let runtime = Arc::new(Runtime::new().context("Failed to create tokio runtime")?);
-
 	// Initialize wallet once at startup
-	let mut state = runtime.block_on(WalletState::new())?;
+	let mut state = WalletState::new().await?;
 
 	// Set up signal handling for graceful shutdown
 	let shutdown_state = state.shutdown.clone();
 	let shutdown_wallet = state.wallet.clone();
-	runtime.spawn(async move {
+	tokio::task::spawn(async move {
 		if let Ok(()) = signal::ctrl_c().await {
 			println!("\n{} Shutdown signal received, stopping wallet...", "⏹️".bright_yellow());
 			shutdown_state.store(true, Ordering::Relaxed);
@@ -248,12 +244,12 @@ async fn main() -> Result<()> {
 
 	// If a command was provided via command line, execute it and start interactive mode
 	if let Some(command) = cli.command {
-		runtime.block_on(execute_command(command, &mut state))?;
+		execute_command(command, &mut state).await?;
 		println!();
 	}
 
 	// Start interactive mode
-	runtime.block_on(start_interactive_mode(state))
+	start_interactive_mode(state).await
 }
 
 async fn start_interactive_mode(mut state: WalletState) -> Result<()> {
