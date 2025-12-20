@@ -5,6 +5,7 @@ use crate::{
 };
 use crate::{impl_from_core_type, impl_into_core_type};
 use std::sync::Arc;
+use ldk_node::bitcoin::hex::DisplayHex;
 
 pub mod config;
 pub mod error;
@@ -63,16 +64,24 @@ impl Transaction {
 /// the payment to the user.
 #[derive(Debug, Clone, Hash, PartialEq, Eq, uniffi::Object)]
 pub enum PaymentId {
-	Lightning(Vec<u8>),
-	Trusted(Vec<u8>),
+	Lightning(String),
+	Trusted(String),
 }
 
 impl From<OrangePaymentId> for PaymentId {
 	fn from(id: OrangePaymentId) -> Self {
 		match id {
-			OrangePaymentId::SelfCustodial(hash) => Self::Lightning(hash.to_vec()),
-			OrangePaymentId::Trusted(hash) => Self::Trusted(hash.to_vec()),
+			OrangePaymentId::SelfCustodial(hash) => Self::Lightning(hash.to_lower_hex_string()),
+			OrangePaymentId::Trusted(hash) => Self::Trusted(hash.to_lower_hex_string()),
 		}
+	}
+}
+
+#[uniffi::export]
+impl PaymentId {
+	/// Gets a string representation of this PaymentId
+	pub fn to_string(&self) -> String {
+		format!("{self:?}")
 	}
 }
 
