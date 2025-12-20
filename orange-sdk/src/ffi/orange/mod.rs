@@ -62,7 +62,7 @@ impl Transaction {
 /// A PaymentId is a unique identifier for a payment. It can be either a Lightning payment or a
 /// Trusted payment. It is used to track the state of a payment and to provide information about
 /// the payment to the user.
-#[derive(Debug, Clone, Hash, PartialEq, Eq, uniffi::Object)]
+#[derive(Debug, Clone, Hash, PartialEq, Eq, uniffi::Enum)]
 pub enum PaymentId {
 	Lightning(String),
 	Trusted(String),
@@ -74,14 +74,6 @@ impl From<OrangePaymentId> for PaymentId {
 			OrangePaymentId::SelfCustodial(hash) => Self::Lightning(hash.to_lower_hex_string()),
 			OrangePaymentId::Trusted(hash) => Self::Trusted(hash.to_lower_hex_string()),
 		}
-	}
-}
-
-#[uniffi::export]
-impl PaymentId {
-	/// Gets a string representation of this PaymentId
-	pub fn to_string(&self) -> String {
-		format!("{self:?}")
 	}
 }
 
@@ -173,7 +165,7 @@ pub enum Event {
 	/// An outgoing payment was successful.
 	PaymentSuccessful {
 		/// A local identifier used to track the payment.
-		payment_id: Arc<PaymentId>,
+		payment_id: PaymentId,
 		/// The hash of the payment.
 		payment_hash: Vec<u8>,
 		/// The preimage to the `payment_hash`.
@@ -186,7 +178,7 @@ pub enum Event {
 	/// An outgoing payment has failed.
 	PaymentFailed {
 		/// A local identifier used to track the payment.
-		payment_id: Arc<PaymentId>,
+		payment_id: PaymentId,
 		/// The hash of the payment.
 		///
 		/// This will be `None` if the payment failed before receiving an invoice when paying a
@@ -202,7 +194,7 @@ pub enum Event {
 	/// A payment has been received.
 	PaymentReceived {
 		/// A local identifier used to track the payment.
-		payment_id: Arc<PaymentId>,
+		payment_id: PaymentId,
 		/// The hash of the payment.
 		payment_hash: Vec<u8>,
 		/// The value, in msats, that has been received.
@@ -216,7 +208,7 @@ pub enum Event {
 	/// A payment has been received.
 	OnchainPaymentReceived {
 		/// A local identifier used to track the payment.
-		payment_id: Arc<PaymentId>,
+		payment_id: PaymentId,
 		/// The transaction ID.
 		txid: Vec<u8>,
 		/// The value, in sats, that has been received.
@@ -252,7 +244,7 @@ pub enum Event {
 	/// A rebalance from our trusted wallet has been initiated.
 	RebalanceInitiated {
 		/// The `payment_id` of the transaction that triggered the rebalance.
-		trigger_payment_id: Arc<PaymentId>,
+		trigger_payment_id: PaymentId,
 		/// The `payment_id` of the rebalance payment sent from the trusted wallet.
 		trusted_rebalance_payment_id: Vec<u8>,
 		/// The amount, in msats, of the rebalance payment.
@@ -261,7 +253,7 @@ pub enum Event {
 	/// A rebalance from our trusted wallet was successful.
 	RebalanceSuccessful {
 		/// The `payment_id` of the transaction that triggered the rebalance.
-		trigger_payment_id: Arc<PaymentId>,
+		trigger_payment_id: PaymentId,
 		/// The `payment_id` of the rebalance payment sent from the trusted wallet.
 		trusted_rebalance_payment_id: Vec<u8>,
 		/// The `payment_id` of the rebalance payment sent to the LN wallet.
@@ -293,14 +285,14 @@ impl From<OrangeEvent> for Event {
 				payment_preimage,
 				fee_paid_msat,
 			} => Event::PaymentSuccessful {
-				payment_id: Arc::new(payment_id.into()),
+				payment_id: payment_id.into(),
 				payment_hash: payment_hash.0.to_vec(),
 				payment_preimage: payment_preimage.0.to_vec(),
 				fee_paid_msat,
 			},
 			OrangeEvent::PaymentFailed { payment_id, payment_hash, reason } => {
 				Event::PaymentFailed {
-					payment_id: Arc::new(payment_id.into()),
+					payment_id: payment_id.into(),
 					payment_hash: payment_hash.map(|h| h.0.to_vec()),
 					reason: reason.map(|r| format!("{:?}", r)),
 				}
@@ -312,7 +304,7 @@ impl From<OrangeEvent> for Event {
 				custom_records,
 				lsp_fee_msats,
 			} => Event::PaymentReceived {
-				payment_id: Arc::new(payment_id.into()),
+				payment_id: payment_id.into(),
 				payment_hash: payment_hash.0.to_vec(),
 				amount_msat,
 				custom_records: custom_records.into_iter().map(|r| r.value).collect(),
@@ -320,7 +312,7 @@ impl From<OrangeEvent> for Event {
 			},
 			OrangeEvent::OnchainPaymentReceived { payment_id, txid, amount_sat, status: _ } => {
 				Event::OnchainPaymentReceived {
-					payment_id: Arc::new(payment_id.into()),
+					payment_id: payment_id.into(),
 					txid: txid.to_byte_array().to_vec(),
 					amount_sat,
 				}
@@ -352,7 +344,7 @@ impl From<OrangeEvent> for Event {
 				trusted_rebalance_payment_id,
 				amount_msat,
 			} => Event::RebalanceInitiated {
-				trigger_payment_id: Arc::new(trigger_payment_id.into()),
+				trigger_payment_id: trigger_payment_id.into(),
 				trusted_rebalance_payment_id: trusted_rebalance_payment_id.to_vec(),
 				amount_msat,
 			},
@@ -363,7 +355,7 @@ impl From<OrangeEvent> for Event {
 				amount_msat,
 				fee_msat,
 			} => Event::RebalanceSuccessful {
-				trigger_payment_id: Arc::new(trigger_payment_id.into()),
+				trigger_payment_id: trigger_payment_id.into(),
 				trusted_rebalance_payment_id: trusted_rebalance_payment_id.to_vec(),
 				ln_rebalance_payment_id: ln_rebalance_payment_id.to_vec(),
 				amount_msat,
