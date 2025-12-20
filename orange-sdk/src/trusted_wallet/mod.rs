@@ -173,6 +173,10 @@ pub enum TrustedError {
 	Other(String),
 }
 
+impl core::fmt::Display for TrustedError {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> Result<(), std::fmt::Error> { write!(f, "{self:?}") }
+}
+
 impl From<ldk_node::lightning::io::Error> for TrustedError {
 	fn from(e: ldk_node::lightning::io::Error) -> Self {
 		TrustedError::IOError(e)

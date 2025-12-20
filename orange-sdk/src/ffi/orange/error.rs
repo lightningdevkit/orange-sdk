@@ -36,7 +36,7 @@ pub enum InitFailure {
 	/// Failure to start the LDK node.
 	LdkNodeStartFailure(String),
 	/// Failure in the trusted wallet implementation.
-	TrustedFailure,
+	TrustedFailure(String),
 }
 
 impl Display for InitFailure {
@@ -46,7 +46,7 @@ impl Display for InitFailure {
 			InitFailure::ConfigError(e) => write!(f, "Config error: {e}"),
 			InitFailure::LdkNodeBuildFailure(e) => write!(f, "Failed to build the LDK node: {e}"),
 			InitFailure::LdkNodeStartFailure(e) => write!(f, "Failed to start the LDK node: {e}"),
-			InitFailure::TrustedFailure => write!(f, "Failed to create the trusted wallet"),
+			InitFailure::TrustedFailure(e) => write!(f, "Failed to create the trusted wallet: {e}"),
 		}
 	}
 }
@@ -67,7 +67,7 @@ impl From<OrangeInitFailure> for InitFailure {
 			OrangeInitFailure::LdkNodeStartFailure(e) => {
 				InitFailure::LdkNodeStartFailure(e.to_string())
 			},
-			OrangeInitFailure::TrustedFailure(_e) => InitFailure::TrustedFailure,
+			OrangeInitFailure::TrustedFailure(e) => InitFailure::TrustedFailure(e.to_string()),
 		}
 	}
 }
@@ -84,7 +84,7 @@ pub enum WalletError {
 	/// Failure in the LDK node.
 	LdkNodeFailure(String),
 	/// Failure in the trusted wallet implementation.
-	TrustedFailure,
+	TrustedFailure(String),
 	/// Failure to parse payment instructions.
 	PaymentInstructionsParseError,
 	/// Failure to build payment info.
@@ -95,7 +95,7 @@ impl Display for WalletError {
 	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
 		match self {
 			WalletError::LdkNodeFailure(e) => write!(f, "Failure from LDK node: {e}"),
-			WalletError::TrustedFailure => write!(f, "Failure from trusted wallet"),
+			WalletError::TrustedFailure(e) => write!(f, "Failure from trusted wallet: {e}"),
 			WalletError::PaymentInstructionsParseError => {
 				write!(f, "Failure to parse payment instructions")
 			},
@@ -108,7 +108,7 @@ impl From<OrangeWalletError> for WalletError {
 	fn from(e: OrangeWalletError) -> Self {
 		match e {
 			OrangeWalletError::LdkNodeFailure(e) => WalletError::LdkNodeFailure(e.to_string()),
-			OrangeWalletError::TrustedFailure(_e) => WalletError::TrustedFailure,
+			OrangeWalletError::TrustedFailure(e) => WalletError::TrustedFailure(e.to_string()),
 		}
 	}
 }
