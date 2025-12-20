@@ -1057,9 +1057,9 @@ impl Wallet {
 	/// If applicable, this will also initiate a rebalance from the trusted wallet to the
 	/// lightning wallet based on the resulting balance and configured tunables.
 	///
-	/// Returns true once the payment is pending, however, this does not mean that the
+	/// Returns once the payment is pending, however, this does not mean that the
 	/// payment has been completed. The payment may still fail.
-	pub async fn pay(&self, instructions: &PaymentInfo) -> Result<(), WalletError> {
+	pub async fn pay(&self, instructions: &PaymentInfo) -> Result<PaymentId, WalletError> {
 		let trusted_balance = self.inner.trusted.get_balance().await?;
 		let ln_balance = self.inner.ln_wallet.get_balance();
 
@@ -1105,7 +1105,7 @@ impl Wallet {
 										.unwrap(),
 								},
 							);
-							return Ok(());
+							return Ok(PaymentId::Trusted(id));
 						},
 						Err(e) => {
 							log_debug!(self.inner.logger, "Trusted payment failed with {e:?}");
@@ -1150,7 +1150,7 @@ impl Wallet {
 								self.inner.runtime.spawn_cancellable_background_task(async move {
 									inner_ref.rebalancer.do_rebalance_if_needed().await;
 								});
-								return Ok(());
+								return Ok(PaymentId::SelfCustodial(id.0));
 							},
 							Err(e) => {
 								log_debug!(self.inner.logger, "LN payment failed with {:?}", e);
@@ -1184,23 +1184,21 @@ impl Wallet {
 		for method in methods.clone() {
 			match method {
 				PaymentMethod::LightningBolt11(_) => {
-					if pay_trusted(method, || PaymentType::OutgoingLightningBolt11 {
+					if let Ok(id) = pay_trusted(method, || PaymentType::OutgoingLightningBolt11 {
 						payment_preimage: None,
 					})
 					.await
-					.is_ok()
 					{
-						return Ok(());
+						return Ok(id);
 					};
 				},
 				PaymentMethod::LightningBolt12(_) => {
-					if pay_trusted(method, || PaymentType::OutgoingLightningBolt12 {
+					if let Ok(id) = pay_trusted(method, || PaymentType::OutgoingLightningBolt12 {
 						payment_preimage: None,
 					})
 					.await
-					.is_ok()
 					{
-						return Ok(());
+						return Ok(id);
 					}
 				},
 				PaymentMethod::OnChain { .. } => {},
@@ -1212,23 +1210,21 @@ impl Wallet {
 		for method in &methods {
 			match method {
 				PaymentMethod::LightningBolt11(_) => {
-					if pay_lightning(method, || PaymentType::OutgoingLightningBolt11 {
+					if let Ok(id) = pay_lightning(method, || PaymentType::OutgoingLightningBolt11 {
 						payment_preimage: None,
 					})
 					.await
-					.is_ok()
 					{
-						return Ok(());
+						return Ok(id);
 					}
 				},
 				PaymentMethod::LightningBolt12(_) => {
-					if pay_lightning(method, || PaymentType::OutgoingLightningBolt12 {
+					if let Ok(id) = pay_lightning(method, || PaymentType::OutgoingLightningBolt12 {
 						payment_preimage: None,
 					})
 					.await
-					.is_ok()
 					{
-						return Ok(());
+						return Ok(id);
 					}
 				},
 				PaymentMethod::OnChain { .. } => {},
@@ -1240,9 +1236,9 @@ impl Wallet {
 		// Finally, try trusted on-chain first,
 		for method in methods.clone() {
 			if let PaymentMethod::OnChain { .. } = method {
-				if pay_trusted(method, || PaymentType::OutgoingOnChain { txid: None }).await.is_ok()
+				if let Ok(id) = pay_trusted(method, || PaymentType::OutgoingOnChain { txid: None }).await
 				{
-					return Ok(());
+					return Ok(id);
 				};
 			}
 		}
@@ -1250,11 +1246,10 @@ impl Wallet {
 		// then pay on-chain out of the lightning wallet
 		for method in &methods {
 			if let PaymentMethod::OnChain { .. } = method {
-				if pay_lightning(method, || PaymentType::OutgoingOnChain { txid: None })
+				if let Ok(id) = pay_lightning(method, || PaymentType::OutgoingOnChain { txid: None })
 					.await
-					.is_ok()
 				{
-					return Ok(());
+					return Ok(id);
 				};
 			}
 		}
