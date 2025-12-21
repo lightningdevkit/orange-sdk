@@ -607,15 +607,14 @@ impl Wallet {
 			Arc::clone(&logger),
 		));
 
-		// Spawn a background thread that every second, we see if we should initiate a rebalance
-		// This will withdraw from the trusted balance to our LN balance, possibly opening a channel.
+		// Spawn a background thread to initiate a rebalance if needed.
+		// We only do this once as we generally rebalance in response to
+		// `Event`s which indicated our balance has changed.
 		let rb = Arc::clone(&rebalancer);
 		runtime.spawn_cancellable_background_task(async move {
-			loop {
-				rb.do_rebalance_if_needed().await;
-
-				tokio::time::sleep(Duration::from_secs(1)).await;
-			}
+			// Wait a second to get caught up, then try to rebalance.
+			tokio::time::sleep(Duration::from_secs(1)).await;
+			rb.do_rebalance_if_needed().await;
 		});
 
 		let inner = Arc::new(WalletImpl {
@@ -1333,12 +1332,20 @@ impl Wallet {
 	///
 	/// **Note:** This **MUST** be called after each event has been handled.
 	pub fn event_handled(&self) -> Result<(), ()> {
-		self.inner.runtime.block_on(self.inner.event_queue.event_handled()).map_err(|e| {
+		let res = self.inner.runtime.block_on(self.inner.event_queue.event_handled()).map_err(|e| {
 			log_error!(
 				self.inner.logger,
 				"Couldn't mark event handled due to persistence failure: {e}"
 			);
-		})
+		});
+		if res.is_ok() {
+			// If an event was handled, probably our balances changed and we may need to rebalance.
+			let inner_ref = Arc::clone(&self.inner);
+			self.inner.runtime.spawn_cancellable_background_task(async move {
+				inner_ref.rebalancer.do_rebalance_if_needed().await;
+			});
+		}
+		res
 	}
 
 	/// Stops the wallet, which will stop the underlying LDK node and any background tasks.
