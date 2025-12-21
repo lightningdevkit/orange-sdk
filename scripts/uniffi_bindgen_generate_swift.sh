@@ -17,11 +17,15 @@ rustup target add aarch64-apple-ios-sim --toolchain stable
 rustup target add aarch64-apple-darwin x86_64-apple-darwin --toolchain stable
 
 # Build rust target libs
+export IPHONEOS_DEPLOYMENT_TARGET=15.0
 cargo build --profile release-smaller --features uniffi || exit 1
 cargo build --profile release-smaller --target x86_64-apple-darwin --features uniffi || exit 1
 cargo build --profile release-smaller --target aarch64-apple-darwin --features uniffi || exit 1
+export CFLAGS_x86_64_apple_ios=-mios-version-min=$IPHONEOS_DEPLOYMENT_TARGET
 cargo build --profile release-smaller --target x86_64-apple-ios --features uniffi || exit 1
+export CFLAGS_aarch64_apple_ios=-mios-version-min=$IPHONEOS_DEPLOYMENT_TARGET
 cargo build --profile release-smaller --target aarch64-apple-ios --features uniffi || exit 1
+export CFLAGS_aarch64_apple_ios_sim=-mios-version-min=$IPHONEOS_DEPLOYMENT_TARGET
 cargo +stable build --release --target aarch64-apple-ios-sim --features uniffi || exit 1
 
 # Combine ios-sim and apple-darwin (macos) libs for x86_64 and aarch64 (m1)
