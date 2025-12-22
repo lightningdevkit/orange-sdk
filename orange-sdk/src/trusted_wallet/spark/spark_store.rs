@@ -5,8 +5,8 @@ use std::sync::Arc;
 use crate::io;
 
 use breez_sdk_spark::{
-	DepositInfo, ListPaymentsRequest, Payment, PaymentDetails, PaymentMetadata, StorageError,
-	UpdateDepositPayload,
+	DepositInfo, ListPaymentsRequest, Payment, PaymentDetails, PaymentMetadata,
+	SetLnurlMetadataItem, StorageError, UpdateDepositPayload,
 };
 use ldk_node::DynStore;
 use ldk_node::lightning::util::persist::KVSTORE_NAMESPACE_KEY_MAX_LEN;
@@ -165,7 +165,7 @@ impl breez_sdk_spark::Storage for SparkStore {
 		let p = payments.into_iter().find(|p| {
 			if let Some(details) = p.details.as_ref() {
 				match details {
-					PaymentDetails::Spark { invoice_details } => {
+					PaymentDetails::Spark { invoice_details, .. } => {
 						if invoice_details.as_ref().is_some_and(|i| i.invoice == invoice) {
 							return true;
 						}
@@ -304,6 +304,13 @@ impl breez_sdk_spark::Storage for SparkStore {
 		.await
 		.map_err(|e| StorageError::Implementation(format!("{e:?}")))?;
 
+		Ok(())
+	}
+
+	async fn set_lnurl_metadata(
+		&self, _metadata: Vec<SetLnurlMetadataItem>,
+	) -> Result<(), StorageError> {
+		// we don't use this
 		Ok(())
 	}
 }

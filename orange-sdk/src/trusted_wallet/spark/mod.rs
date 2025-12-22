@@ -203,7 +203,11 @@ impl TrustedWalletInterface for Spark {
 
 				let res = self
 					.spark_wallet
-					.send_payment(SendPaymentRequest { prepare_response: prepare, options: None })
+					.send_payment(SendPaymentRequest {
+						prepare_response: prepare,
+						options: None,
+						idempotency_key: None,
+					})
 					.await?;
 
 				let id = parse_payment_id(&res.payment.id)?;
@@ -324,12 +328,6 @@ impl EventListener for SparkEventHandler {
 		match event {
 			SdkEvent::Synced => {
 				log_debug!(self.logger, "Spark wallet synced");
-			},
-			SdkEvent::DataSynced { did_pull_new_records } => {
-				log_debug!(
-					self.logger,
-					"Spark wallet data synced, did_pull_new_records: {did_pull_new_records}"
-				);
 			},
 			SdkEvent::UnclaimedDeposits { unclaimed_deposits } => {
 				log_warn!(
