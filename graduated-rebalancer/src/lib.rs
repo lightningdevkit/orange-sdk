@@ -12,6 +12,7 @@ use bitcoin_payment_instructions::PaymentMethod;
 use lightning::bitcoin::hashes::Hash;
 use lightning::bitcoin::hex::DisplayHex;
 use lightning::bitcoin::OutPoint;
+use lightning::types::payment::PaymentHash;
 use lightning::util::logger::Logger;
 use lightning::{log_debug, log_error, log_info};
 use lightning_invoice::Bolt11Invoice;
@@ -159,6 +160,12 @@ pub enum RebalancerEvent {
 		trigger_id: [u8; 32],
 		/// Trusted wallet payment ID for the rebalance
 		trusted_rebalance_payment_id: [u8; 32],
+		/// The [`PaymentHash`] of this rebalance payment.
+		///
+		/// Note that if you're using LDK only we have the information required to make a
+		/// payment for this hash, meaning that any payments claimable by our lightning
+		/// wallet are related to this rebalance.
+		payment_hash: PaymentHash,
 		/// Amount being rebalanced in millisatoshis
 		amount_msat: u64,
 	},
@@ -170,6 +177,12 @@ pub enum RebalancerEvent {
 		trusted_rebalance_payment_id: [u8; 32],
 		/// Lightning payment ID for the rebalance
 		ln_rebalance_payment_id: [u8; 32],
+		/// The [`PaymentHash`] of this rebalance payment.
+		///
+		/// Note that if you're using LDK only we have the information required to make a
+		/// payment for this hash, meaning that any payments claimable by our lightning
+		/// wallet are related to this rebalance.
+		payment_hash: PaymentHash,
 		/// Amount rebalanced in millisatoshis
 		amount_msat: u64,
 		/// Total fee paid in millisatoshis
@@ -281,6 +294,7 @@ where
 						.handle_event(RebalancerEvent::RebalanceInitiated {
 							trigger_id: params.id,
 							trusted_rebalance_payment_id: rebalance_id,
+							payment_hash: PaymentHash(expected_hash.to_byte_array()),
 							amount_msat: transfer_amt.milli_sats(),
 						})
 						.await;
@@ -322,6 +336,7 @@ where
 							trusted_rebalance_payment_id: rebalance_id,
 							ln_rebalance_payment_id: ln_payment.id,
 							amount_msat: transfer_amt.milli_sats(),
+							payment_hash: PaymentHash(expected_hash.to_byte_array()),
 							fee_msat: ln_payment.fee_paid_msat.unwrap_or_default()
 								+ trusted_payment.fee_paid_msat.unwrap_or_default(),
 						})

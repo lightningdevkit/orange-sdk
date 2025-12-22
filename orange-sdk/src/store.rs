@@ -18,8 +18,8 @@ use ldk_node::bitcoin::Txid;
 use ldk_node::bitcoin::hex::{DisplayHex, FromHex};
 use ldk_node::lightning::io;
 use ldk_node::lightning::ln::msgs::DecodeError;
-use ldk_node::lightning::types::payment::PaymentPreimage;
-use ldk_node::lightning::util::persist::KVStore;
+use ldk_node::lightning::types::payment::{PaymentHash, PaymentPreimage};
+use ldk_node::lightning::util::persist::{KVStore, KVStoreSync};
 use ldk_node::lightning::util::ser::{Readable, Writeable, Writer};
 use ldk_node::lightning::{impl_writeable_tlv_based, impl_writeable_tlv_based_enum};
 use ldk_node::payment::PaymentDetails;
@@ -254,14 +254,21 @@ pub(crate) enum TxType {
 	Payment {
 		ty: PaymentType,
 	},
-	PendingRebalance {},
+	PendingRebalance {
+		// Note that while all of these fields are `Option`al, they are always
+		// filled in by any released version of Orange. They were added after
+		// some initial beta testing, however.
+		trusted_payment: Option<[u8; 32]>,
+		payment_triggering_transfer: Option<PaymentId>,
+		payment_hash: Option<PaymentHash>,
+	},
 }
 
 impl TxType {
 	pub(crate) fn is_rebalance(&self) -> bool {
 		matches!(
 			self,
-			TxType::PendingRebalance {}
+			TxType::PendingRebalance { .. }
 				| TxType::TrustedToLightning { .. }
 				| TxType::OnchainToLightning { .. }
 		)
@@ -280,7 +287,11 @@ impl_writeable_tlv_based_enum!(TxType,
 	},
 	(2, PaymentTriggeringTransferLightning) => { (0, ty, required), },
 	(3, Payment) => { (0, ty, required), },
-	(4, PendingRebalance) => {},
+	(4, PendingRebalance) => {
+		(1, trusted_payment, option),
+		(3, payment_triggering_transfer, option),
+		(5, payment_hash, option),
+	},
 );
 
 #[derive(Debug, Copy, Clone)]

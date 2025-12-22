@@ -679,6 +679,15 @@ impl Wallet {
 			transaction: Option<Transaction>,
 		}
 
+		let mut completed_internal_transfers = HashMap::new();
+		#[derive(Debug)]
+		struct CompletedInternalTransfer {
+			trusted_transfer_id: [u8; 32],
+			payment_triggering_transfer: PaymentId,
+			time: Duration,
+			ln_transfer_id: Option<[u8; 32]>,
+		}
+
 		for payment in trusted_payments {
 			if let Some(tx_metadata) = tx_metadata.get(&PaymentId::Trusted(payment.id)) {
 				match &tx_metadata.ty {
@@ -731,7 +740,32 @@ impl Wallet {
 							time_since_epoch: tx_metadata.time,
 						});
 					},
-					TxType::PendingRebalance { .. } => {
+					TxType::PendingRebalance {
+						trusted_payment,
+						payment_triggering_transfer,
+						payment_hash,
+					} => {
+						if let Some(trusted_id) = trusted_payment {
+							debug_assert_eq!(*trusted_id, payment.id);
+						}
+						if payment.status == TxStatus::Completed {
+							if trusted_payment.is_some()
+								&& payment_triggering_transfer.is_some()
+								&& payment_hash.is_some()
+							{
+								let old_val = completed_internal_transfers.insert(
+									payment_hash.unwrap(),
+									CompletedInternalTransfer {
+										trusted_transfer_id: trusted_payment.unwrap(),
+										payment_triggering_transfer: payment_triggering_transfer
+											.unwrap(),
+										time: payment.time_since_epoch,
+										ln_transfer_id: None,
+									},
+								);
+								debug_assert!(old_val.is_none());
+							}
+						}
 						// Pending rebalances are not shown in the transaction list.
 						continue;
 					},
@@ -879,15 +913,63 @@ impl Wallet {
 					// failed rebalances.
 					continue;
 				}
-				res.push(Transaction {
-					id: PaymentId::SelfCustodial(payment.id.0),
-					status,
-					outbound: payment.direction == PaymentDirection::Outbound,
-					amount: payment.amount_msat.map(|a| Amount::from_milli_sats(a).unwrap()),
-					fee,
-					payment_type: (&payment).into(),
-					time_since_epoch: Duration::from_secs(payment.latest_update_timestamp),
-				})
+
+				let payment_hash = match payment.kind {
+					PaymentKind::Onchain { .. } => None,
+					PaymentKind::Bolt11 { hash, .. } => Some(hash),
+					PaymentKind::Bolt11Jit { hash, .. } => Some(hash),
+					PaymentKind::Bolt12Offer { hash, .. } => hash,
+					PaymentKind::Bolt12Refund { hash, .. } => hash,
+					PaymentKind::Spontaneous { hash, .. } => Some(hash),
+				};
+
+				if let Some(info) =
+					payment_hash.map(|hash| completed_internal_transfers.get_mut(&hash)).flatten()
+				{
+					info.ln_transfer_id = Some(payment.id.0);
+				} else {
+					res.push(Transaction {
+						id: PaymentId::SelfCustodial(payment.id.0),
+						status,
+						outbound: payment.direction == PaymentDirection::Outbound,
+						amount: payment.amount_msat.map(|a| Amount::from_milli_sats(a).unwrap()),
+						fee,
+						payment_type: (&payment).into(),
+						time_since_epoch: Duration::from_secs(payment.latest_update_timestamp),
+					})
+				}
+			}
+		}
+
+		std::mem::drop(tx_metadata);
+		for (_, info) in completed_internal_transfers {
+			debug_assert!(info.ln_transfer_id.is_some());
+			if let Some(lightning_payment) = info.ln_transfer_id {
+				log_info!(
+					self.inner.logger,
+					"Setting metadata for background-completed internal transfer with from trusted transaction {:?} to LN transaction {:?} triggered by transaction {}",
+					info.trusted_transfer_id,
+					lightning_payment,
+					info.payment_triggering_transfer
+				);
+				let metadata = TxMetadata {
+					ty: TxType::TrustedToLightning {
+						trusted_payment: info.trusted_transfer_id,
+						lightning_payment,
+						payment_triggering_transfer: info.payment_triggering_transfer,
+					},
+					time: info.time,
+				};
+				self.inner
+					.tx_metadata
+					.set_tx_caused_rebalance(&info.payment_triggering_transfer)
+					.expect("Failed to write metadata for rebalance transaction");
+				self.inner
+					.tx_metadata
+					.upsert(PaymentId::Trusted(info.trusted_transfer_id), metadata);
+				self.inner
+					.tx_metadata
+					.insert(PaymentId::SelfCustodial(lightning_payment), metadata);
 			}
 		}
 
