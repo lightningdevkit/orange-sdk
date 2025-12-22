@@ -1235,7 +1235,8 @@ impl Wallet {
 		// Finally, try trusted on-chain first,
 		for method in methods.clone() {
 			if let PaymentMethod::OnChain { .. } = method {
-				if let Ok(id) = pay_trusted(method, || PaymentType::OutgoingOnChain { txid: None }).await
+				if let Ok(id) =
+					pay_trusted(method, || PaymentType::OutgoingOnChain { txid: None }).await
 				{
 					return Ok(id);
 				};
@@ -1245,8 +1246,8 @@ impl Wallet {
 		// then pay on-chain out of the lightning wallet
 		for method in &methods {
 			if let PaymentMethod::OnChain { .. } = method {
-				if let Ok(id) = pay_lightning(method, || PaymentType::OutgoingOnChain { txid: None })
-					.await
+				if let Ok(id) =
+					pay_lightning(method, || PaymentType::OutgoingOnChain { txid: None }).await
 				{
 					return Ok(id);
 				};
@@ -1327,12 +1328,13 @@ impl Wallet {
 	///
 	/// **Note:** This **MUST** be called after each event has been handled.
 	pub fn event_handled(&self) -> Result<(), ()> {
-		let res = self.inner.runtime.block_on(self.inner.event_queue.event_handled()).map_err(|e| {
-			log_error!(
-				self.inner.logger,
-				"Couldn't mark event handled due to persistence failure: {e}"
-			);
-		});
+		let res =
+			self.inner.runtime.block_on(self.inner.event_queue.event_handled()).map_err(|e| {
+				log_error!(
+					self.inner.logger,
+					"Couldn't mark event handled due to persistence failure: {e}"
+				);
+			});
 		if res.is_ok() {
 			// If an event was handled, probably our balances changed and we may need to rebalance.
 			let inner_ref = Arc::clone(&self.inner);

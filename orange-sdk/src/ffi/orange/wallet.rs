@@ -156,7 +156,9 @@ impl Wallet {
 	///
 	/// Returns once the payment is pending. This does not mean the payment has completed -
 	/// it may still fail. Use event handlers or transaction listing to monitor payment status.
-	pub async fn pay(&self, payment_info: Arc<PaymentInfo>) -> Result<super::PaymentId, WalletError> {
+	pub async fn pay(
+		&self, payment_info: Arc<PaymentInfo>,
+	) -> Result<super::PaymentId, WalletError> {
 		let id = self.inner.pay(&payment_info.0).await?;
 		Ok(id.into())
 	}

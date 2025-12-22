@@ -4,8 +4,8 @@ use crate::{
 	PaymentId as OrangePaymentId, Transaction as OrangeTransaction, event::Event as OrangeEvent,
 };
 use crate::{impl_from_core_type, impl_into_core_type};
-use std::sync::Arc;
 use ldk_node::bitcoin::hex::DisplayHex;
+use std::sync::Arc;
 
 pub mod config;
 pub mod error;

@@ -393,7 +393,7 @@ async fn execute_command(command: Commands, state: &mut WalletState) -> Result<(
 			match wallet.parse_payment_instructions(&destination).await {
 				Ok(instructions) => match PaymentInfo::build(instructions, amount) {
 					Ok(payment_info) => match wallet.pay(&payment_info).await {
-						Ok(()) => {
+						Ok(_) => {
 							println!("{} Payment initiated successfully!", "✅".bright_green());
 						},
 						Err(e) => {
