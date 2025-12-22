@@ -49,6 +49,13 @@ enum Commands {
 	Transactions,
 	/// List our lightning Channels
 	Channels,
+	/// Estimate the fee for a payment
+	EstimateFee {
+		/// Destination address or invoice
+		destination: String,
+		/// Amount in sats (optional)
+		amount: Option<u64>,
+	},
 	/// Clear the screen
 	Clear,
 	/// Exit the application
@@ -346,6 +353,20 @@ fn parse_command(input: &str) -> Result<Commands> {
 		"status" => Ok(Commands::Status),
 		"transactions" | "txs" | "tx" => Ok(Commands::Transactions),
 		"channels" | "chan" => Ok(Commands::Channels),
+		"estimate-fee" | "estimatefee" | "fee" => {
+			if parts.len() < 2 {
+				return Err(anyhow::anyhow!("Usage: estimate-fee <destination> [amount]"));
+			}
+			let destination = parts[1].to_string();
+
+			let amount = if parts.len() > 2 {
+				Some(parts[2].parse::<u64>().context("Amount must be a valid number")?)
+			} else {
+				None
+			};
+
+			Ok(Commands::EstimateFee { destination, amount })
+		},
 		"clear" | "cls" => Ok(Commands::Clear),
 		"exit" | "quit" | "q" => Ok(Commands::Exit),
 		"help" => {
@@ -542,6 +563,33 @@ async fn execute_command(command: Commands, state: &mut WalletState) -> Result<(
 				}
 			}
 		},
+		Commands::EstimateFee { destination, amount } => {
+			let wallet = state.wallet();
+
+			println!("{} Estimating fee...", "🧮".bright_yellow());
+			println!("Destination: {}", destination.bright_cyan());
+			if let Some(amount) = amount {
+				println!("Amount: {} sats", amount.to_string().bright_green().bold());
+			}
+
+			let _amount = amount
+				.map(|a| Amount::from_sats(a).map_err(|_| anyhow::anyhow!("Invalid amount")))
+				.transpose()?;
+
+			match wallet.parse_payment_instructions(&destination).await {
+				Ok(instructions) => {
+					let estimated_fee = wallet.estimate_fee(&instructions).await;
+					println!(
+						"{} Estimated fee: {} sats",
+						"✅".bright_green(),
+						estimated_fee.sats_rounding_up()
+					);
+				},
+				Err(e) => {
+					return Err(anyhow::anyhow!("Failed to parse payment instructions: {e:?}"));
+				},
+			}
+		},
 		Commands::Clear => {
 			print!("\x1B[2J\x1B[1;1H");
 			std::io::stdout().flush().unwrap();
@@ -577,6 +625,9 @@ fn print_help() {
 	println!("  {}", "channels".bright_green().bold());
 	println!("    List channels");
 	println!();
+	println!("  {} <destination> [amount]", "estimate-fee".bright_green().bold());
+	println!("    Estimate the fee for a payment");
+	println!();
 	println!("  {}", "clear".bright_green().bold());
 	println!("    Clear the terminal screen");
 	println!();
@@ -587,6 +638,7 @@ fn print_help() {
 	println!("  balance");
 	println!("  send lnbc1... 10000");
 	println!("  receive 25000");
+	println!("  estimate-fee lnbc1... 10000");
 	println!("  events");
 	println!();
 	println!("{}", "Note:".bright_yellow().bold());
