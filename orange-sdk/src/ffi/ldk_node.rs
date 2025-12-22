@@ -3,6 +3,7 @@ use crate::ffi::orange::error::ConfigError;
 use crate::{impl_from_core_type, impl_into_core_type};
 use ldk_node::ChannelDetails as LDKChannelDetails;
 use ldk_node::bip39::Mnemonic as LDKMnemonic;
+use ldk_node::bip39::rand_core::RngCore;
 use ldk_node::bitcoin::Network as LDKNetwork;
 use std::str::FromStr;
 
@@ -36,6 +37,13 @@ impl Mnemonic {
 			Ok(mnemonic) => Ok(Mnemonic(mnemonic)),
 			Err(_) => Err(ConfigError::InvalidMnemonic),
 		}
+	}
+
+	#[uniffi::constructor]
+	pub fn generate() -> Result<Self, ConfigError> {
+		let mut entropy = [0u8; 16]; // 128 bits for 12-word mnemonic
+		rand::thread_rng().fill_bytes(&mut entropy);
+		Self::from_entropy(entropy.to_vec())
 	}
 }
 
