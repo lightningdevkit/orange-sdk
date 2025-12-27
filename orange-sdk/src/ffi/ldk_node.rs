@@ -19,6 +19,7 @@ impl From<Network> for LDKNetwork {
 }
 
 #[derive(Debug, Clone, uniffi::Object)]
+#[uniffi::export(Display)]
 pub struct Mnemonic(pub LDKMnemonic);
 
 #[uniffi::export]
