@@ -429,14 +429,14 @@ impl TxMetadataStore {
 
 const REBALANCE_ENABLED_KEY: &str = "rebalance_enabled";
 
-pub(crate) fn get_rebalance_enabled(store: &DynStore) -> bool {
-	match KVStoreSync::read(store, STORE_PRIMARY_KEY, "", REBALANCE_ENABLED_KEY) {
+pub(crate) async fn get_rebalance_enabled(store: &DynStore) -> bool {
+	match KVStore::read(store, STORE_PRIMARY_KEY, "", REBALANCE_ENABLED_KEY).await {
 		Ok(bytes) => Readable::read(&mut &bytes[..]).expect("Invalid data in rebalance_enabled"),
 		Err(e) if e.kind() == io::ErrorKind::NotFound => {
 			// if rebalance_enabled is not found, default to true
 			// and write it to the store so we don't have to do this again
 			let rebalance_enabled = true;
-			set_rebalance_enabled(store, rebalance_enabled);
+			set_rebalance_enabled(store, rebalance_enabled).await;
 			rebalance_enabled
 		},
 		Err(e) => {
@@ -445,9 +445,10 @@ pub(crate) fn get_rebalance_enabled(store: &DynStore) -> bool {
 	}
 }
 
-pub(crate) fn set_rebalance_enabled(store: &DynStore, enabled: bool) {
+pub(crate) async fn set_rebalance_enabled(store: &DynStore, enabled: bool) {
 	let bytes = enabled.encode();
-	KVStoreSync::write(store, STORE_PRIMARY_KEY, "", REBALANCE_ENABLED_KEY, bytes)
+	KVStore::write(store, STORE_PRIMARY_KEY, "", REBALANCE_ENABLED_KEY, bytes)
+		.await
 		.expect("Failed to write rebalance_enabled");
 }
 

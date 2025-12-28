@@ -118,13 +118,13 @@ impl Wallet {
 	}
 
 	/// Sets whether the wallet should automatically rebalance from trusted/onchain to lightning.
-	pub fn set_rebalance_enabled(&self, value: bool) {
-		self.inner.set_rebalance_enabled(value)
+	pub async fn set_rebalance_enabled(&self, value: bool) {
+		self.inner.set_rebalance_enabled(value).await
 	}
 
 	/// Whether the wallet should automatically rebalance from trusted/onchain to lightning.
-	pub fn get_rebalance_enabled(&self) -> bool {
-		self.inner.get_rebalance_enabled()
+	pub async fn get_rebalance_enabled(&self) -> bool {
+		self.inner.get_rebalance_enabled().await
 	}
 
 	pub async fn list_transactions(
@@ -191,8 +191,8 @@ impl Wallet {
 	}
 
 	/// List our current channels
-	pub fn close_channels(&self) -> Result<(), WalletError> {
-		self.inner.close_channels()?;
+	pub async fn close_channels(&self) -> Result<(), WalletError> {
+		self.inner.close_channels().await?;
 		Ok(())
 	}
 

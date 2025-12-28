@@ -634,13 +634,13 @@ impl Wallet {
 	}
 
 	/// Sets whether the wallet should automatically rebalance from trusted/onchain to lightning.
-	pub fn set_rebalance_enabled(&self, value: bool) {
-		store::set_rebalance_enabled(self.inner.store.as_ref(), value)
+	pub async fn set_rebalance_enabled(&self, value: bool) {
+		store::set_rebalance_enabled(self.inner.store.as_ref(), value).await
 	}
 
 	/// Whether the wallet should automatically rebalance from trusted/onchain to lightning.
-	pub fn get_rebalance_enabled(&self) -> bool {
-		store::get_rebalance_enabled(self.inner.store.as_ref())
+	pub async fn get_rebalance_enabled(&self) -> bool {
+		store::get_rebalance_enabled(self.inner.store.as_ref()).await
 	}
 
 	/// Returns the lightning wallet's node id.
@@ -1268,10 +1268,10 @@ impl Wallet {
 	/// Initiates closing all channels in the lightning wallet. The channel will not be closed
 	/// until a [`Event::ChannelClosed`] event is emitted.
 	/// This will disable rebalancing before closing channels, so that we don't try to reopen them.
-	pub fn close_channels(&self) -> Result<(), WalletError> {
+	pub async fn close_channels(&self) -> Result<(), WalletError> {
 		// we are explicitly disabling rebalancing here, so that we don't try to
 		// reopen channels after closing them.
-		self.set_rebalance_enabled(false);
+		self.set_rebalance_enabled(false).await;
 
 		self.inner.ln_wallet.close_channels()?;
 

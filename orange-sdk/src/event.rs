@@ -442,7 +442,7 @@ impl LdkEventHandler {
 			} => {
 				// We experienced a channel close, we disable rebalancing so we don't automatically
 				// try to reopen the channel.
-				store::set_rebalance_enabled(self.event_queue.kv_store.as_ref(), false);
+				store::set_rebalance_enabled(self.event_queue.kv_store.as_ref(), false).await;
 
 				if let Err(e) = self
 					.event_queue

@@ -62,7 +62,7 @@ impl OrangeTrigger {
 impl RebalanceTrigger for OrangeTrigger {
 	fn needs_trusted_rebalance(&self) -> impl Future<Output = Option<TriggerParams>> + Send {
 		async move {
-			let rebalance_enabled = store::get_rebalance_enabled(self.store.as_ref());
+			let rebalance_enabled = store::get_rebalance_enabled(self.store.as_ref()).await;
 			if !rebalance_enabled {
 				return None;
 			}
@@ -143,7 +143,7 @@ impl RebalanceTrigger for OrangeTrigger {
 
 	fn needs_onchain_rebalance(&self) -> impl Future<Output = Option<TriggerParams>> + Send {
 		async move {
-			let rebalance_enabled = store::get_rebalance_enabled(self.store.as_ref());
+			let rebalance_enabled = store::get_rebalance_enabled(self.store.as_ref()).await;
 			if !rebalance_enabled {
 				return None;
 			}
