@@ -400,7 +400,7 @@ impl SparkEventHandler {
 								TrustedError::Other(format!("Invalid payment_hash hex: {e:?}"))
 							})?;
 
-						if self.tx_metadata.set_preimage(payment_id, preimage).is_err() {
+						if self.tx_metadata.set_preimage(payment_id, preimage).await.is_err() {
 							log_error!(
 								self.logger,
 								"Failed to set preimage for payment {payment_id:?}"

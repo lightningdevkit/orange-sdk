@@ -322,124 +322,108 @@ impl TxMetadataStore {
 		self.tx_metadata.read().unwrap()
 	}
 
-	fn do_set(&self, key: PaymentId, value: TxMetadata) -> bool {
-		let mut tx_metadata = self.tx_metadata.write().unwrap();
+	async fn do_set(&self, key: PaymentId, value: TxMetadata) -> bool {
 		let key_str = key.to_string();
 		let ser = value.encode();
-		let old = tx_metadata.insert(key, value);
-		KVStoreSync::write(
-			self.store.as_ref(),
-			STORE_PRIMARY_KEY,
-			STORE_SECONDARY_KEY,
-			&key_str,
-			ser,
-		)
-		.expect("We do not allow writes to fail");
+		let old = {
+			let mut tx_metadata = self.tx_metadata.write().unwrap();
+			tx_metadata.insert(key, value)
+		};
+		KVStore::write(self.store.as_ref(), STORE_PRIMARY_KEY, STORE_SECONDARY_KEY, &key_str, ser)
+			.await
+			.expect("We do not allow writes to fail");
 		old.is_some()
 	}
 
-	pub fn upsert(&self, key: PaymentId, value: TxMetadata) {
-		self.do_set(key, value);
+	pub async fn upsert(&self, key: PaymentId, value: TxMetadata) {
+		self.do_set(key, value).await;
 	}
 
-	pub fn insert(&self, key: PaymentId, value: TxMetadata) {
-		let had_old = self.do_set(key, value);
+	pub async fn insert(&self, key: PaymentId, value: TxMetadata) {
+		let had_old = self.do_set(key, value).await;
 		debug_assert!(!had_old);
 	}
 
-	pub fn set_tx_caused_rebalance(&self, payment_id: &PaymentId) -> Result<(), ()> {
-		let mut tx_metadata = self.tx_metadata.write().unwrap();
-		if let Some(metadata) = tx_metadata.get_mut(payment_id) {
-			if let TxType::Payment { ty } = &mut metadata.ty {
-				metadata.ty = TxType::PaymentTriggeringTransferLightning { ty: *ty };
-				let key_str = payment_id.to_string();
-				let ser = metadata.encode();
-				KVStoreSync::write(
-					self.store.as_ref(),
-					STORE_PRIMARY_KEY,
-					STORE_SECONDARY_KEY,
-					&key_str,
-					ser,
-				)
-				.expect("We do not allow writes to fail");
-				Ok(())
+	pub async fn set_tx_caused_rebalance(&self, payment_id: &PaymentId) -> Result<(), ()> {
+		let (key_str, ser) = {
+			let mut tx_metadata = self.tx_metadata.write().unwrap();
+			if let Some(metadata) = tx_metadata.get_mut(payment_id) {
+				if let TxType::Payment { ty } = &mut metadata.ty {
+					metadata.ty = TxType::PaymentTriggeringTransferLightning { ty: *ty };
+					let key_str = payment_id.to_string();
+					let ser = metadata.encode();
+					(key_str, ser)
+				} else {
+					eprintln!("payment_id {payment_id} is not a payment, cannot set rebalance");
+					return Err(());
+				}
 			} else {
-				eprintln!("payment_id {payment_id} is not a payment, cannot set rebalance");
-				Err(())
+				eprintln!("doesn't exist in metadata store: {payment_id}");
+				return Err(());
 			}
-		} else {
-			eprintln!("doesn't exist in metadata store: {payment_id}");
-			Err(())
-		}
+		};
+		KVStore::write(self.store.as_ref(), STORE_PRIMARY_KEY, STORE_SECONDARY_KEY, &key_str, ser)
+			.await
+			.expect("We do not allow writes to fail");
+		Ok(())
 	}
 
 	/// Sets the preimage for an outgoing lightning payment. If the payment already has a preimage,
 	/// this is a no-op and returns Ok(()). If the payment_id does not exist in the store, or if the payment
 	/// is not an outgoing lightning payment, returns Err(()).
-	pub fn set_preimage(&self, payment_id: PaymentId, preimage: [u8; 32]) -> Result<(), ()> {
-		let mut tx_metadata = self.tx_metadata.write().unwrap();
-		if let Some(metadata) = tx_metadata.get_mut(&payment_id) {
-			match metadata.ty {
-				TxType::Payment { ty } => match ty {
-					PaymentType::OutgoingLightningBolt12 { payment_preimage } => {
-						if payment_preimage.is_some() {
-							Ok(())
-						} else {
-							metadata.ty = TxType::Payment {
-								ty: PaymentType::OutgoingLightningBolt12 {
-									payment_preimage: Some(PaymentPreimage(preimage)),
-								},
-							};
-
-							KVStoreSync::write(
-								self.store.as_ref(),
-								STORE_PRIMARY_KEY,
-								STORE_SECONDARY_KEY,
-								&payment_id.to_string(),
-								metadata.encode(),
-							)
-							.expect("We do not allow writes to fail");
-							Ok(())
-						}
-					},
-					PaymentType::OutgoingLightningBolt11 { payment_preimage } => {
-						if payment_preimage.is_some() {
-							Ok(())
-						} else {
-							metadata.ty = TxType::Payment {
-								ty: PaymentType::OutgoingLightningBolt11 {
-									payment_preimage: Some(PaymentPreimage(preimage)),
-								},
-							};
-
-							KVStoreSync::write(
-								self.store.as_ref(),
-								STORE_PRIMARY_KEY,
-								STORE_SECONDARY_KEY,
-								&payment_id.to_string(),
-								metadata.encode(),
-							)
-							.expect("We do not allow writes to fail");
-							Ok(())
-						}
+	pub async fn set_preimage(&self, payment_id: PaymentId, preimage: [u8; 32]) -> Result<(), ()> {
+		let (key_str, ser) = {
+			let mut tx_metadata = self.tx_metadata.write().unwrap();
+			if let Some(metadata) = tx_metadata.get_mut(&payment_id) {
+				match metadata.ty {
+					TxType::Payment { ty } => match ty {
+						PaymentType::OutgoingLightningBolt12 { payment_preimage } => {
+							if payment_preimage.is_some() {
+								return Ok(());
+							} else {
+								metadata.ty = TxType::Payment {
+									ty: PaymentType::OutgoingLightningBolt12 {
+										payment_preimage: Some(PaymentPreimage(preimage)),
+									},
+								};
+								(payment_id.to_string(), metadata.encode())
+							}
+						},
+						PaymentType::OutgoingLightningBolt11 { payment_preimage } => {
+							if payment_preimage.is_some() {
+								return Ok(());
+							} else {
+								metadata.ty = TxType::Payment {
+									ty: PaymentType::OutgoingLightningBolt11 {
+										payment_preimage: Some(PaymentPreimage(preimage)),
+									},
+								};
+								(payment_id.to_string(), metadata.encode())
+							}
+						},
+						_ => {
+							eprintln!(
+								"payment_id {payment_id} is not an outgoing lightning payment, cannot set preimage"
+							);
+							return Err(());
+						},
 					},
 					_ => {
-						eprintln!(
-							"payment_id {payment_id} is not an outgoing lightning payment, cannot set preimage"
-						);
-						Err(())
+						// if we're trying to set a preimage on a non-payment, just continue
+						// this should only happen when we finish a rebalance payment
+						return Ok(());
 					},
-				},
-				_ => {
-					// if we're trying to set a preimage on a non-payment, just continue
-					// this should only happen when we finish a rebalance payment
-					Ok(())
-				},
+				}
+			} else {
+				eprintln!("doesn't exist in metadata store: {payment_id}");
+				return Err(());
 			}
-		} else {
-			eprintln!("doesn't exist in metadata store: {payment_id}");
-			Err(())
-		}
+		};
+
+		KVStore::write(self.store.as_ref(), STORE_PRIMARY_KEY, STORE_SECONDARY_KEY, &key_str, ser)
+			.await
+			.expect("We do not allow writes to fail");
+		Ok(())
 	}
 }
 

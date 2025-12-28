@@ -1095,15 +1095,18 @@ impl Wallet {
 					let res = self.inner.trusted.pay(method, instructions.amount).await;
 					match res {
 						Ok(id) => {
-							self.inner.tx_metadata.insert(
-								PaymentId::Trusted(id),
-								TxMetadata {
-									ty: TxType::Payment { ty: ty() },
-									time: SystemTime::now()
-										.duration_since(SystemTime::UNIX_EPOCH)
-										.unwrap(),
-								},
-							);
+							self.inner
+								.tx_metadata
+								.insert(
+									PaymentId::Trusted(id),
+									TxMetadata {
+										ty: TxType::Payment { ty: ty() },
+										time: SystemTime::now()
+											.duration_since(SystemTime::UNIX_EPOCH)
+											.unwrap(),
+									},
+								)
+								.await;
 							return Ok(PaymentId::Trusted(id));
 						},
 						Err(e) => {
@@ -1136,15 +1139,18 @@ impl Wallet {
 								// Note that the Payment Id can be repeated if we make a payment,
 								// it fails, then we attempt to pay the same (BOLT 11) invoice
 								// again.
-								self.inner.tx_metadata.upsert(
-									PaymentId::SelfCustodial(id.0),
-									TxMetadata {
-										ty: TxType::Payment { ty: typ },
-										time: SystemTime::now()
-											.duration_since(SystemTime::UNIX_EPOCH)
-											.unwrap(),
-									},
-								);
+								self.inner
+									.tx_metadata
+									.upsert(
+										PaymentId::SelfCustodial(id.0),
+										TxMetadata {
+											ty: TxType::Payment { ty: typ },
+											time: SystemTime::now()
+												.duration_since(SystemTime::UNIX_EPOCH)
+												.unwrap(),
+										},
+									)
+									.await;
 								let inner_ref = Arc::clone(&self.inner);
 								self.inner.runtime.spawn_cancellable_background_task(async move {
 									inner_ref.rebalancer.do_rebalance_if_needed().await;
