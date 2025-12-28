@@ -19,7 +19,7 @@ use ldk_node::bitcoin::hex::{DisplayHex, FromHex};
 use ldk_node::lightning::io;
 use ldk_node::lightning::ln::msgs::DecodeError;
 use ldk_node::lightning::types::payment::PaymentPreimage;
-use ldk_node::lightning::util::persist::{KVStore, KVStoreSync};
+use ldk_node::lightning::util::persist::KVStore;
 use ldk_node::lightning::util::ser::{Readable, Writeable, Writer};
 use ldk_node::lightning::{impl_writeable_tlv_based, impl_writeable_tlv_based_enum};
 use ldk_node::payment::PaymentDetails;
@@ -452,25 +452,27 @@ pub(crate) async fn set_rebalance_enabled(store: &DynStore, enabled: bool) {
 		.expect("Failed to write rebalance_enabled");
 }
 
-pub(crate) fn write_splice_out(store: &DynStore, details: &PaymentDetails) {
-	KVStoreSync::write(
+pub(crate) async fn write_splice_out(store: &DynStore, details: &PaymentDetails) {
+	KVStore::write(
 		store,
 		STORE_PRIMARY_KEY,
 		SPLICE_OUT_SECONDARY_KEY,
 		&details.id.0.to_lower_hex_string(),
 		details.encode(),
 	)
+	.await
 	.expect("Failed to write splice out txid");
 }
 
-pub(crate) fn read_splice_outs(store: &DynStore) -> Vec<PaymentDetails> {
-	let keys = KVStoreSync::list(store, STORE_PRIMARY_KEY, SPLICE_OUT_SECONDARY_KEY)
+pub(crate) async fn read_splice_outs(store: &DynStore) -> Vec<PaymentDetails> {
+	let keys = KVStore::list(store, STORE_PRIMARY_KEY, SPLICE_OUT_SECONDARY_KEY)
+		.await
 		.expect("We do not allow reads to fail");
 	let mut splice_outs = Vec::with_capacity(keys.len());
 	for key in keys {
-		let data_bytes =
-			KVStoreSync::read(store, STORE_PRIMARY_KEY, SPLICE_OUT_SECONDARY_KEY, &key)
-				.expect("We do not allow reads to fail");
+		let data_bytes = KVStore::read(store, STORE_PRIMARY_KEY, SPLICE_OUT_SECONDARY_KEY, &key)
+			.await
+			.expect("We do not allow reads to fail");
 		let data =
 			Readable::read(&mut &data_bytes[..]).expect("Invalid data in splice out storage");
 		splice_outs.push(data);

@@ -366,7 +366,8 @@ impl LightningWallet {
 											store::write_splice_out(
 												self.inner.store.as_ref(),
 												&details,
-											);
+											)
+											.await;
 											return Ok(id);
 										}
 									},
