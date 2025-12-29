@@ -801,7 +801,7 @@ async fn test_pay_onchain_from_self_custody() {
 		let electrsd = Arc::clone(&params.electrsd);
 
 		// disable rebalancing so we have on-chain funds
-		wallet.set_rebalance_enabled(false);
+		wallet.set_rebalance_enabled(false).await;
 
 		let starting_bal = wallet.get_balance().await.unwrap();
 		assert_eq!(starting_bal.available_balance(), Amount::ZERO);
@@ -1030,7 +1030,7 @@ async fn test_force_close_handling() {
 		assert_eq!(starting_bal.available_balance(), Amount::ZERO);
 		assert_eq!(starting_bal.pending_balance, Amount::ZERO);
 
-		let rebalancing = wallet.get_rebalance_enabled();
+		let rebalancing = wallet.get_rebalance_enabled().await;
 		assert!(rebalancing);
 
 		// get a channel so we can make a payment
@@ -1060,7 +1060,7 @@ async fn test_force_close_handling() {
 		}
 
 		// rebalancing should be disabled after a force close
-		let rebalancing = wallet.get_rebalance_enabled();
+		let rebalancing = wallet.get_rebalance_enabled().await;
 		assert!(!rebalancing);
 	})
 	.await;
@@ -1079,7 +1079,7 @@ async fn test_close_all_channels() {
 		assert_eq!(starting_bal.available_balance(), Amount::ZERO);
 		assert_eq!(starting_bal.pending_balance, Amount::ZERO);
 
-		let rebalancing = wallet.get_rebalance_enabled();
+		let rebalancing = wallet.get_rebalance_enabled().await;
 		assert!(rebalancing);
 
 		// get a channel so we can make a payment
@@ -1089,7 +1089,7 @@ async fn test_close_all_channels() {
 		generate_blocks(&bitcoind, &electrsd, 6).await;
 
 		// init closing all channels
-		wallet.close_channels().unwrap();
+		wallet.close_channels().await.unwrap();
 
 		// wait for the channels to be closed
 		let event = wait_next_event(&wallet).await;
@@ -1101,7 +1101,7 @@ async fn test_close_all_channels() {
 		}
 
 		// rebalancing should be disabled after closing all channels
-		let rebalancing = wallet.get_rebalance_enabled();
+		let rebalancing = wallet.get_rebalance_enabled().await;
 		assert!(!rebalancing);
 	})
 	.await;
@@ -1115,7 +1115,7 @@ async fn test_threshold_boundary_trusted_balance_limit() {
 
 		// we're not testing rebalancing here, so disable it to keep things simple
 		// on slow CI this can cause tests to fail if rebalancing kicks in
-		wallet.set_rebalance_enabled(false);
+		wallet.set_rebalance_enabled(false).await;
 
 		let tunables = wallet.get_tunables();
 
@@ -1508,7 +1508,7 @@ async fn test_payment_network_mismatch() {
 		let electrsd = Arc::clone(&params.electrsd);
 
 		// disable rebalancing so we have on-chain funds
-		wallet.set_rebalance_enabled(false);
+		wallet.set_rebalance_enabled(false).await;
 
 		// fund wallet with on-chain
 		let recv_amount = Amount::from_sats(1_000_000).unwrap();
@@ -2045,14 +2045,14 @@ async fn test_wallet_configuration_validation() {
 		// without creating new wallets
 
 		// Test 2: Verify rebalancing can be toggled
-		let initial_rebalance_state = wallet.get_rebalance_enabled();
+		let initial_rebalance_state = wallet.get_rebalance_enabled().await;
 		assert!(initial_rebalance_state, "Rebalancing should be enabled by default");
 
-		wallet.set_rebalance_enabled(false);
-		assert!(!wallet.get_rebalance_enabled(), "Should be able to disable rebalancing");
+		wallet.set_rebalance_enabled(false).await;
+		assert!(!wallet.get_rebalance_enabled().await, "Should be able to disable rebalancing");
 
-		wallet.set_rebalance_enabled(true);
-		assert!(wallet.get_rebalance_enabled(), "Should be able to re-enable rebalancing");
+		wallet.set_rebalance_enabled(true).await;
+		assert!(wallet.get_rebalance_enabled().await, "Should be able to re-enable rebalancing");
 
 		// Test 3: Verify tunables are consistent and reasonable
 		let tunables = wallet.get_tunables();

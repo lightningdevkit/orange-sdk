@@ -634,13 +634,13 @@ impl Wallet {
 	}
 
 	/// Sets whether the wallet should automatically rebalance from trusted/onchain to lightning.
-	pub fn set_rebalance_enabled(&self, value: bool) {
-		store::set_rebalance_enabled(self.inner.store.as_ref(), value)
+	pub async fn set_rebalance_enabled(&self, value: bool) {
+		store::set_rebalance_enabled(self.inner.store.as_ref(), value).await
 	}
 
 	/// Whether the wallet should automatically rebalance from trusted/onchain to lightning.
-	pub fn get_rebalance_enabled(&self) -> bool {
-		store::get_rebalance_enabled(self.inner.store.as_ref())
+	pub async fn get_rebalance_enabled(&self) -> bool {
+		store::get_rebalance_enabled(self.inner.store.as_ref()).await
 	}
 
 	/// Returns the lightning wallet's node id.
@@ -664,7 +664,7 @@ impl Wallet {
 		let mut lightning_payments = self.inner.ln_wallet.list_payments();
 		lightning_payments.sort_by_key(|l| l.latest_update_timestamp);
 
-		let splice_outs = store::read_splice_outs(self.inner.store.as_ref());
+		let splice_outs = store::read_splice_outs(self.inner.store.as_ref()).await;
 
 		let mut res = Vec::with_capacity(
 			trusted_payments.len() + lightning_payments.len() + splice_outs.len(),
@@ -1095,15 +1095,18 @@ impl Wallet {
 					let res = self.inner.trusted.pay(method, instructions.amount).await;
 					match res {
 						Ok(id) => {
-							self.inner.tx_metadata.insert(
-								PaymentId::Trusted(id),
-								TxMetadata {
-									ty: TxType::Payment { ty: ty() },
-									time: SystemTime::now()
-										.duration_since(SystemTime::UNIX_EPOCH)
-										.unwrap(),
-								},
-							);
+							self.inner
+								.tx_metadata
+								.insert(
+									PaymentId::Trusted(id),
+									TxMetadata {
+										ty: TxType::Payment { ty: ty() },
+										time: SystemTime::now()
+											.duration_since(SystemTime::UNIX_EPOCH)
+											.unwrap(),
+									},
+								)
+								.await;
 							return Ok(PaymentId::Trusted(id));
 						},
 						Err(e) => {
@@ -1136,15 +1139,18 @@ impl Wallet {
 								// Note that the Payment Id can be repeated if we make a payment,
 								// it fails, then we attempt to pay the same (BOLT 11) invoice
 								// again.
-								self.inner.tx_metadata.upsert(
-									PaymentId::SelfCustodial(id.0),
-									TxMetadata {
-										ty: TxType::Payment { ty: typ },
-										time: SystemTime::now()
-											.duration_since(SystemTime::UNIX_EPOCH)
-											.unwrap(),
-									},
-								);
+								self.inner
+									.tx_metadata
+									.upsert(
+										PaymentId::SelfCustodial(id.0),
+										TxMetadata {
+											ty: TxType::Payment { ty: typ },
+											time: SystemTime::now()
+												.duration_since(SystemTime::UNIX_EPOCH)
+												.unwrap(),
+										},
+									)
+									.await;
 								let inner_ref = Arc::clone(&self.inner);
 								self.inner.runtime.spawn_cancellable_background_task(async move {
 									inner_ref.rebalancer.do_rebalance_if_needed().await;
@@ -1262,10 +1268,10 @@ impl Wallet {
 	/// Initiates closing all channels in the lightning wallet. The channel will not be closed
 	/// until a [`Event::ChannelClosed`] event is emitted.
 	/// This will disable rebalancing before closing channels, so that we don't try to reopen them.
-	pub fn close_channels(&self) -> Result<(), WalletError> {
+	pub async fn close_channels(&self) -> Result<(), WalletError> {
 		// we are explicitly disabling rebalancing here, so that we don't try to
 		// reopen channels after closing them.
-		self.set_rebalance_enabled(false);
+		self.set_rebalance_enabled(false).await;
 
 		self.inner.ln_wallet.close_channels()?;
 

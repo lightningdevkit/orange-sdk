@@ -368,7 +368,10 @@ impl TrustedWalletInterface for Cashu {
 								let payment_preimage =
 									preimage.unwrap_or(PaymentPreimage([0u8; 32]));
 
-								if tx_metadata.set_preimage(payment_id, payment_preimage.0).is_err()
+								if tx_metadata
+									.set_preimage(payment_id, payment_preimage.0)
+									.await
+									.is_err()
 								{
 									log_error!(
 										logger,

@@ -474,7 +474,7 @@ async fn execute_command(command: Commands, state: &mut WalletState) -> Result<(
 			);
 			println!(
 				"Rebalance Enabled: {}",
-				if wallet.get_rebalance_enabled() {
+				if wallet.get_rebalance_enabled().await {
 					"Yes".bright_green()
 				} else {
 					"No".bright_red()

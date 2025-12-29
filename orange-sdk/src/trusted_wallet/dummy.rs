@@ -118,6 +118,7 @@ impl DummyTrustedWallet {
 						if !is_rebalance {
 							if tx_metadata
 								.set_preimage(payment_id, payment_preimage.unwrap().0)
+								.await
 								.is_err()
 							{
 								println!("Failed to set preimage for payment {payment_id:?}");

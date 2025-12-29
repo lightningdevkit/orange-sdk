@@ -339,7 +339,7 @@ impl LdkEventHandler {
 				let preimage = payment_preimage.unwrap(); // safe
 				let payment_id = PaymentId::SelfCustodial(payment_id.unwrap().0); // safe
 
-				if self.tx_metadata.set_preimage(payment_id, preimage.0).is_err() {
+				if self.tx_metadata.set_preimage(payment_id, preimage.0).await.is_err() {
 					log_error!(self.logger, "Failed to set preimage for payment {payment_id:?}");
 				}
 
@@ -442,7 +442,7 @@ impl LdkEventHandler {
 			} => {
 				// We experienced a channel close, we disable rebalancing so we don't automatically
 				// try to reopen the channel.
-				store::set_rebalance_enabled(self.event_queue.kv_store.as_ref(), false);
+				store::set_rebalance_enabled(self.event_queue.kv_store.as_ref(), false).await;
 
 				if let Err(e) = self
 					.event_queue

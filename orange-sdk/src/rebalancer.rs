@@ -62,7 +62,7 @@ impl OrangeTrigger {
 impl RebalanceTrigger for OrangeTrigger {
 	fn needs_trusted_rebalance(&self) -> impl Future<Output = Option<TriggerParams>> + Send {
 		async move {
-			let rebalance_enabled = store::get_rebalance_enabled(self.store.as_ref());
+			let rebalance_enabled = store::get_rebalance_enabled(self.store.as_ref()).await;
 			if !rebalance_enabled {
 				return None;
 			}
@@ -99,15 +99,17 @@ impl RebalanceTrigger for OrangeTrigger {
 							payment.id.as_hex()
 						);
 						new_txn.push((payment.amount, &payment.id));
-						self.tx_metadata.insert(
-							payment_id,
-							TxMetadata {
-								ty: TxType::Payment { ty: PaymentType::IncomingLightning {} },
-								time: SystemTime::now()
-									.duration_since(SystemTime::UNIX_EPOCH)
-									.unwrap(),
-							},
-						);
+						self.tx_metadata
+							.insert(
+								payment_id,
+								TxMetadata {
+									ty: TxType::Payment { ty: PaymentType::IncomingLightning {} },
+									time: SystemTime::now()
+										.duration_since(SystemTime::UNIX_EPOCH)
+										.unwrap(),
+								},
+							)
+							.await;
 					}
 				}
 
@@ -141,7 +143,7 @@ impl RebalanceTrigger for OrangeTrigger {
 
 	fn needs_onchain_rebalance(&self) -> impl Future<Output = Option<TriggerParams>> + Send {
 		async move {
-			let rebalance_enabled = store::get_rebalance_enabled(self.store.as_ref());
+			let rebalance_enabled = store::get_rebalance_enabled(self.store.as_ref()).await;
 			if !rebalance_enabled {
 				return None;
 			}
@@ -215,19 +217,21 @@ impl RebalanceTrigger for OrangeTrigger {
 								// make sure we have a metadata entry for the triggering transaction
 								let trigger = PaymentId::SelfCustodial(txid.to_byte_array());
 								if self.tx_metadata.read().get(&trigger).is_none() {
-									self.tx_metadata.insert(
-										trigger,
-										TxMetadata {
-											ty: TxType::Payment {
-												ty: PaymentType::IncomingOnChain {
-													txid: Some(txid),
+									self.tx_metadata
+										.insert(
+											trigger,
+											TxMetadata {
+												ty: TxType::Payment {
+													ty: PaymentType::IncomingOnChain {
+														txid: Some(txid),
+													},
 												},
+												time: SystemTime::now()
+													.duration_since(SystemTime::UNIX_EPOCH)
+													.unwrap(),
 											},
-											time: SystemTime::now()
-												.duration_since(SystemTime::UNIX_EPOCH)
-												.unwrap(),
-										},
-									);
+										)
+										.await;
 								}
 
 								Some(TriggerParams {
@@ -295,7 +299,8 @@ impl graduated_rebalancer::EventHandler for OrangeRebalanceEventHandler {
 						time: SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap(),
 					};
 					self.tx_metadata
-						.insert(PaymentId::Trusted(trusted_rebalance_payment_id), metadata);
+						.insert(PaymentId::Trusted(trusted_rebalance_payment_id), metadata)
+						.await;
 					if let Err(e) = self
 						.event_queue
 						.add_event(Event::RebalanceInitiated {
@@ -318,6 +323,7 @@ impl graduated_rebalancer::EventHandler for OrangeRebalanceEventHandler {
 					let triggering_transaction_id = PaymentId::Trusted(trigger_id);
 					self.tx_metadata
 						.set_tx_caused_rebalance(&triggering_transaction_id)
+						.await
 						.expect("Failed to write metadata for rebalance transaction");
 					let metadata = TxMetadata {
 						ty: TxType::TrustedToLightning {
@@ -327,8 +333,8 @@ impl graduated_rebalancer::EventHandler for OrangeRebalanceEventHandler {
 						},
 						time: SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap(),
 					};
-					self.tx_metadata.upsert(PaymentId::Trusted(rebalance_id), metadata);
-					self.tx_metadata.insert(PaymentId::SelfCustodial(lightning_id), metadata);
+					self.tx_metadata.upsert(PaymentId::Trusted(rebalance_id), metadata).await;
+					self.tx_metadata.insert(PaymentId::SelfCustodial(lightning_id), metadata).await;
 
 					let event_queue = Arc::clone(&self.event_queue);
 					let logger = Arc::clone(&self.logger);
@@ -357,13 +363,15 @@ impl graduated_rebalancer::EventHandler for OrangeRebalanceEventHandler {
 					let trigger_id = PaymentId::SelfCustodial(triggering_txid.to_byte_array());
 					self.tx_metadata
 						.set_tx_caused_rebalance(&trigger_id)
+						.await
 						.expect("Failed to write metadata for onchain rebalance transaction");
 					let metadata = TxMetadata {
 						ty: TxType::OnchainToLightning { channel_txid: chan_txid, triggering_txid },
 						time: SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap(),
 					};
 					self.tx_metadata
-						.insert(PaymentId::SelfCustodial(chan_txid.to_byte_array()), metadata);
+						.insert(PaymentId::SelfCustodial(chan_txid.to_byte_array()), metadata)
+						.await;
 				},
 			}
 		})
