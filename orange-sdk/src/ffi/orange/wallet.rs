@@ -125,7 +125,9 @@ pub struct Wallet {
 impl Wallet {
 	#[uniffi::constructor]
 	pub async fn new(config: WalletConfig) -> Result<Self, InitFailure> {
-		let rt = Arc::new(tokio::runtime::Builder::new_multi_thread().enable_all().build()?);
+		let rt = Arc::new(
+			tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build()?,
+		);
 
 		let config: OrangeWalletConfig = config.try_into()?;
 
