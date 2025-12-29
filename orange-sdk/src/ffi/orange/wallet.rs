@@ -10,7 +10,10 @@ use crate::ffi::orange::Event;
 use crate::ffi::orange::config::{Tunables, WalletConfig};
 use crate::ffi::orange::error::{InitFailure, WalletError};
 use crate::{impl_from_core_type, impl_into_core_type};
+
+use std::pin::Pin;
 use std::sync::Arc;
+use std::task::{Context, Poll};
 
 /// Represents the balances of the wallet, including available and pending balances.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, uniffi::Object)]
@@ -85,23 +88,50 @@ impl SingleUseReceiveUri {
 impl_from_core_type!(OrangeSingleUseReceiveUri, SingleUseReceiveUri);
 impl_into_core_type!(SingleUseReceiveUri, OrangeSingleUseReceiveUri);
 
+// This is basically the `async-compat` utility that UniFFI uses under
+// the hood for its `async_runtime = "tokio"` attribute, except it lets
+// us use our own runtime to avoid the redundant runtimes implicit in
+// the `async-compat` single-threaded runtime.
+pin_project_lite::pin_project! {
+	struct RTPoller<T> {
+		#[pin]
+		inner: T,
+		rt: Arc<tokio::runtime::Runtime>,
+	}
+}
+
+impl<T> RTPoller<T> {
+	fn new(inner: T, rt: Arc<tokio::runtime::Runtime>) -> Self {
+		Self { inner, rt }
+	}
+}
+
+impl<T: Future> Future for RTPoller<T> {
+	type Output = T::Output;
+
+	fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+		let _guard = self.rt.enter();
+		self.project().inner.poll(cx)
+	}
+}
+
 #[derive(Clone, uniffi::Object)]
 pub struct Wallet {
 	inner: Arc<OrangeWallet>,
-	_rt: Arc<tokio::runtime::Runtime>,
+	rt: Arc<tokio::runtime::Runtime>,
 }
 
-#[uniffi::export(async_runtime = "tokio")]
+#[uniffi::export]
 impl Wallet {
 	#[uniffi::constructor]
-	pub fn new(config: WalletConfig) -> Result<Self, InitFailure> {
+	pub async fn new(config: WalletConfig) -> Result<Self, InitFailure> {
 		let rt = Arc::new(tokio::runtime::Builder::new_multi_thread().enable_all().build()?);
 
 		let config: OrangeWalletConfig = config.try_into()?;
 
-		let inner = rt.block_on(async move { OrangeWallet::new(config).await })?;
+		let inner = RTPoller::new(OrangeWallet::new(config), Arc::clone(&rt)).await?;
 
-		Ok(Wallet { inner: Arc::new(inner), _rt: rt })
+		Ok(Wallet { inner: Arc::new(inner), rt })
 	}
 
 	pub fn node_id(&self) -> String {
@@ -109,28 +139,29 @@ impl Wallet {
 	}
 
 	pub async fn get_balance(&self) -> Result<Balances, WalletError> {
-		let balance = self.inner.get_balance().await?;
+		let balance = RTPoller::new(self.inner.get_balance(), Arc::clone(&self.rt)).await?;
 		Ok(balance.into())
 	}
 
-	pub async fn is_connected_to_lsp(&self) -> bool {
+	pub fn is_connected_to_lsp(&self) -> bool {
 		self.inner.is_connected_to_lsp()
 	}
 
 	/// Sets whether the wallet should automatically rebalance from trusted/onchain to lightning.
 	pub async fn set_rebalance_enabled(&self, value: bool) {
-		self.inner.set_rebalance_enabled(value).await
+		RTPoller::new(self.inner.set_rebalance_enabled(value), Arc::clone(&self.rt)).await
 	}
 
 	/// Whether the wallet should automatically rebalance from trusted/onchain to lightning.
 	pub async fn get_rebalance_enabled(&self) -> bool {
-		self.inner.get_rebalance_enabled().await
+		RTPoller::new(self.inner.get_rebalance_enabled(), Arc::clone(&self.rt)).await
 	}
 
 	pub async fn list_transactions(
 		&self,
 	) -> Result<Vec<std::sync::Arc<crate::ffi::orange::Transaction>>, WalletError> {
-		let transactions = self.inner.list_transactions().await?;
+		let transactions =
+			RTPoller::new(self.inner.list_transactions(), Arc::clone(&self.rt)).await?;
 		Ok(transactions.into_iter().map(|tx| std::sync::Arc::new(tx.into())).collect())
 	}
 
@@ -144,7 +175,11 @@ impl Wallet {
 	pub async fn parse_payment_instructions(
 		&self, instructions: String,
 	) -> Result<PaymentInstructions, ParseError> {
-		let result = self.inner.parse_payment_instructions(&instructions).await?;
+		let result = RTPoller::new(
+			self.inner.parse_payment_instructions(&instructions),
+			Arc::clone(&self.rt),
+		)
+		.await?;
 		Ok(result.into())
 	}
 
@@ -159,7 +194,7 @@ impl Wallet {
 	pub async fn pay(
 		&self, payment_info: Arc<PaymentInfo>,
 	) -> Result<super::PaymentId, WalletError> {
-		let id = self.inner.pay(&payment_info.0).await?;
+		let id = RTPoller::new(self.inner.pay(&payment_info.0), Arc::clone(&self.rt)).await?;
 		Ok(id.into())
 	}
 
@@ -170,18 +205,26 @@ impl Wallet {
 	pub async fn estimate_fee(
 		&self, payment_info: Arc<PaymentInfo>,
 	) -> Result<Arc<Amount>, WalletError> {
-		let fee = self.inner.estimate_fee(&payment_info.0.instructions).await;
+		let fee = RTPoller::new(
+			self.inner.estimate_fee(&payment_info.0.instructions),
+			Arc::clone(&self.rt),
+		)
+		.await;
 		Ok(Arc::new(fee.into()))
 	}
 
 	pub async fn stop(&self) {
-		self.inner.stop().await
+		RTPoller::new(self.inner.stop(), Arc::clone(&self.rt)).await
 	}
 
 	pub async fn get_single_use_receive_uri(
 		&self, amount: Option<Arc<Amount>>,
 	) -> Result<SingleUseReceiveUri, WalletError> {
-		let uri = self.inner.get_single_use_receive_uri(amount.map(|a| a.0)).await?;
+		let uri = RTPoller::new(
+			self.inner.get_single_use_receive_uri(amount.map(|a| a.0)),
+			Arc::clone(&self.rt),
+		)
+		.await?;
 		Ok(uri.into())
 	}
 
@@ -192,7 +235,7 @@ impl Wallet {
 
 	/// List our current channels
 	pub async fn close_channels(&self) -> Result<(), WalletError> {
-		self.inner.close_channels().await?;
+		RTPoller::new(self.inner.close_channels(), Arc::clone(&self.rt)).await?;
 		Ok(())
 	}
 
@@ -230,7 +273,7 @@ impl Wallet {
 	/// **Caution:** Users must handle events as quickly as possible to prevent a large event backlog,
 	/// which can increase the memory footprint of [`crate::Wallet`].
 	pub async fn next_event_async(&self) -> Event {
-		self.inner.next_event_async().await.into()
+		RTPoller::new(self.inner.next_event_async(), Arc::clone(&self.rt)).await.into()
 	}
 
 	/// Returns the next event in the event queue.

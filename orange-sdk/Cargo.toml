@@ -14,7 +14,7 @@ name = "orange_sdk"
 
 [features]
 default = ["spark"]
-uniffi = ["dep:uniffi", "spark", "cashu", "rand"]
+uniffi = ["dep:uniffi", "spark", "cashu", "rand", "pin-project-lite"]
 spark = ["breez-sdk-spark", "uuid", "serde_json"]
 cashu = ["cdk", "serde_json"]
 _test-utils = ["corepc-node", 'electrsd', "cashu", "uuid/v7", "rand"]
@@ -43,7 +43,8 @@ cdk-sqlite = { version = "0.14.2", optional = true }
 cdk-axum = { version = "0.14.2", optional = true }
 axum = { version = "0.8.1", optional = true }
 
-uniffi = { version = "0.29", features = ["cli", "tokio"], optional = true }
+uniffi = { version = "0.29", default-features = false, features = ["cli"], optional = true }
+pin-project-lite = { version = "0.2", default-features = false, optional = true }
 
 [dev-dependencies]
 test-log = "0.2.18"
