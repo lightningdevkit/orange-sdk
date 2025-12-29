@@ -669,7 +669,6 @@ impl Wallet {
 		let mut res = Vec::with_capacity(
 			trusted_payments.len() + lightning_payments.len() + splice_outs.len(),
 		);
-		let tx_metadata = self.inner.tx_metadata.read();
 
 		let mut internal_transfers = HashMap::new();
 		#[derive(Debug, Default)]
@@ -687,190 +686,204 @@ impl Wallet {
 			time: Duration,
 			ln_transfer_id: Option<[u8; 32]>,
 		}
-
-		for payment in trusted_payments {
-			if let Some(tx_metadata) = tx_metadata.get(&PaymentId::Trusted(payment.id)) {
-				match &tx_metadata.ty {
-					TxType::TrustedToLightning {
-						trusted_payment,
-						lightning_payment: _,
-						payment_triggering_transfer,
-					} => {
-						let entry = internal_transfers
-							.entry(*payment_triggering_transfer)
-							.or_insert(InternalTransfer::default());
-						if payment.id == *trusted_payment {
-							debug_assert!(entry.send_fee.is_none());
-							entry.send_fee = Some(payment.fee);
-						} else {
-							debug_assert!(false);
-						}
-					},
-					TxType::OnchainToLightning { .. } => {
+		{
+			let tx_metadata = self.inner.tx_metadata.read();
+			for payment in trusted_payments {
+				if let Some(tx_metadata) = tx_metadata.get(&PaymentId::Trusted(payment.id)) {
+					match &tx_metadata.ty {
+						TxType::TrustedToLightning {
+							trusted_payment,
+							lightning_payment: _,
+							payment_triggering_transfer,
+						} => {
+							let entry = internal_transfers
+								.entry(*payment_triggering_transfer)
+								.or_insert(InternalTransfer::default());
+							if payment.id == *trusted_payment {
+								debug_assert!(entry.send_fee.is_none());
+								entry.send_fee = Some(payment.fee);
+							} else {
+								debug_assert!(false);
+							}
+						},
+						TxType::OnchainToLightning { .. } => {
+							debug_assert!(
+								false,
+								"Onchain to lightning transfer should not be in trusted payments list"
+							);
+						},
+						TxType::PaymentTriggeringTransferLightning { ty } => {
+							let entry = internal_transfers
+								.entry(PaymentId::Trusted(payment.id))
+								.or_insert(InternalTransfer::default());
+							debug_assert!(entry.transaction.is_none());
+							entry.transaction = Some(Transaction {
+								id: PaymentId::Trusted(payment.id),
+								status: payment.status,
+								outbound: payment.outbound,
+								amount: Some(payment.amount),
+								fee: Some(payment.fee),
+								payment_type: *ty,
+								time_since_epoch: tx_metadata.time,
+							});
+						},
+						TxType::Payment { ty } => {
+							debug_assert!(!matches!(ty, PaymentType::OutgoingOnChain { .. }));
+							debug_assert!(!matches!(ty, PaymentType::IncomingOnChain { .. }));
+							res.push(Transaction {
+								id: PaymentId::Trusted(payment.id),
+								status: payment.status,
+								outbound: payment.outbound,
+								amount: Some(payment.amount),
+								fee: Some(payment.fee),
+								payment_type: *ty,
+								time_since_epoch: tx_metadata.time,
+							});
+						},
+						TxType::PendingRebalance {
+							trusted_payment,
+							payment_triggering_transfer,
+							payment_hash,
+						} => {
+							if let Some(trusted_id) = trusted_payment {
+								debug_assert_eq!(*trusted_id, payment.id);
+							}
+							if payment.status == TxStatus::Completed {
+								if trusted_payment.is_some()
+									&& payment_triggering_transfer.is_some()
+									&& payment_hash.is_some()
+								{
+									let old_val = completed_internal_transfers.insert(
+										payment_hash.unwrap(),
+										CompletedInternalTransfer {
+											trusted_transfer_id: trusted_payment.unwrap(),
+											payment_triggering_transfer:
+												payment_triggering_transfer.unwrap(),
+											time: payment.time_since_epoch,
+											ln_transfer_id: None,
+										},
+									);
+									debug_assert!(old_val.is_none());
+								}
+							}
+							// Pending rebalances are not shown in the transaction list.
+							continue;
+						},
+					}
+				} else {
+					if payment.outbound {
+						log_warn!(
+							self.inner.logger,
+							"Missing outbound trusted payment metadata entry on {:?}",
+							payment.id
+						);
+						#[cfg(feature = "_test-utils")]
 						debug_assert!(
 							false,
-							"Onchain to lightning transfer should not be in trusted payments list"
+							"Missing outbound trusted payment metadata entry on {:?}",
+							payment.id
 						);
-					},
-					TxType::PaymentTriggeringTransferLightning { ty } => {
-						let entry = internal_transfers
-							.entry(PaymentId::Trusted(payment.id))
-							.or_insert(InternalTransfer::default());
-						debug_assert!(entry.transaction.is_none());
-						entry.transaction = Some(Transaction {
-							id: PaymentId::Trusted(payment.id),
-							status: payment.status,
-							outbound: payment.outbound,
-							amount: Some(payment.amount),
-							fee: Some(payment.fee),
-							payment_type: *ty,
-							time_since_epoch: tx_metadata.time,
-						});
-					},
-					TxType::Payment { ty } => {
-						debug_assert!(!matches!(ty, PaymentType::OutgoingOnChain { .. }));
-						debug_assert!(!matches!(ty, PaymentType::IncomingOnChain { .. }));
-						res.push(Transaction {
-							id: PaymentId::Trusted(payment.id),
-							status: payment.status,
-							outbound: payment.outbound,
-							amount: Some(payment.amount),
-							fee: Some(payment.fee),
-							payment_type: *ty,
-							time_since_epoch: tx_metadata.time,
-						});
-					},
-					TxType::PendingRebalance {
-						trusted_payment,
-						payment_triggering_transfer,
-						payment_hash,
-					} => {
-						if let Some(trusted_id) = trusted_payment {
-							debug_assert_eq!(*trusted_id, payment.id);
-						}
-						if payment.status == TxStatus::Completed {
-							if trusted_payment.is_some()
-								&& payment_triggering_transfer.is_some()
-								&& payment_hash.is_some()
-							{
-								let old_val = completed_internal_transfers.insert(
-									payment_hash.unwrap(),
-									CompletedInternalTransfer {
-										trusted_transfer_id: trusted_payment.unwrap(),
-										payment_triggering_transfer: payment_triggering_transfer
-											.unwrap(),
-										time: payment.time_since_epoch,
-										ln_transfer_id: None,
-									},
-								);
-								debug_assert!(old_val.is_none());
-							}
-						}
-						// Pending rebalances are not shown in the transaction list.
+					}
+
+					if payment.status != TxStatus::Completed {
+						// We don't bother to surface pending inbound transactions (i.e. issued but
+						// unpaid invoices) in our transaction list.
 						continue;
-					},
-				}
-			} else {
-				if payment.outbound {
-					log_warn!(
-						self.inner.logger,
-						"Missing outbound trusted payment metadata entry on {:?}",
-						payment.id
-					);
-					#[cfg(feature = "_test-utils")]
-					debug_assert!(
-						false,
-						"Missing outbound trusted payment metadata entry on {:?}",
-						payment.id
-					);
-				}
+					}
 
-				if payment.status != TxStatus::Completed {
-					// We don't bother to surface pending inbound transactions (i.e. issued but
-					// unpaid invoices) in our transaction list.
-					continue;
+					let payment_type = if payment.outbound {
+						PaymentType::OutgoingLightningBolt11 { payment_preimage: None }
+					} else {
+						PaymentType::IncomingLightning {}
+					};
+
+					res.push(Transaction {
+						id: PaymentId::Trusted(payment.id),
+						status: payment.status,
+						outbound: payment.outbound,
+						amount: Some(payment.amount),
+						fee: Some(payment.fee),
+						payment_type,
+						time_since_epoch: payment.time_since_epoch,
+					});
 				}
-
-				let payment_type = if payment.outbound {
-					PaymentType::OutgoingLightningBolt11 { payment_preimage: None }
-				} else {
-					PaymentType::IncomingLightning {}
-				};
-
-				res.push(Transaction {
-					id: PaymentId::Trusted(payment.id),
-					status: payment.status,
-					outbound: payment.outbound,
-					amount: Some(payment.amount),
-					fee: Some(payment.fee),
-					payment_type,
-					time_since_epoch: payment.time_since_epoch,
-				});
 			}
-		}
-		for payment in lightning_payments {
-			use ldk_node::payment::PaymentDirection;
-			let lightning_receive_fee = match payment.kind {
-				PaymentKind::Bolt11Jit { counterparty_skimmed_fee_msat, .. } => {
-					let msats = counterparty_skimmed_fee_msat.unwrap_or(0);
-					debug_assert_eq!(payment.direction, PaymentDirection::Inbound);
-					Some(Amount::from_milli_sats(msats).expect("Must be valid"))
-				},
-				_ => None,
-			};
-			let fee = if payment.direction == PaymentDirection::Outbound {
-				match payment.fee_paid_msat {
-					None => Some(lightning_receive_fee.unwrap_or(Amount::ZERO)),
-					Some(fee) => Some(
-						Amount::from_milli_sats(fee)
-							.unwrap()
-							.saturating_add(lightning_receive_fee.unwrap_or(Amount::ZERO)),
-					),
-				}
-			} else {
-				Some(lightning_receive_fee.unwrap_or(Amount::ZERO))
-			};
-			if let Some(tx_metadata) = tx_metadata.get(&PaymentId::SelfCustodial(payment.id.0)) {
-				match &tx_metadata.ty {
-					TxType::TrustedToLightning {
-						trusted_payment: _,
-						lightning_payment,
-						payment_triggering_transfer,
-					} => {
-						let entry = internal_transfers
-							.entry(*payment_triggering_transfer)
-							.or_insert(InternalTransfer::default());
-						if payment.id.0 == *lightning_payment {
-							debug_assert!(entry.receive_fee.is_none());
-							entry.receive_fee = lightning_receive_fee.or(Some(Amount::ZERO));
-						} else {
-							debug_assert!(false);
-						}
+			for payment in lightning_payments {
+				use ldk_node::payment::PaymentDirection;
+				let lightning_receive_fee = match payment.kind {
+					PaymentKind::Bolt11Jit { counterparty_skimmed_fee_msat, .. } => {
+						let msats = counterparty_skimmed_fee_msat.unwrap_or(0);
+						debug_assert_eq!(payment.direction, PaymentDirection::Inbound);
+						Some(Amount::from_milli_sats(msats).expect("Must be valid"))
 					},
-					TxType::OnchainToLightning { channel_txid, triggering_txid } => {
-						let entry = internal_transfers
-							.entry(PaymentId::SelfCustodial(triggering_txid.to_byte_array()))
-							.or_insert(InternalTransfer::default());
-						if &payment.id.0 == channel_txid.as_byte_array() {
-							debug_assert!(entry.send_fee.is_none());
-							entry.send_fee = payment
-								.fee_paid_msat
-								.map(|fee| Amount::from_milli_sats(fee).expect("Must be valid"));
-						} else {
-							debug_assert!(false);
-						}
-					},
-					TxType::PaymentTriggeringTransferLightning { ty: _ } => {
-						let entry = internal_transfers
-							.entry(PaymentId::SelfCustodial(payment.id.0))
-							.or_insert(InternalTransfer {
-								receive_fee: lightning_receive_fee,
-								send_fee: None,
-								transaction: None,
-							});
-						debug_assert!(entry.transaction.is_none());
+					_ => None,
+				};
+				let fee = if payment.direction == PaymentDirection::Outbound {
+					match payment.fee_paid_msat {
+						None => Some(lightning_receive_fee.unwrap_or(Amount::ZERO)),
+						Some(fee) => Some(
+							Amount::from_milli_sats(fee)
+								.unwrap()
+								.saturating_add(lightning_receive_fee.unwrap_or(Amount::ZERO)),
+						),
+					}
+				} else {
+					Some(lightning_receive_fee.unwrap_or(Amount::ZERO))
+				};
+				if let Some(tx_metadata) = tx_metadata.get(&PaymentId::SelfCustodial(payment.id.0))
+				{
+					match &tx_metadata.ty {
+						TxType::TrustedToLightning {
+							trusted_payment: _,
+							lightning_payment,
+							payment_triggering_transfer,
+						} => {
+							let entry = internal_transfers
+								.entry(*payment_triggering_transfer)
+								.or_insert(InternalTransfer::default());
+							if payment.id.0 == *lightning_payment {
+								debug_assert!(entry.receive_fee.is_none());
+								entry.receive_fee = lightning_receive_fee.or(Some(Amount::ZERO));
+							} else {
+								debug_assert!(false);
+							}
+						},
+						TxType::OnchainToLightning { channel_txid, triggering_txid } => {
+							let entry = internal_transfers
+								.entry(PaymentId::SelfCustodial(triggering_txid.to_byte_array()))
+								.or_insert(InternalTransfer::default());
+							if &payment.id.0 == channel_txid.as_byte_array() {
+								debug_assert!(entry.send_fee.is_none());
+								entry.send_fee = payment.fee_paid_msat.map(|fee| {
+									Amount::from_milli_sats(fee).expect("Must be valid")
+								});
+							} else {
+								debug_assert!(false);
+							}
+						},
+						TxType::PaymentTriggeringTransferLightning { ty: _ } => {
+							let entry = internal_transfers
+								.entry(PaymentId::SelfCustodial(payment.id.0))
+								.or_insert(InternalTransfer {
+									receive_fee: lightning_receive_fee,
+									send_fee: None,
+									transaction: None,
+								});
+							debug_assert!(entry.transaction.is_none());
 
-						entry.transaction = Some(Transaction {
+							entry.transaction = Some(Transaction {
+								id: PaymentId::SelfCustodial(payment.id.0),
+								status: payment.status.into(),
+								outbound: payment.direction == PaymentDirection::Outbound,
+								amount: payment
+									.amount_msat
+									.map(|a| Amount::from_milli_sats(a).expect("Must be valid")),
+								fee,
+								payment_type: (&payment).into(),
+								time_since_epoch: tx_metadata.time,
+							});
+						},
+						TxType::Payment { ty: _ } => res.push(Transaction {
 							id: PaymentId::SelfCustodial(payment.id.0),
 							status: payment.status.into(),
 							outbound: payment.direction == PaymentDirection::Outbound,
@@ -880,68 +893,59 @@ impl Wallet {
 							fee,
 							payment_type: (&payment).into(),
 							time_since_epoch: tx_metadata.time,
-						});
-					},
-					TxType::Payment { ty: _ } => res.push(Transaction {
-						id: PaymentId::SelfCustodial(payment.id.0),
-						status: payment.status.into(),
-						outbound: payment.direction == PaymentDirection::Outbound,
-						amount: payment
-							.amount_msat
-							.map(|a| Amount::from_milli_sats(a).expect("Must be valid")),
-						fee,
-						payment_type: (&payment).into(),
-						time_since_epoch: tx_metadata.time,
-					}),
-					TxType::PendingRebalance { .. } => {
-						// Pending rebalances are not shown in the transaction list.
-						continue;
-					},
-				}
-			} else {
-				debug_assert_ne!(
-					payment.direction,
-					PaymentDirection::Outbound,
-					"Missing outbound lightning payment metadata entry on {}",
-					payment.id
-				);
-
-				let status = payment.status.into();
-				if status != TxStatus::Completed {
-					// We don't bother to surface pending inbound transactions (i.e. issued but
-					// unpaid invoices) in our transaction list, in part because these may be
-					// failed rebalances.
-					continue;
-				}
-
-				let payment_hash = match payment.kind {
-					PaymentKind::Onchain { .. } => None,
-					PaymentKind::Bolt11 { hash, .. } => Some(hash),
-					PaymentKind::Bolt11Jit { hash, .. } => Some(hash),
-					PaymentKind::Bolt12Offer { hash, .. } => hash,
-					PaymentKind::Bolt12Refund { hash, .. } => hash,
-					PaymentKind::Spontaneous { hash, .. } => Some(hash),
-				};
-
-				if let Some(info) =
-					payment_hash.map(|hash| completed_internal_transfers.get_mut(&hash)).flatten()
-				{
-					info.ln_transfer_id = Some(payment.id.0);
+						}),
+						TxType::PendingRebalance { .. } => {
+							// Pending rebalances are not shown in the transaction list.
+							continue;
+						},
+					}
 				} else {
-					res.push(Transaction {
-						id: PaymentId::SelfCustodial(payment.id.0),
-						status,
-						outbound: payment.direction == PaymentDirection::Outbound,
-						amount: payment.amount_msat.map(|a| Amount::from_milli_sats(a).unwrap()),
-						fee,
-						payment_type: (&payment).into(),
-						time_since_epoch: Duration::from_secs(payment.latest_update_timestamp),
-					})
+					debug_assert_ne!(
+						payment.direction,
+						PaymentDirection::Outbound,
+						"Missing outbound lightning payment metadata entry on {}",
+						payment.id
+					);
+
+					let status = payment.status.into();
+					if status != TxStatus::Completed {
+						// We don't bother to surface pending inbound transactions (i.e. issued but
+						// unpaid invoices) in our transaction list, in part because these may be
+						// failed rebalances.
+						continue;
+					}
+
+					let payment_hash = match payment.kind {
+						PaymentKind::Onchain { .. } => None,
+						PaymentKind::Bolt11 { hash, .. } => Some(hash),
+						PaymentKind::Bolt11Jit { hash, .. } => Some(hash),
+						PaymentKind::Bolt12Offer { hash, .. } => hash,
+						PaymentKind::Bolt12Refund { hash, .. } => hash,
+						PaymentKind::Spontaneous { hash, .. } => Some(hash),
+					};
+
+					if let Some(info) = payment_hash
+						.map(|hash| completed_internal_transfers.get_mut(&hash))
+						.flatten()
+					{
+						info.ln_transfer_id = Some(payment.id.0);
+					} else {
+						res.push(Transaction {
+							id: PaymentId::SelfCustodial(payment.id.0),
+							status,
+							outbound: payment.direction == PaymentDirection::Outbound,
+							amount: payment
+								.amount_msat
+								.map(|a| Amount::from_milli_sats(a).unwrap()),
+							fee,
+							payment_type: (&payment).into(),
+							time_since_epoch: Duration::from_secs(payment.latest_update_timestamp),
+						})
+					}
 				}
 			}
 		}
 
-		std::mem::drop(tx_metadata);
 		for (_, info) in completed_internal_transfers {
 			debug_assert!(info.ln_transfer_id.is_some());
 			if let Some(lightning_payment) = info.ln_transfer_id {
@@ -963,13 +967,16 @@ impl Wallet {
 				self.inner
 					.tx_metadata
 					.set_tx_caused_rebalance(&info.payment_triggering_transfer)
+					.await
 					.expect("Failed to write metadata for rebalance transaction");
 				self.inner
 					.tx_metadata
-					.upsert(PaymentId::Trusted(info.trusted_transfer_id), metadata);
+					.upsert(PaymentId::Trusted(info.trusted_transfer_id), metadata)
+					.await;
 				self.inner
 					.tx_metadata
-					.insert(PaymentId::SelfCustodial(lightning_payment), metadata);
+					.insert(PaymentId::SelfCustodial(lightning_payment), metadata)
+					.await;
 			}
 		}
 

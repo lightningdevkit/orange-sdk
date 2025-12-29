@@ -19,7 +19,7 @@ use ldk_node::bitcoin::hex::{DisplayHex, FromHex};
 use ldk_node::lightning::io;
 use ldk_node::lightning::ln::msgs::DecodeError;
 use ldk_node::lightning::types::payment::{PaymentHash, PaymentPreimage};
-use ldk_node::lightning::util::persist::{KVStore, KVStoreSync};
+use ldk_node::lightning::util::persist::KVStore;
 use ldk_node::lightning::util::ser::{Readable, Writeable, Writer};
 use ldk_node::lightning::{impl_writeable_tlv_based, impl_writeable_tlv_based_enum};
 use ldk_node::payment::PaymentDetails;
