@@ -1,4 +1,5 @@
 use crate::logging::Logger;
+use crate::rebalancer::RebalanceEventHandlerHolder;
 use crate::store::{self, PaymentId};
 
 use ldk_node::bitcoin::secp256k1::PublicKey;
@@ -131,6 +132,17 @@ pub enum Event {
 		/// The fee paid, in msats, for the rebalance payment.
 		fee_msat: u64,
 	},
+	/// A rebalance from our trusted wallet has failed.
+	RebalanceFailed {
+		/// The `payment_id` of the transaction that triggered the rebalance.
+		trigger_payment_id: PaymentId,
+		/// The `payment_id` of the rebalance payment sent from the trusted wallet.
+		trusted_rebalance_payment_id: Option<[u8; 32]>,
+		/// The amount, in msats, of the rebalance payment.
+		amount_msat: u64,
+		/// The reason for the failure.
+		reason: String,
+	},
 	/// We have initiated a splice and are waiting for it to confirm.
 	SplicePending {
 		/// The `channel_id` of the channel.
@@ -198,6 +210,12 @@ impl_writeable_tlv_based_enum!(Event,
 		(3, counterparty_node_id, required),
 		(5, user_channel_id, required),
 		(7, new_funding_txo, required),
+	},
+	(9, RebalanceFailed) => {
+		(0, trigger_payment_id, required),
+		(2, trusted_rebalance_payment_id, option),
+		(4, amount_msat, required),
+		(6, reason, required),
 	},
 );
 
@@ -321,9 +339,8 @@ pub(crate) struct LdkEventHandler {
 	pub(crate) event_queue: Arc<EventQueue>,
 	pub(crate) ldk_node: Arc<ldk_node::Node>,
 	pub(crate) tx_metadata: store::TxMetadataStore,
-	pub(crate) payment_receipt_sender: watch::Sender<()>,
-	pub(crate) channel_pending_sender: watch::Sender<u128>,
 	pub(crate) splice_pending_sender: watch::Sender<u128>,
+	pub(crate) rebalance_event_handler: RebalanceEventHandlerHolder,
 	pub(crate) logger: Arc<Logger>,
 }
 
@@ -399,7 +416,11 @@ impl LdkEventHandler {
 				{
 					log_error!(self.logger, "Failed to add PaymentReceived event: {e:?}");
 				}
-				let _ = self.payment_receipt_sender.send(());
+
+				// Notify rebalancer if this might be a rebalance payment
+				self.rebalance_event_handler
+					.notify_ln_payment_received(payment_hash.0, payment_id.0, lsp_fee_msats)
+					.await;
 			},
 			ldk_node::Event::PaymentForwarded { .. } => {},
 			ldk_node::Event::PaymentClaimable { .. } => {
@@ -419,6 +440,11 @@ impl LdkEventHandler {
 			} => {
 				let funding_txo = funding_txo.unwrap(); // safe
 
+				// Notify rebalancer if this might be an on-chain rebalance
+				self.rebalance_event_handler
+					.notify_channel_splice_pending(user_channel_id.0, funding_txo)
+					.await;
+
 				if let Err(e) = self
 					.event_queue
 					.add_event(Event::ChannelOpened {
@@ -432,7 +458,6 @@ impl LdkEventHandler {
 					log_error!(self.logger, "Failed to add ChannelOpened event: {e:?}");
 					return;
 				}
-				let _ = self.channel_pending_sender.send(user_channel_id.0);
 			},
 			ldk_node::Event::ChannelClosed {
 				channel_id,
@@ -465,6 +490,12 @@ impl LdkEventHandler {
 				new_funding_txo,
 			} => {
 				log_debug!(self.logger, "Received SplicePending event {event:?}");
+
+				// Notify rebalancer if this might be an on-chain rebalance
+				self.rebalance_event_handler
+					.notify_channel_splice_pending(user_channel_id.0, new_funding_txo)
+					.await;
+
 				let _ = self.splice_pending_sender.send(user_channel_id.0);
 
 				if let Err(e) = self

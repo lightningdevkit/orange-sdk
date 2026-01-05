@@ -2,6 +2,7 @@ use crate::bitcoin::OutPoint;
 use crate::bitcoin::hashes::Hash;
 use crate::event::{EventQueue, LdkEventHandler};
 use crate::logging::Logger;
+use crate::rebalancer::RebalanceEventHandlerHolder;
 use crate::runtime::Runtime;
 use crate::store::{TxMetadataStore, TxStatus};
 use crate::{ChainSource, InitFailure, PaymentType, Seed, WalletConfig, store};
@@ -24,7 +25,7 @@ use ldk_node::payment::{
 };
 use ldk_node::{DynStore, NodeError, UserChannelId};
 
-use graduated_rebalancer::{LightningBalance, ReceivedLightningPayment};
+use graduated_rebalancer::LightningBalance;
 
 use std::collections::HashMap;
 use std::fmt::Debug;
@@ -43,8 +44,6 @@ pub(crate) struct LightningWalletImpl {
 	pub(crate) ldk_node: Arc<ldk_node::Node>,
 	logger: Arc<Logger>,
 	store: Arc<DynStore>,
-	payment_receipt_flag: watch::Receiver<()>,
-	channel_pending_receipt_flag: watch::Receiver<u128>,
 	splice_pending_receipt_flag: watch::Receiver<u128>,
 	lsp_node_id: PublicKey,
 	lsp_socket_addr: SocketAddress,
@@ -57,9 +56,11 @@ pub(crate) struct LightningWallet {
 const DEFAULT_INVOICE_EXPIRY_SECS: u32 = 86_400; // 24 hours
 
 impl LightningWallet {
+	#[allow(clippy::too_many_arguments)]
 	pub(super) async fn init(
 		runtime: Arc<Runtime>, config: WalletConfig, store: Arc<DynStore>,
-		event_queue: Arc<EventQueue>, tx_metadata: TxMetadataStore, logger: Arc<Logger>,
+		event_queue: Arc<EventQueue>, tx_metadata: TxMetadataStore,
+		rebalance_event_handler: RebalanceEventHandlerHolder, logger: Arc<Logger>,
 	) -> Result<Self, InitFailure> {
 		log_info!(logger, "Creating LDK node...");
 		let anchor_channels_config = ldk_node::config::AnchorChannelsConfig {
@@ -164,24 +165,19 @@ impl LightningWallet {
 		}
 
 		let ldk_node = Arc::new(builder.build_with_store(Arc::clone(&store))?);
-		let (payment_receipt_sender, payment_receipt_flag) = watch::channel(());
-		let (channel_pending_sender, channel_pending_receipt_flag) = watch::channel(0);
 		let (splice_pending_sender, splice_pending_receipt_flag) = watch::channel(0);
 		let ev_handler = Arc::new(LdkEventHandler {
 			event_queue,
 			ldk_node: Arc::clone(&ldk_node),
 			tx_metadata,
-			payment_receipt_sender,
-			channel_pending_sender,
 			splice_pending_sender,
+			rebalance_event_handler,
 			logger: Arc::clone(&logger),
 		});
 		let inner = Arc::new(LightningWalletImpl {
 			ldk_node,
 			logger,
 			store,
-			payment_receipt_flag,
-			channel_pending_receipt_flag,
 			splice_pending_receipt_flag,
 			lsp_node_id,
 			lsp_socket_addr,
@@ -198,18 +194,6 @@ impl LightningWallet {
 		});
 
 		Ok(Self { inner })
-	}
-
-	pub(crate) async fn await_payment_receipt(&self) {
-		let mut flag = self.inner.payment_receipt_flag.clone();
-		flag.mark_unchanged();
-		let _ = flag.changed().await;
-	}
-
-	pub(crate) async fn await_channel_pending(&self, channel_id: u128) {
-		let mut flag = self.inner.channel_pending_receipt_flag.clone();
-		flag.mark_unchanged();
-		flag.wait_for(|t| t == &channel_id).await.expect("channel pending not received");
 	}
 
 	pub(crate) async fn await_splice_pending(&self, channel_id: u128) {
@@ -488,40 +472,6 @@ impl graduated_rebalancer::LightningWallet for LightningWallet {
 		Box::pin(async move { self.pay(&method, amount).await.map(|p| p.0) })
 	}
 
-	fn await_payment_receipt(
-		&self, payment_hash: [u8; 32],
-	) -> Pin<Box<dyn Future<Output = Option<ReceivedLightningPayment>> + Send + '_>> {
-		Box::pin(async move {
-			let id = PaymentId(payment_hash);
-			loop {
-				if let Some(payment) = self.inner.ldk_node.payment(&id) {
-					let counterparty_skimmed_fee_msat = match payment.kind {
-						PaymentKind::Bolt11 { hash, .. } => {
-							debug_assert!(hash.0 == payment_hash, "Payment Hash mismatch");
-							None
-						},
-						PaymentKind::Bolt11Jit { hash, counterparty_skimmed_fee_msat, .. } => {
-							debug_assert!(hash.0 == payment_hash, "Payment Hash mismatch");
-							counterparty_skimmed_fee_msat
-						},
-						_ => return None, // Ignore other payment kinds, we only care about the one we just sent.
-					};
-					match payment.status {
-						PaymentStatus::Succeeded => {
-							return Some(ReceivedLightningPayment {
-								id: payment.id.0,
-								fee_paid_msat: counterparty_skimmed_fee_msat,
-							});
-						},
-						PaymentStatus::Pending => {},
-						PaymentStatus::Failed => return None,
-					}
-				}
-				self.await_payment_receipt().await;
-			}
-		})
-	}
-
 	fn has_channel_with_lsp(&self) -> bool {
 		let channels = self.inner.ldk_node.list_channels();
 		channels.iter().any(|c| c.counterparty_node_id == self.inner.lsp_node_id)
@@ -533,26 +483,6 @@ impl graduated_rebalancer::LightningWallet for LightningWallet {
 		Box::pin(async move {
 			// we don't use the amount and just use our full spendable balance in open_channel_with_lsp
 			self.open_channel_with_lsp().await.map(|c| c.0)
-		})
-	}
-
-	fn await_channel_pending(
-		&self, channel_id: u128,
-	) -> Pin<Box<dyn Future<Output = OutPoint> + Send + '_>> {
-		Box::pin(async move {
-			loop {
-				let channels = self.inner.ldk_node.list_channels();
-				let chan = channels
-					.into_iter()
-					.find(|c| c.user_channel_id.0 == channel_id && c.funding_txo.is_some());
-				match chan {
-					Some(c) => return c.funding_txo.expect("channel has no funding txo"),
-					None => {
-						self.await_channel_pending(channel_id).await;
-						// Wait for the next channel pending event
-					},
-				}
-			}
 		})
 	}
 
@@ -574,29 +504,23 @@ impl graduated_rebalancer::LightningWallet for LightningWallet {
 		Box::pin(async move { self.splice_balance_into_channel(amt).await.map(|c| c.0) })
 	}
 
-	fn await_splice_pending(
-		&self, channel_id: u128,
-	) -> Pin<Box<dyn Future<Output = OutPoint> + Send + '_>> {
-		Box::pin(async move {
-			// todo since we can't see if we have any active splices, we just await the next splice pending event
-			// this is kinda race-y hopefully we can fix
-			self.await_splice_pending(channel_id).await;
-			loop {
-				let channels = self.inner.ldk_node.list_channels();
-				let chan = channels
-					.into_iter()
-					.find(|c| c.user_channel_id.0 == channel_id && c.funding_txo.is_some());
-				match chan {
-					Some(c) => {
-						return c.funding_txo.expect("channel has no funding txo");
-					},
-					None => {
-						self.await_splice_pending(channel_id).await;
-						// Wait for the next channel pending event
-					},
-				}
-			}
-		})
+	fn get_channel_outpoint(&self, user_channel_id: u128) -> Option<OutPoint> {
+		self.inner
+			.ldk_node
+			.list_channels()
+			.into_iter()
+			.find(|c| c.user_channel_id.0 == user_channel_id)
+			.and_then(|c| c.funding_txo)
+	}
+
+	fn find_pending_lsp_channel(&self) -> Option<u128> {
+		let channels = self.inner.ldk_node.list_channels();
+		let lsp_channels: Vec<_> =
+			channels.iter().filter(|c| c.counterparty_node_id == self.inner.lsp_node_id).collect();
+
+		// there should only be one channel with the LSP at a time
+		debug_assert_eq!(lsp_channels.len(), 1, "More than one channel with LSP found");
+		lsp_channels.first().map(|c| c.user_channel_id.0)
 	}
 }
 

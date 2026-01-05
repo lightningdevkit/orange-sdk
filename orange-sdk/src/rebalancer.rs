@@ -270,16 +270,72 @@ pub(crate) struct OrangeRebalanceEventHandler {
 	tx_metadata: TxMetadataStore,
 	/// The event handler for processing wallet events.
 	event_queue: Arc<EventQueue>,
+	/// Reference to the rebalancer, set once after initialization.
+	rebalancer: tokio::sync::OnceCell<Arc<crate::Rebalancer>>,
 	/// Logger for logging events and errors.
 	logger: Arc<Logger>,
 }
+
+/// A holder type for the event handler that can be shared across wallets.
+pub(crate) type RebalanceEventHandlerHolder = Arc<OrangeRebalanceEventHandler>;
 
 impl OrangeRebalanceEventHandler {
 	/// Creates a new `OrangeRebalanceEventHandler` instance.
 	pub(crate) fn new(
 		tx_metadata: TxMetadataStore, event_queue: Arc<EventQueue>, logger: Arc<Logger>,
 	) -> Self {
-		Self { tx_metadata, event_queue, logger }
+		Self { tx_metadata, event_queue, rebalancer: tokio::sync::OnceCell::new(), logger }
+	}
+
+	/// Sets the rebalancer reference after initialization. Panics if called more than once.
+	pub(crate) fn set_rebalancer(&self, rebalancer: Arc<crate::Rebalancer>) {
+		if self.rebalancer.set(rebalancer).is_err() {
+			panic!("rebalancer already set");
+		}
+	}
+
+	/// Notify that a trusted wallet payment has been sent.
+	pub(crate) async fn notify_trusted_payment_sent(
+		&self, payment_hash: [u8; 32], fee_msat: Option<u64>,
+	) {
+		if let Some(rebalancer) = self.rebalancer.get() {
+			rebalancer.on_trusted_payment_sent(payment_hash, fee_msat).await;
+		} else {
+			debug_assert!(false, "Rebalancer not set in OrangeRebalanceEventHandler");
+		}
+	}
+
+	/// Notify that a lightning wallet payment has been received.
+	pub(crate) async fn notify_ln_payment_received(
+		&self, payment_hash: [u8; 32], payment_id: [u8; 32], fee_msat: Option<u64>,
+	) {
+		if let Some(rebalancer) = self.rebalancer.get() {
+			rebalancer.on_ln_payment_received(payment_hash, payment_id, fee_msat).await;
+		} else {
+			debug_assert!(false, "Rebalancer not set in OrangeRebalanceEventHandler");
+		}
+	}
+
+	/// Notify that a trusted wallet payment has failed.
+	pub(crate) async fn notify_trusted_payment_failed(
+		&self, payment_hash: [u8; 32], reason: String,
+	) {
+		if let Some(rebalancer) = self.rebalancer.get() {
+			rebalancer.on_trusted_payment_failed(payment_hash, reason).await;
+		} else {
+			debug_assert!(false, "Rebalancer not set in OrangeRebalanceEventHandler");
+		}
+	}
+
+	/// Notify that a channel or splice has become pending.
+	pub(crate) async fn notify_channel_splice_pending(
+		&self, user_channel_id: u128, outpoint: ldk_node::bitcoin::OutPoint,
+	) {
+		if let Some(rebalancer) = self.rebalancer.get() {
+			rebalancer.on_channel_splice_pending(user_channel_id, outpoint).await;
+		} else {
+			debug_assert!(false, "Rebalancer not set in OrangeRebalanceEventHandler");
+		}
 	}
 }
 
@@ -301,6 +357,7 @@ impl graduated_rebalancer::EventHandler for OrangeRebalanceEventHandler {
 					self.tx_metadata
 						.insert(PaymentId::Trusted(trusted_rebalance_payment_id), metadata)
 						.await;
+					println!("=========== Rebalance Initiated Event ===========");
 					if let Err(e) = self
 						.event_queue
 						.add_event(Event::RebalanceInitiated {
@@ -352,6 +409,33 @@ impl graduated_rebalancer::EventHandler for OrangeRebalanceEventHandler {
 							log_error!(logger, "Failed to add RebalanceSuccessful event: {e:?}");
 						}
 					});
+				},
+				RebalancerEvent::RebalanceFailed {
+					trigger_id,
+					trusted_rebalance_payment_id,
+					amount_msat,
+					reason,
+				} => {
+					log_info!(
+						self.logger,
+						"Rebalance failed for trigger {}: {}",
+						trigger_id.as_hex(),
+						reason
+					);
+
+					// Post a RebalanceFailed event to the event queue
+					if let Err(e) = self
+						.event_queue
+						.add_event(Event::RebalanceFailed {
+							trigger_payment_id: PaymentId::Trusted(trigger_id),
+							trusted_rebalance_payment_id,
+							amount_msat,
+							reason,
+						})
+						.await
+					{
+						log_error!(self.logger, "Failed to add RebalanceFailed event: {e:?}");
+					}
 				},
 				RebalancerEvent::OnChainRebalanceInitiated {
 					trigger_id,

@@ -72,6 +72,7 @@ type Rebalancer = GraduatedRebalancer<
 	LightningWallet,
 	OrangeTrigger,
 	OrangeRebalanceEventHandler,
+	store::RebalancePersistenceStore,
 	Logger,
 >;
 
@@ -529,6 +530,13 @@ impl Wallet {
 
 		let tx_metadata = TxMetadataStore::new(Arc::clone(&store)).await;
 
+		// Create the rebalance event handler early so it can be passed to wallet init functions
+		let rebalance_events = Arc::new(OrangeRebalanceEventHandler::new(
+			tx_metadata.clone(),
+			Arc::clone(&event_queue),
+			Arc::clone(&logger),
+		));
+
 		// Cashu must init before LDK Node because CashuKvDatabase does
 		// synchronous SQLite reads that deadlock with LDK Node's background
 		// store writes. Other backends can init concurrently.
@@ -541,6 +549,7 @@ impl Wallet {
 					Arc::clone(&store),
 					Arc::clone(&event_queue),
 					tx_metadata.clone(),
+					Arc::clone(&rebalance_events),
 					Arc::clone(&logger),
 					Arc::clone(&runtime),
 				)
@@ -549,7 +558,6 @@ impl Wallet {
 		} else {
 			None
 		};
-
 		let (trusted, ln_wallet) = tokio::join!(
 			async {
 				let trusted: Arc<Box<DynTrustedWalletInterface>> = match &config.extra_config {
@@ -561,6 +569,7 @@ impl Wallet {
 							Arc::clone(&store),
 							Arc::clone(&event_queue),
 							tx_metadata.clone(),
+							Arc::clone(&rebalance_events),
 							Arc::clone(&logger),
 							Arc::clone(&runtime),
 						)
@@ -576,6 +585,7 @@ impl Wallet {
 							&cfg.bitcoind,
 							tx_metadata.clone(),
 							Arc::clone(&event_queue),
+							Arc::clone(&rebalance_events),
 							Arc::clone(&runtime),
 						)
 						.await,
@@ -591,6 +601,7 @@ impl Wallet {
 						Arc::clone(&store),
 						Arc::clone(&event_queue),
 						tx_metadata.clone(),
+						Arc::clone(&rebalance_events),
 						Arc::clone(&logger),
 					)
 					.await?,
@@ -612,19 +623,31 @@ impl Wallet {
 			Arc::clone(&logger),
 		));
 
-		let rebalance_events = Arc::new(OrangeRebalanceEventHandler::new(
-			tx_metadata.clone(),
-			Arc::clone(&event_queue),
-			Arc::clone(&logger),
-		));
-
 		let rebalancer = Arc::new(GraduatedRebalancer::new(
 			wt,
 			Arc::clone(&ln_wallet),
 			trigger,
-			rebalance_events,
+			Arc::clone(&rebalance_events),
+			Arc::new(store::RebalancePersistenceStore::new(Arc::clone(&store))),
 			Arc::clone(&logger),
 		));
+
+		// Set the rebalancer reference in the event handler
+		rebalance_events.set_rebalancer(Arc::clone(&rebalancer));
+
+		// Recover incomplete rebalances from previous sessions
+		// we ignore the return value because we always attempt a rebalance on startup
+		rebalancer.recover_incomplete_trusted_rebalances().await.map_err(|()| {
+			log_error!(logger, "Failed to recover incomplete rebalances");
+			BuildError::WalletSetupFailed
+		})?;
+
+		// Recover incomplete on-chain rebalances from previous sessions
+		// we ignore the return value because we always attempt a rebalance on startup
+		rebalancer.recover_incomplete_onchain_rebalances().await.map_err(|()| {
+			log_error!(logger, "Failed to recover incomplete on-chain rebalances");
+			BuildError::WalletSetupFailed
+		})?;
 
 		// Spawn a background thread to initiate a rebalance if needed.
 		// We only do this once as we generally rebalance in response to
