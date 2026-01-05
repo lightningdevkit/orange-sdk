@@ -392,6 +392,7 @@ async fn test_receive_onchain() {
 			.unwrap();
 
 		wait_for_tx(&electrsd.client, sent_txid).await;
+		println!("payment sent with txid: {sent_txid}");
 
 		// confirm transaction
 		generate_blocks(&bitcoind, &electrsd, 6).await;
@@ -404,8 +405,8 @@ async fn test_receive_onchain() {
 		})
 		.await;
 
+		println!("waiting for onchain recv event");
 		let event = wait_next_event(&wallet).await;
-
 		match event {
 			Event::OnchainPaymentReceived { txid, amount_sat, status, .. } => {
 				assert_eq!(txid, sent_txid);
@@ -445,6 +446,7 @@ async fn test_receive_onchain() {
 		tokio::time::sleep(Duration::from_secs(5)).await; // wait for sync
 
 		//  wait for rebalance to be initiated
+		println!("waiting for channel opened event");
 		let event = wait_next_event(&wallet).await;
 		match event {
 			Event::ChannelOpened { counterparty_node_id, .. } => {

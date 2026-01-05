@@ -248,10 +248,20 @@ where
 
 	/// Does any rebalance if it meets the conditions of the tunables
 	pub async fn do_rebalance_if_needed(&self) {
+		self.do_trusted_rebalance_if_needed().await;
+
+		self.do_onchain_rebalance_if_needed().await;
+	}
+
+	/// Does a trusted to lightning rebalance if needed
+	pub async fn do_trusted_rebalance_if_needed(&self) {
 		if let Some(params) = self.trigger.needs_trusted_rebalance().await {
 			self.do_trusted_rebalance(params).await;
 		}
+	}
 
+	/// Does an on-chain to lightning rebalance if needed
+	pub async fn do_onchain_rebalance_if_needed(&self) {
 		if let Some(params) = self.trigger.needs_onchain_rebalance().await {
 			self.do_onchain_rebalance(params).await;
 		}

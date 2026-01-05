@@ -615,6 +615,15 @@ impl Wallet {
 			// Wait a second to get caught up, then try to rebalance.
 			tokio::time::sleep(Duration::from_secs(1)).await;
 			rb.do_rebalance_if_needed().await;
+
+			// create loop for onchain rebalancing.
+			// we only do onchain rebalancing here as trusted rebalancing is
+			// handled by events but we cannot do that for onchain rebalancing.
+			// So we need to detect onchain balance changes periodically.
+			loop {
+				tokio::time::sleep(Duration::from_secs(1)).await;
+				rb.do_onchain_rebalance_if_needed().await;
+			}
 		});
 
 		let inner = Arc::new(WalletImpl {
