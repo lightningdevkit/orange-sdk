@@ -39,6 +39,7 @@ mod event;
 mod ffi;
 mod lightning_wallet;
 pub(crate) mod logging;
+mod rebalance_monitor;
 mod rebalancer;
 mod runtime;
 mod store;
@@ -46,6 +47,7 @@ pub mod trusted_wallet;
 
 use lightning_wallet::LightningWallet;
 use logging::Logger;
+use rebalance_monitor::RebalanceMonitor;
 use trusted_wallet::TrustedError;
 
 pub use crate::logging::LoggerType;
@@ -72,6 +74,7 @@ type Rebalancer = GraduatedRebalancer<
 	LightningWallet,
 	OrangeTrigger,
 	OrangeRebalanceEventHandler,
+	store::RebalancePersistenceStore,
 	Logger,
 >;
 
@@ -590,6 +593,9 @@ impl Wallet {
 		let trusted = trusted?;
 		let ln_wallet = ln_wallet?;
 
+		let trusted_monitor_holder = trusted.rebalance_monitor_holder();
+		let ln_monitor_holder = ln_wallet.rebalance_monitor_holder();
+
 		let wt = Arc::new(WalletTrusted(Arc::clone(&trusted)));
 
 		let trigger = Arc::new(OrangeTrigger::new(
@@ -613,8 +619,20 @@ impl Wallet {
 			Arc::clone(&ln_wallet),
 			trigger,
 			rebalance_events,
+			Arc::new(store::RebalancePersistenceStore::new(Arc::clone(&store))),
 			Arc::clone(&logger),
 		));
+
+		// Create the rebalance monitor and populate the holders
+		let monitor = RebalanceMonitor::new(Arc::clone(&rebalancer));
+		*ln_monitor_holder.lock().await = Some(monitor.clone());
+		*trusted_monitor_holder.lock().await = Some(monitor);
+
+		// Recover incomplete rebalances from previous sessions
+		rebalancer.recover_incomplete_rebalances().await.map_err(|()| {
+			log_error!(logger, "Failed to recover incomplete rebalances");
+			BuildError::WalletSetupFailed
+		})?;
 
 		// Spawn a background thread to initiate a rebalance if needed.
 		// We only do this once as we generally rebalance in response to

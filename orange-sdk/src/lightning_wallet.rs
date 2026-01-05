@@ -2,6 +2,7 @@ use crate::bitcoin::OutPoint;
 use crate::bitcoin::hashes::Hash;
 use crate::event::{EventQueue, LdkEventHandler};
 use crate::logging::Logger;
+use crate::rebalance_monitor::RebalanceMonitorHolder;
 use crate::runtime::Runtime;
 use crate::store::{TxMetadataStore, TxStatus};
 use crate::{ChainSource, InitFailure, PaymentType, Seed, WalletConfig, store};
@@ -24,7 +25,7 @@ use ldk_node::payment::{
 };
 use ldk_node::{DynStore, NodeError, UserChannelId};
 
-use graduated_rebalancer::{LightningBalance, ReceivedLightningPayment};
+use graduated_rebalancer::LightningBalance;
 
 use std::collections::HashMap;
 use std::fmt::Debug;
@@ -43,9 +44,9 @@ pub(crate) struct LightningWalletImpl {
 	pub(crate) ldk_node: Arc<ldk_node::Node>,
 	logger: Arc<Logger>,
 	store: Arc<DynStore>,
-	payment_receipt_flag: watch::Receiver<()>,
 	channel_pending_receipt_flag: watch::Receiver<u128>,
 	splice_pending_receipt_flag: watch::Receiver<u128>,
+	rebalance_monitor_holder: RebalanceMonitorHolder,
 	lsp_node_id: PublicKey,
 	lsp_socket_addr: SocketAddress,
 }
@@ -164,25 +165,25 @@ impl LightningWallet {
 		}
 
 		let ldk_node = Arc::new(builder.build_with_store(Arc::clone(&store))?);
-		let (payment_receipt_sender, payment_receipt_flag) = watch::channel(());
 		let (channel_pending_sender, channel_pending_receipt_flag) = watch::channel(0);
 		let (splice_pending_sender, splice_pending_receipt_flag) = watch::channel(0);
+		let rebalance_monitor_holder = Arc::new(tokio::sync::Mutex::new(None));
 		let ev_handler = Arc::new(LdkEventHandler {
 			event_queue,
 			ldk_node: Arc::clone(&ldk_node),
 			tx_metadata,
-			payment_receipt_sender,
 			channel_pending_sender,
 			splice_pending_sender,
+			rebalance_monitor: Arc::clone(&rebalance_monitor_holder),
 			logger: Arc::clone(&logger),
 		});
 		let inner = Arc::new(LightningWalletImpl {
 			ldk_node,
 			logger,
 			store,
-			payment_receipt_flag,
 			channel_pending_receipt_flag,
 			splice_pending_receipt_flag,
+			rebalance_monitor_holder,
 			lsp_node_id,
 			lsp_socket_addr,
 		});
@@ -198,12 +199,6 @@ impl LightningWallet {
 		});
 
 		Ok(Self { inner })
-	}
-
-	pub(crate) async fn await_payment_receipt(&self) {
-		let mut flag = self.inner.payment_receipt_flag.clone();
-		flag.mark_unchanged();
-		let _ = flag.changed().await;
 	}
 
 	pub(crate) async fn await_channel_pending(&self, channel_id: u128) {
@@ -466,6 +461,11 @@ impl LightningWallet {
 	pub(crate) fn stop(&self) {
 		let _ = self.inner.ldk_node.stop();
 	}
+
+	/// Get the rebalance monitor holder for this wallet
+	pub(crate) fn rebalance_monitor_holder(&self) -> RebalanceMonitorHolder {
+		Arc::clone(&self.inner.rebalance_monitor_holder)
+	}
 }
 
 impl graduated_rebalancer::LightningWallet for LightningWallet {
@@ -486,40 +486,6 @@ impl graduated_rebalancer::LightningWallet for LightningWallet {
 		&self, method: PaymentMethod, amount: Amount,
 	) -> Pin<Box<dyn Future<Output = Result<[u8; 32], Self::Error>> + Send + '_>> {
 		Box::pin(async move { self.pay(&method, amount).await.map(|p| p.0) })
-	}
-
-	fn await_payment_receipt(
-		&self, payment_hash: [u8; 32],
-	) -> Pin<Box<dyn Future<Output = Option<ReceivedLightningPayment>> + Send + '_>> {
-		Box::pin(async move {
-			let id = PaymentId(payment_hash);
-			loop {
-				if let Some(payment) = self.inner.ldk_node.payment(&id) {
-					let counterparty_skimmed_fee_msat = match payment.kind {
-						PaymentKind::Bolt11 { hash, .. } => {
-							debug_assert!(hash.0 == payment_hash, "Payment Hash mismatch");
-							None
-						},
-						PaymentKind::Bolt11Jit { hash, counterparty_skimmed_fee_msat, .. } => {
-							debug_assert!(hash.0 == payment_hash, "Payment Hash mismatch");
-							counterparty_skimmed_fee_msat
-						},
-						_ => return None, // Ignore other payment kinds, we only care about the one we just sent.
-					};
-					match payment.status {
-						PaymentStatus::Succeeded => {
-							return Some(ReceivedLightningPayment {
-								id: payment.id.0,
-								fee_paid_msat: counterparty_skimmed_fee_msat,
-							});
-						},
-						PaymentStatus::Pending => {},
-						PaymentStatus::Failed => return None,
-					}
-				}
-				self.await_payment_receipt().await;
-			}
-		})
 	}
 
 	fn has_channel_with_lsp(&self) -> bool {

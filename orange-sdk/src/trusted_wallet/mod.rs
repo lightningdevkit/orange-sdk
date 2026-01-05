@@ -1,13 +1,12 @@
 //! This module defines the `TrustedWalletInterface` trait and its associated types.
 
+use crate::rebalance_monitor::RebalanceMonitorHolder;
 use crate::store::TxStatus;
 
 use ldk_node::lightning_invoice::Bolt11Invoice;
 
 use bitcoin_payment_instructions::PaymentMethod;
 use bitcoin_payment_instructions::amount::Amount;
-
-use graduated_rebalancer::ReceivedLightningPayment;
 
 use std::future::Future;
 use std::pin::Pin;
@@ -44,7 +43,7 @@ pub struct Payment {
 pub(crate) type DynTrustedWalletInterface = dyn TrustedWalletInterface + Send + Sync;
 
 /// Represents a trait for a trusted wallet interface.
-pub trait TrustedWalletInterface: Send + Sync + private::Sealed {
+pub(crate) trait TrustedWalletInterface: Send + Sync + private::Sealed {
 	/// Returns the current balance of the wallet.
 	fn get_balance(
 		&self,
@@ -83,11 +82,8 @@ pub trait TrustedWalletInterface: Send + Sync + private::Sealed {
 		&self, method: PaymentMethod, amount: Amount,
 	) -> Pin<Box<dyn Future<Output = Result<[u8; 32], TrustedError>> + Send + '_>>;
 
-	/// Waits for a payment with the given payment hash to succeed.
-	/// Returns the `ReceivedLightningPayment` if successful, or `None` if it fails or times out.
-	fn await_payment_success(
-		&self, payment_hash: [u8; 32],
-	) -> Pin<Box<dyn Future<Output = Option<ReceivedLightningPayment>> + Send + '_>>;
+	/// Get the rebalance monitor holder for this wallet
+	fn rebalance_monitor_holder(&self) -> RebalanceMonitorHolder;
 
 	/// Stops the wallet, cleaning up any resources.
 	/// This is typically used to gracefully shut down the wallet.
@@ -115,12 +111,6 @@ impl<T: ?Sized + TrustedWalletInterface> graduated_rebalancer::TrustedWallet for
 		&self, method: PaymentMethod, amount: Amount,
 	) -> Pin<Box<dyn Future<Output = Result<[u8; 32], Self::Error>> + Send + '_>> {
 		Box::pin(async move { self.0.pay(method, amount).await })
-	}
-
-	fn await_payment_success(
-		&self, payment_hash: [u8; 32],
-	) -> Pin<Box<dyn Future<Output = Option<ReceivedLightningPayment>> + Send + '_>> {
-		Box::pin(async move { self.0.await_payment_success(payment_hash).await })
 	}
 }
 

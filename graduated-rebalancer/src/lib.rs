@@ -12,13 +12,75 @@ use bitcoin_payment_instructions::PaymentMethod;
 use lightning::bitcoin::hashes::Hash;
 use lightning::bitcoin::hex::DisplayHex;
 use lightning::bitcoin::OutPoint;
+use lightning::impl_writeable_tlv_based;
 use lightning::util::logger::Logger;
 use lightning::{log_debug, log_error, log_info};
 use lightning_invoice::Bolt11Invoice;
+use std::collections::HashMap;
 use std::fmt::Debug;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
+
+/// Represents the state of an in-progress rebalance from trusted to lightning wallet
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RebalanceState {
+	/// ID from the rebalance trigger
+	pub trigger_id: [u8; 32],
+	/// Expected payment hash for the lightning invoice
+	pub expected_payment_hash: [u8; 32],
+	/// Amount being rebalanced in millisatoshis
+	pub amount_msat: u64,
+	/// Whether the lightning wallet has received the payment
+	pub ln_payment_received: bool,
+	/// Whether the trusted wallet has confirmed sending the payment
+	pub trusted_payment_sent: bool,
+	/// Payment ID from the trusted wallet
+	pub trusted_payment_id: Option<[u8; 32]>,
+	/// Lightning payment ID (set when received)
+	pub ln_payment_id: Option<[u8; 32]>,
+	/// Fee paid by lightning wallet in millisatoshis
+	pub ln_fee_msat: Option<u64>,
+	/// Fee paid by trusted wallet in millisatoshis
+	pub trusted_fee_msat: Option<u64>,
+}
+
+impl_writeable_tlv_based!(RebalanceState, {
+	(0, trigger_id, required),
+	(2, expected_payment_hash, required),
+	(4, amount_msat, required),
+	(6, ln_payment_received, required),
+	(8, trusted_payment_sent, required),
+	(10, trusted_payment_id, option),
+	(12, ln_payment_id, option),
+	(14, ln_fee_msat, option),
+	(16, trusted_fee_msat, option),
+});
+
+/// Trait for persisting rebalance state across restarts
+pub trait RebalancePersistence: Send + Sync {
+	/// Insert a new rebalance state
+	fn insert_rebalance_state(
+		&self, state: RebalanceState,
+	) -> Pin<Box<dyn Future<Output = ()> + Send + '_>>;
+
+	/// Update an existing rebalance state
+	fn update_rebalance_state(
+		&self, state: RebalanceState,
+	) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
+		self.insert_rebalance_state(state)
+	}
+
+	/// Remove a rebalance state
+	fn remove_rebalance_state(
+		&self, payment_hash: [u8; 32],
+	) -> Pin<Box<dyn Future<Output = ()> + Send + '_>>;
+
+	/// List all incomplete rebalance states
+	fn list_incomplete_rebalances(
+		&self,
+	) -> Pin<Box<dyn Future<Output = Result<Vec<RebalanceState>, ()>> + Send + '_>>;
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 /// Parameters for doing a rebalance
@@ -78,11 +140,6 @@ pub trait TrustedWallet: Send + Sync {
 	fn pay(
 		&self, method: PaymentMethod, amount: Amount,
 	) -> Pin<Box<dyn Future<Output = Result<[u8; 32], Self::Error>> + Send + '_>>;
-
-	/// Wait for a payment success notification
-	fn await_payment_success(
-		&self, payment_hash: [u8; 32],
-	) -> Pin<Box<dyn Future<Output = Option<ReceivedLightningPayment>> + Send + '_>>;
 }
 
 /// Trait representing a lightning wallet backend
@@ -102,11 +159,6 @@ pub trait LightningWallet: Send + Sync {
 	fn pay(
 		&self, method: PaymentMethod, amount: Amount,
 	) -> Pin<Box<dyn Future<Output = Result<[u8; 32], Self::Error>> + Send + '_>>;
-
-	/// Wait for a payment receipt notification
-	fn await_payment_receipt(
-		&self, payment_hash: [u8; 32],
-	) -> Pin<Box<dyn Future<Output = Option<ReceivedLightningPayment>> + Send + '_>>;
 
 	/// Check if we already have a channel with the LSP
 	fn has_channel_with_lsp(&self) -> bool;
@@ -130,15 +182,6 @@ pub trait LightningWallet: Send + Sync {
 	fn await_splice_pending(
 		&self, channel_id: u128,
 	) -> Pin<Box<dyn Future<Output = OutPoint> + Send + '_>>;
-}
-
-/// Represents a payment from the lightning wallet
-#[derive(Debug, Clone)]
-pub struct ReceivedLightningPayment {
-	/// Unique payment ID
-	pub id: [u8; 32],
-	/// Fee paid in millisatoshis
-	pub fee_paid_msat: Option<u64>,
 }
 
 /// Lightning wallet balance information
@@ -174,6 +217,17 @@ pub enum RebalancerEvent {
 		amount_msat: u64,
 		/// Total fee paid in millisatoshis
 		fee_msat: u64,
+	},
+	/// Rebalance failed
+	RebalanceFailed {
+		/// Trigger id given by the rebalance trigger
+		trigger_id: [u8; 32],
+		/// Trusted wallet payment ID for the rebalance
+		trusted_rebalance_payment_id: Option<[u8; 32]>,
+		/// Amount that was being rebalanced in millisatoshis
+		amount_msat: u64,
+		/// Reason for failure
+		reason: String,
 	},
 	/// We have initiated a lightning channel open
 	OnChainRebalanceInitiated {
@@ -212,37 +266,42 @@ pub struct GraduatedRebalancer<
 	L: LightningWallet,
 	R: RebalanceTrigger,
 	E: EventHandler,
+	P: RebalancePersistence,
 	O: Logger,
 > {
 	trusted: Arc<T>,
 	ln_wallet: Arc<L>,
 	trigger: Arc<R>,
 	event_handler: Arc<E>,
+	persistence: Arc<P>,
 	logger: Arc<O>,
 
-	/// Mutex to ensure thread-safe balance operations.
-	balance_mutex: tokio::sync::Mutex<()>,
+	/// In-memory cache of active rebalances indexed by payment hash
+	active_rebalances: Arc<tokio::sync::RwLock<HashMap<[u8; 32], RebalanceState>>>,
 }
 
-impl<T, LN, R, E, L> GraduatedRebalancer<T, LN, R, E, L>
+impl<T, LN, R, E, P, L> GraduatedRebalancer<T, LN, R, E, P, L>
 where
 	T: TrustedWallet,
 	LN: LightningWallet,
 	R: RebalanceTrigger,
 	E: EventHandler,
+	P: RebalancePersistence,
 	L: Logger,
 {
 	/// Create a new graduated rebalancer
 	pub fn new(
-		trusted: Arc<T>, ln_wallet: Arc<LN>, trigger: Arc<R>, event_handler: Arc<E>, logger: Arc<L>,
+		trusted: Arc<T>, ln_wallet: Arc<LN>, trigger: Arc<R>, event_handler: Arc<E>,
+		persistence: Arc<P>, logger: Arc<L>,
 	) -> Self {
 		Self {
 			trusted,
 			ln_wallet,
 			trigger,
 			event_handler,
+			persistence,
 			logger,
-			balance_mutex: tokio::sync::Mutex::new(()),
+			active_rebalances: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
 		}
 	}
 
@@ -268,77 +327,84 @@ where
 	}
 
 	/// Perform a rebalance from trusted to lightning wallet
+	/// This method initiates the rebalance and returns immediately.
+	/// Completion is handled via the observer pattern (on_trusted_payment_sent, on_ln_payment_received).
 	async fn do_trusted_rebalance(&self, params: TriggerParams) {
-		let transfer_amt = params.amount;
-		let _lock = self.balance_mutex.lock().await;
+		// Check if there's already an active rebalance
+		let mut rebalances = self.active_rebalances.write().await;
+		if !rebalances.is_empty() {
+			log_info!(
+				self.logger,
+				"Skipping rebalance trigger - already have {} active rebalance(s)",
+				rebalances.len()
+			);
+			return;
+		}
+
 		log_info!(self.logger, "Initiating rebalance");
 
+		let transfer_amt = params.amount;
 		if let Ok(inv) = self.ln_wallet.get_bolt11_invoice(Some(transfer_amt)).await {
 			log_debug!(
 				self.logger,
 				"Attempting to pay invoice {inv} to rebalance for {transfer_amt:?}",
 			);
-			let expected_hash = *inv.payment_hash();
+
+			let expected_hash = inv.payment_hash().to_byte_array();
+
+			// Create and persist rebalance state
+			let mut state = RebalanceState {
+				trigger_id: params.id,
+				expected_payment_hash: expected_hash,
+				amount_msat: transfer_amt.milli_sats(),
+				ln_payment_received: false,
+				trusted_payment_sent: false,
+				trusted_payment_id: None,
+				ln_payment_id: None,
+				ln_fee_msat: None,
+				trusted_fee_msat: None,
+			};
+			self.persistence.insert_rebalance_state(state).await;
+
 			match self.trusted.pay(PaymentMethod::LightningBolt11(inv), transfer_amt).await {
-				Ok(rebalance_id) => {
+				Ok(trusted_payment_id) => {
 					log_debug!(
 						self.logger,
-						"Rebalance trusted transaction initiated, id {}. Waiting for LN payment.",
-						rebalance_id.as_hex()
+						"Rebalance trusted transaction initiated, id {}. Will complete via observer callbacks.",
+						trusted_payment_id.as_hex()
 					);
 
+					// persist trusted payment id
+					state.trusted_payment_id = Some(trusted_payment_id);
+					self.persistence.update_rebalance_state(state).await;
+
+					// Add to active rebalances cache
+					rebalances.insert(expected_hash, state);
+
+					// Post initiated event
 					self.event_handler
 						.handle_event(RebalancerEvent::RebalanceInitiated {
 							trigger_id: params.id,
-							trusted_rebalance_payment_id: rebalance_id,
+							trusted_rebalance_payment_id: trusted_payment_id,
 							amount_msat: transfer_amt.milli_sats(),
-						})
-						.await;
-
-					let ln_payment = match self
-						.ln_wallet
-						.await_payment_receipt(expected_hash.to_byte_array())
-						.await
-					{
-						Some(receipt) => receipt,
-						None => {
-							log_error!(self.logger, "Failed to receive rebalance payment!");
-							return;
-						},
-					};
-
-					let trusted_payment = match self
-						.trusted
-						.await_payment_success(expected_hash.to_byte_array())
-						.await
-					{
-						Some(success) => success,
-						None => {
-							log_error!(self.logger, "Failed to send rebalance payment!");
-							return;
-						},
-					};
-
-					log_info!(
-						self.logger,
-						"Rebalance succeeded. Sent trusted tx {} to lightning tx {}",
-						rebalance_id.as_hex(),
-						ln_payment.id.as_hex(),
-					);
-
-					self.event_handler
-						.handle_event(RebalancerEvent::RebalanceSuccessful {
-							trigger_id: params.id,
-							trusted_rebalance_payment_id: rebalance_id,
-							ln_rebalance_payment_id: ln_payment.id,
-							amount_msat: transfer_amt.milli_sats(),
-							fee_msat: ln_payment.fee_paid_msat.unwrap_or_default()
-								+ trusted_payment.fee_paid_msat.unwrap_or_default(),
 						})
 						.await;
 				},
 				Err(e) => {
 					log_info!(self.logger, "Rebalance trusted transaction failed with {e:?}",);
+
+					// Clean up persisted state
+					self.persistence.remove_rebalance_state(expected_hash).await;
+
+					// Post failure event
+					self.event_handler
+						.handle_event(RebalancerEvent::RebalanceFailed {
+							trigger_id: params.id,
+							trusted_rebalance_payment_id: None,
+							amount_msat: transfer_amt.milli_sats(),
+							reason: format!("Failed to initiate trusted payment: {e:?}"),
+						})
+						.await;
 				},
 			}
 		}
@@ -346,7 +412,7 @@ where
 
 	/// Perform on-chain to lightning rebalance by opening a channel or splicing into an existing one
 	async fn do_onchain_rebalance(&self, params: TriggerParams) {
-		let _ = self.balance_mutex.lock().await;
+		let _ = self.active_rebalances.write().await; // todo persist onchain rebalances
 
 		let (channel_outpoint, user_channel_id) = if self.ln_wallet.has_channel_with_lsp() {
 			log_info!(self.logger, "Splicing into channel with LSP with on-chain funds");
@@ -354,7 +420,15 @@ where
 			let user_chan_id = match self.ln_wallet.splice_to_lsp_channel(params.amount).await {
 				Ok(chan_id) => chan_id,
 				Err(e) => {
-					log_error!(self.logger, "Failed to open channel with LSP: {e:?}");
+					log_error!(self.logger, "Failed to splice to LSP channel: {e:?}");
+					self.event_handler
+						.handle_event(RebalancerEvent::RebalanceFailed {
+							trigger_id: params.id,
+							trusted_rebalance_payment_id: None,
+							amount_msat: params.amount.milli_sats(),
+							reason: format!("Failed to splice to LSP channel: {e:?}"),
+						})
+						.await;
 					return;
 				},
 			};
@@ -373,6 +447,14 @@ where
 				Ok(chan_id) => chan_id,
 				Err(e) => {
 					log_error!(self.logger, "Failed to open channel with LSP: {e:?}");
+					self.event_handler
+						.handle_event(RebalancerEvent::RebalanceFailed {
+							trigger_id: params.id,
+							trusted_rebalance_payment_id: None,
+							amount_msat: params.amount.milli_sats(),
+							reason: format!("Failed to open channel with LSP: {e:?}"),
+						})
+						.await;
 					return;
 				},
 			};
@@ -395,9 +477,158 @@ where
 			.await;
 	}
 
+	/// Called when the trusted wallet confirms sending a payment
+	/// This is part of the observer pattern to handle rebalance completion across restarts
+	pub async fn on_trusted_payment_sent(&self, payment_hash: [u8; 32], fee_msat: Option<u64>) {
+		let mut rebalances = self.active_rebalances.write().await;
+
+		if let Some(state) = rebalances.get_mut(&payment_hash) {
+			state.trusted_payment_sent = true;
+			state.trusted_fee_msat = fee_msat;
+
+			log_debug!(self.logger, "Trusted payment sent for rebalance {}", payment_hash.as_hex());
+
+			// Check if rebalance is complete, otherwise persist state
+			if state.ln_payment_received {
+				self.complete_rebalance(*state, &mut rebalances).await;
+			} else {
+				self.persistence.update_rebalance_state(*state).await;
+			}
+		}
+	}
+
+	/// Called when the lightning wallet receives a payment
+	/// This is part of the observer pattern to handle rebalance completion across restarts
+	pub async fn on_ln_payment_received(
+		&self, payment_hash: [u8; 32], payment_id: [u8; 32], fee_msat: Option<u64>,
+	) {
+		let mut rebalances = self.active_rebalances.write().await;
+
+		if let Some(state) = rebalances.get_mut(&payment_hash) {
+			state.ln_payment_received = true;
+			state.ln_payment_id = Some(payment_id);
+			state.ln_fee_msat = fee_msat;
+
+			log_debug!(
+				self.logger,
+				"Lightning payment received for rebalance {}",
+				payment_hash.as_hex()
+			);
+
+			// Check if rebalance is complete, otherwise persist state
+			if state.trusted_payment_sent {
+				self.complete_rebalance(*state, &mut rebalances).await;
+			} else {
+				self.persistence.update_rebalance_state(*state).await;
+			}
+		}
+	}
+
+	/// Called when a trusted wallet payment fails
+	/// This is part of the observer pattern to handle rebalance failures
+	pub async fn on_trusted_payment_failed(&self, payment_hash: [u8; 32], reason: String) {
+		let mut rebalances = self.active_rebalances.write().await;
+
+		if let Some(state) = rebalances.get(&payment_hash) {
+			log_info!(
+				self.logger,
+				"Trusted payment failed for rebalance {}: {}",
+				payment_hash.as_hex(),
+				reason
+			);
+
+			// Post failure event
+			self.event_handler
+				.handle_event(RebalancerEvent::RebalanceFailed {
+					trigger_id: state.trigger_id,
+					trusted_rebalance_payment_id: state.trusted_payment_id,
+					amount_msat: state.amount_msat,
+					reason,
+				})
+				.await;
+
+			// Clean up
+			rebalances.remove(&payment_hash);
+			self.persistence.remove_rebalance_state(payment_hash).await;
+		}
+	}
+
+	/// Complete a rebalance by posting the success event and cleaning up
+	async fn complete_rebalance(
+		&self, state: RebalanceState,
+		rebalances: &mut tokio::sync::RwLockWriteGuard<'_, HashMap<[u8; 32], RebalanceState>>,
+	) {
+		log_info!(
+			self.logger,
+			"Rebalance succeeded. Sent trusted tx {} to lightning tx {}",
+			state.trusted_payment_id.expect("trusted_payment_id must be set").as_hex(),
+			state.ln_payment_id.expect("ln_payment_id must be set").as_hex(),
+		);
+
+		self.event_handler
+			.handle_event(RebalancerEvent::RebalanceSuccessful {
+				trigger_id: state.trigger_id,
+				trusted_rebalance_payment_id: state
+					.trusted_payment_id
+					.expect("trusted_payment_id must be set"),
+				ln_rebalance_payment_id: state.ln_payment_id.expect("ln_payment_id must be set"),
+				amount_msat: state.amount_msat,
+				fee_msat: state.ln_fee_msat.unwrap_or_default()
+					+ state.trusted_fee_msat.unwrap_or_default(),
+			})
+			.await;
+
+		// Clean up
+		rebalances.remove(&state.expected_payment_hash);
+		self.persistence.remove_rebalance_state(state.expected_payment_hash).await;
+	}
+
+	/// Recover incomplete rebalances from persistence on startup
+	/// This should be called during wallet initialization
+	pub async fn recover_incomplete_rebalances(&self) -> Result<(), ()> {
+		let incomplete = self.persistence.list_incomplete_rebalances().await?;
+
+		if !incomplete.is_empty() {
+			log_info!(
+				self.logger,
+				"Found {} incomplete rebalances, loading into memory",
+				incomplete.len()
+			);
+		}
+
+		let mut rebalances = self.active_rebalances.write().await;
+		for state in incomplete {
+			log_debug!(
+				self.logger,
+				"Recovering rebalance {} (ln_received: {}, trusted_sent: {})",
+				state.expected_payment_hash.as_hex(),
+				state.ln_payment_received,
+				state.trusted_payment_sent
+			);
+
+			// If both sides already completed, finalize now
+			if state.ln_payment_received && state.trusted_payment_sent {
+				log_info!(
+					self.logger,
+					"Rebalance {} was already complete, finalizing",
+					state.expected_payment_hash.as_hex()
+				);
+
+				// We need to temporarily insert to use complete_rebalance
+				rebalances.insert(state.expected_payment_hash, state);
+				self.complete_rebalance(state, &mut rebalances).await;
+			} else {
+				// Still waiting for one or both sides
+				rebalances.insert(state.expected_payment_hash, state);
+			}
+		}
+
+		Ok(())
+	}
+
 	/// Stops the rebalancer, waits for any active rebalances to complete
 	pub async fn stop(&self) {
 		log_debug!(self.logger, "Waiting for balance mutex...");
-		let _ = self.balance_mutex.lock().await;
+		let _ = self.active_rebalances.write().await;
 	}
 }

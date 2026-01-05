@@ -169,6 +169,7 @@ async fn test_pay_from_trusted() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+#[test_log::test]
 async fn test_sweep_to_ln() {
 	test_utils::run_test(|params| async move {
 		let wallet = Arc::clone(&params.wallet);
@@ -195,6 +196,7 @@ async fn test_sweep_to_ln() {
 		})
 		.await;
 
+		println!("waiting for payment recv");
 		let event = wait_next_event(&wallet).await;
 		match event {
 			Event::PaymentReceived { .. } => {},
@@ -216,12 +218,14 @@ async fn test_sweep_to_ln() {
 		.await;
 
 		// receive to trusted wallet
+		println!("waiting for payment recv 2");
 		let event = wait_next_event(&wallet).await;
 		match event {
 			Event::PaymentReceived { .. } => {},
 			e => panic!("Expected PaymentReceived event, got {e:?}"),
 		}
 
+		println!("waiting for rebalance");
 		let event = wait_next_event(&wallet).await;
 		assert!(
 			matches!(event, Event::RebalanceInitiated { .. }),
@@ -235,16 +239,18 @@ async fn test_sweep_to_ln() {
 		.await;
 
 		// wait for payment received
+		println!("waiting for channel opened");
 		let event = wait_next_event(&wallet).await;
 		match event {
 			Event::ChannelOpened { counterparty_node_id, .. } => {
 				assert_eq!(counterparty_node_id, lsp.node_id());
 			},
-			_ => panic!("Expected ChannelOpened event"),
+			e => panic!("Expected ChannelOpened event, got {e:?}"),
 		}
 
 		let expect_amt = intermediate_amt.saturating_add(recv_amt);
 
+		println!("waiting for payment recv");
 		let event = wait_next_event(&wallet).await;
 		match event {
 			Event::PaymentReceived { payment_id, amount_msat, lsp_fee_msats, .. } => {
@@ -255,6 +261,7 @@ async fn test_sweep_to_ln() {
 			e => panic!("Expected RebalanceSuccessful event, got {e:?}"),
 		}
 
+		println!("waiting for rebalance successful");
 		let event = wait_next_event(&wallet).await;
 		match event {
 			Event::RebalanceSuccessful { amount_msat, fee_msat, .. } => {

@@ -274,6 +274,17 @@ pub enum Event {
 		/// The outpoint of the channel's splice funding transaction.
 		new_funding_txo: String,
 	},
+	/// A rebalance from our trusted wallet has failed.
+	RebalanceFailed {
+		/// The `payment_id` of the transaction that triggered the rebalance.
+		trigger_payment_id: PaymentId,
+		/// The `payment_id` of the rebalance payment sent from the trusted wallet.
+		trusted_rebalance_payment_id: Option<Vec<u8>>,
+		/// The amount, in msats, of the rebalance payment.
+		amount_msat: u64,
+		/// The reason for the failure.
+		reason: String,
+	},
 }
 
 impl From<OrangeEvent> for Event {
@@ -360,6 +371,17 @@ impl From<OrangeEvent> for Event {
 				ln_rebalance_payment_id: ln_rebalance_payment_id.to_vec(),
 				amount_msat,
 				fee_msat,
+			},
+			OrangeEvent::RebalanceFailed {
+				trigger_payment_id,
+				trusted_rebalance_payment_id,
+				amount_msat,
+				reason,
+			} => Event::RebalanceFailed {
+				trigger_payment_id: trigger_payment_id.into(),
+				trusted_rebalance_payment_id: trusted_rebalance_payment_id.map(|id| id.to_vec()),
+				amount_msat,
+				reason,
 			},
 			OrangeEvent::SplicePending {
 				channel_id,

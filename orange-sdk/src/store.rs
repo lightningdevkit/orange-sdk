@@ -12,6 +12,7 @@
 //! shifted to minimize fees and ensure maximal security.
 
 use bitcoin_payment_instructions::amount::Amount;
+use graduated_rebalancer::RebalancePersistence;
 
 use ldk_node::DynStore;
 use ldk_node::bitcoin::Txid;
@@ -26,6 +27,8 @@ use ldk_node::payment::PaymentDetails;
 
 use std::collections::HashMap;
 use std::fmt;
+use std::future::Future;
+use std::pin::Pin;
 use std::str::FromStr;
 use std::sync::{Arc, RwLock, RwLockReadGuard};
 use std::time::Duration;
@@ -33,6 +36,7 @@ use std::time::Duration;
 const STORE_PRIMARY_KEY: &str = "orange_sdk";
 const STORE_SECONDARY_KEY: &str = "payment_store";
 const SPLICE_OUT_SECONDARY_KEY: &str = "splice_out";
+const REBALANCE_STATE_SECONDARY_KEY: &str = "rebalance_state";
 
 /// The status of a transaction. This is used to track the state of a transaction
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -131,12 +135,21 @@ impl From<Transaction> for StoreTransaction {
 /// A PaymentId is a unique identifier for a payment. It can be either a Lightning payment or a
 /// Trusted payment. It is used to track the state of a payment and to provide information about
 /// the payment to the user.
-#[derive(Debug, Copy, Clone, Hash, PartialEq, Eq)]
+#[derive(Copy, Clone, Hash, PartialEq, Eq)]
 pub enum PaymentId {
 	/// A self-custodial payment identifier.
 	SelfCustodial([u8; 32]),
 	/// A trusted payment identifier.
 	Trusted([u8; 32]),
+}
+
+impl fmt::Debug for PaymentId {
+	fn fmt(&self, fmt: &mut fmt::Formatter) -> Result<(), fmt::Error> {
+		match self {
+			PaymentId::SelfCustodial(bytes) => write!(fmt, "SelfCustodial({})", bytes.as_hex()),
+			PaymentId::Trusted(s) => write!(fmt, "Trusted({})", s.as_hex()),
+		}
+	}
 }
 
 impl fmt::Display for PaymentId {
@@ -424,6 +437,86 @@ impl TxMetadataStore {
 			.await
 			.expect("We do not allow writes to fail");
 		Ok(())
+	}
+}
+
+/// Wrapper for rebalance state persistence
+#[derive(Clone)]
+pub(crate) struct RebalancePersistenceStore {
+	store: Arc<DynStore>,
+}
+
+impl RebalancePersistenceStore {
+	pub fn new(store: Arc<DynStore>) -> Self {
+		Self { store }
+	}
+}
+
+impl RebalancePersistence for RebalancePersistenceStore {
+	fn insert_rebalance_state(
+		&self, state: graduated_rebalancer::RebalanceState,
+	) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
+		Box::pin(async move {
+			let key = state.expected_payment_hash.as_hex().to_string();
+			let ser = state.encode();
+			KVStore::write(
+				self.store.as_ref(),
+				STORE_PRIMARY_KEY,
+				REBALANCE_STATE_SECONDARY_KEY,
+				&key,
+				ser,
+			)
+			.await
+			.expect("We do not allow writes to fail");
+		})
+	}
+
+	fn remove_rebalance_state(
+		&self, payment_hash: [u8; 32],
+	) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
+		Box::pin(async move {
+			let key = payment_hash.as_hex().to_string();
+			KVStore::remove(
+				self.store.as_ref(),
+				STORE_PRIMARY_KEY,
+				REBALANCE_STATE_SECONDARY_KEY,
+				&key,
+				false,
+			)
+			.await
+			.expect("We do not allow removes to fail");
+		})
+	}
+
+	fn list_incomplete_rebalances(
+		&self,
+	) -> Pin<
+		Box<dyn Future<Output = Result<Vec<graduated_rebalancer::RebalanceState>, ()>> + Send + '_>,
+	> {
+		Box::pin(async move {
+			let keys = KVStore::list(
+				self.store.as_ref(),
+				STORE_PRIMARY_KEY,
+				REBALANCE_STATE_SECONDARY_KEY,
+			)
+			.await
+			.map_err(|_| ())?;
+			let mut states = Vec::with_capacity(keys.len());
+			for key in keys {
+				let data_bytes = KVStore::read(
+					self.store.as_ref(),
+					STORE_PRIMARY_KEY,
+					REBALANCE_STATE_SECONDARY_KEY,
+					&key,
+				)
+				.await
+				.map_err(|_| ())?;
+				let state: graduated_rebalancer::RebalanceState =
+					Readable::read(&mut &data_bytes[..]).map_err(|_| ())?;
+				states.push(state);
+			}
+			Ok(states)
+		})
 	}
 }
 

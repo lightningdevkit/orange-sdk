@@ -301,6 +301,7 @@ impl graduated_rebalancer::EventHandler for OrangeRebalanceEventHandler {
 					self.tx_metadata
 						.insert(PaymentId::Trusted(trusted_rebalance_payment_id), metadata)
 						.await;
+					println!("=========== Rebalance Initiated Event ===========");
 					if let Err(e) = self
 						.event_queue
 						.add_event(Event::RebalanceInitiated {
@@ -352,6 +353,33 @@ impl graduated_rebalancer::EventHandler for OrangeRebalanceEventHandler {
 							log_error!(logger, "Failed to add RebalanceSuccessful event: {e:?}");
 						}
 					});
+				},
+				RebalancerEvent::RebalanceFailed {
+					trigger_id,
+					trusted_rebalance_payment_id,
+					amount_msat,
+					reason,
+				} => {
+					log_info!(
+						self.logger,
+						"Rebalance failed for trigger {}: {}",
+						trigger_id.as_hex(),
+						reason
+					);
+
+					// Post a RebalanceFailed event to the event queue
+					if let Err(e) = self
+						.event_queue
+						.add_event(Event::RebalanceFailed {
+							trigger_payment_id: PaymentId::Trusted(trigger_id),
+							trusted_rebalance_payment_id,
+							amount_msat,
+							reason,
+						})
+						.await
+					{
+						log_error!(self.logger, "Failed to add RebalanceFailed event: {e:?}");
+					}
 				},
 				RebalancerEvent::OnChainRebalanceInitiated {
 					trigger_id,

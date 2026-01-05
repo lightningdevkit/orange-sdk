@@ -5,6 +5,8 @@ pub(crate) mod spark_store;
 use crate::bitcoin::Network;
 use crate::bitcoin::hex::FromHex;
 use crate::logging::Logger;
+use crate::rebalance_monitor::RebalanceMonitorHolder;
+use crate::runtime::Runtime;
 use crate::store::{PaymentId, TxMetadataStore, TxStatus};
 use crate::trusted_wallet::{Payment, TrustedError, TrustedWalletInterface};
 use crate::{Event, EventQueue, InitFailure, Seed, WalletConfig};
@@ -19,16 +21,13 @@ use bitcoin_payment_instructions::PaymentMethod;
 use bitcoin_payment_instructions::amount::Amount;
 
 use breez_sdk_spark::{
-	BreezSdk, EventListener, GetInfoRequest, ListPaymentsRequest, PaymentDetails, PaymentStatus,
-	PaymentType, PrepareSendPaymentRequest, ReceivePaymentMethod, ReceivePaymentRequest,
-	SdkBuilder, SdkError, SdkEvent, SendPaymentMethod, SendPaymentRequest,
+	BreezSdk, EventListener, GetInfoRequest, ListPaymentsRequest, PaymentDetails, PaymentType,
+	PrepareSendPaymentRequest, ReceivePaymentMethod, ReceivePaymentRequest, SdkBuilder, SdkError,
+	SdkEvent, SendPaymentMethod, SendPaymentRequest,
 };
-
-use graduated_rebalancer::ReceivedLightningPayment;
 
 use tokio::sync::watch;
 
-use crate::runtime::Runtime;
 use std::future::Future;
 use std::pin::Pin;
 use std::str::FromStr;
@@ -86,7 +85,7 @@ impl SparkWalletConfig {
 pub(crate) struct Spark {
 	spark_wallet: Arc<BreezSdk>,
 	shutdown_sender: watch::Sender<()>,
-	payment_success_flag: watch::Receiver<()>,
+	rebalance_monitor_holder: RebalanceMonitorHolder,
 	logger: Arc<Logger>,
 }
 
@@ -220,33 +219,8 @@ impl TrustedWalletInterface for Spark {
 		})
 	}
 
-	fn await_payment_success(
-		&self, payment_hash: [u8; 32],
-	) -> Pin<Box<dyn Future<Output = Option<ReceivedLightningPayment>> + Send + '_>> {
-		Box::pin(async move {
-			loop {
-				let res =
-					self.spark_wallet.list_payments(ListPaymentsRequest::default()).await.ok()?;
-
-				let tx = res.payments.into_iter().find(|p| {
-					if let Some(PaymentDetails::Lightning { payment_hash: ph, .. }) = &p.details {
-						let hash: Option<[u8; 32]> = FromHex::from_hex(ph).ok();
-						hash == Some(payment_hash)
-					} else {
-						false
-					}
-				})?;
-
-				if tx.status == PaymentStatus::Completed {
-					return Some(ReceivedLightningPayment {
-						id: payment_hash,
-						fee_paid_msat: Some((tx.fees * 1_000) as u64),
-					});
-				}
-
-				self.await_payment_success().await;
-			}
-		})
+	fn rebalance_monitor_holder(&self) -> RebalanceMonitorHolder {
+		Arc::clone(&self.rebalance_monitor_holder)
 	}
 
 	fn stop(&self) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
@@ -285,12 +259,12 @@ impl Spark {
 		log_info!(logger, "Started Spark wallet!");
 
 		let (shutdown_sender, shutdown_receiver) = watch::channel::<()>(());
-		let (payment_success_sender, payment_success_flag) = watch::channel(());
 
+		let rebalance_monitor_holder = Arc::new(tokio::sync::Mutex::new(None));
 		let listener = SparkEventHandler {
 			event_queue: Arc::clone(&event_queue),
 			tx_metadata,
-			payment_success_sender,
+			rebalance_monitor: Arc::clone(&rebalance_monitor_holder),
 			logger: Arc::clone(&logger),
 		};
 
@@ -305,20 +279,14 @@ impl Spark {
 
 		log_info!(logger, "Spark wallet initialized");
 
-		Ok(Spark { spark_wallet, shutdown_sender, payment_success_flag, logger })
-	}
-
-	pub(crate) async fn await_payment_success(&self) {
-		let mut flag = self.payment_success_flag.clone();
-		flag.mark_unchanged();
-		let _ = flag.changed().await;
+		Ok(Spark { spark_wallet, shutdown_sender, rebalance_monitor_holder, logger })
 	}
 }
 
 struct SparkEventHandler {
 	event_queue: Arc<EventQueue>,
 	tx_metadata: TxMetadataStore,
-	payment_success_sender: watch::Sender<()>,
+	rebalance_monitor: RebalanceMonitorHolder,
 	logger: Arc<Logger>,
 }
 
@@ -376,16 +344,6 @@ impl SparkEventHandler {
 							map.get(&payment_id).is_some_and(|m| m.ty.is_rebalance())
 						};
 
-						if is_rebalance {
-							log_info!(
-								self.logger,
-								"Ignoring successful payment event for rebalance payment: {payment_id:?}"
-							);
-							// make sure we still send payment success
-							self.payment_success_sender.send(()).unwrap();
-							return Ok(());
-						}
-
 						let preimage = preimage.ok_or_else(|| {
 							TrustedError::Other(
 								"Payment succeeded but preimage is missing".to_string(),
@@ -399,6 +357,20 @@ impl SparkEventHandler {
 							FromHex::from_hex(&payment_hash).map_err(|e| {
 								TrustedError::Other(format!("Invalid payment_hash hex: {e:?}"))
 							})?;
+
+						if is_rebalance {
+							log_info!(
+								self.logger,
+								"Notifying rebalancer of successful trusted payment: {payment_id:?}"
+							);
+							// Notify the rebalance monitor
+							let monitor_guard = self.rebalance_monitor.lock().await;
+							if let Some(monitor) = monitor_guard.as_ref() {
+								let fee_msat = Some((payment.fees * 1_000) as u64);
+								monitor.notify_trusted_payment_sent(payment_hash, fee_msat).await;
+							}
+							return Ok(());
+						}
 
 						if self.tx_metadata.set_preimage(payment_id, preimage).await.is_err() {
 							log_error!(
@@ -415,8 +387,6 @@ impl SparkEventHandler {
 								fee_paid_msat: Some((payment.fees * 1_000) as u64), // convert to msats
 							})
 							.await?;
-
-						self.payment_success_sender.send(()).unwrap();
 					},
 					_ => {
 						log_debug!(self.logger, "Unsupported payment details for Send: {payment:?}")
@@ -471,6 +441,10 @@ impl SparkEventHandler {
 			PaymentType::Send => match payment.details {
 				Some(PaymentDetails::Lightning { payment_hash, .. }) => {
 					let payment_id = PaymentId::Trusted(id);
+					let payment_hash: [u8; 32] = FromHex::from_hex(&payment_hash).map_err(|e| {
+						TrustedError::Other(format!("Invalid payment_hash hex: {e:?}"))
+					})?;
+
 					let is_rebalance = {
 						let map = self.tx_metadata.read();
 						map.get(&payment_id).is_some_and(|m| m.ty.is_rebalance())
@@ -479,14 +453,17 @@ impl SparkEventHandler {
 					if is_rebalance {
 						log_info!(
 							self.logger,
-							"Ignoring failed payment event for rebalance payment: {payment_id:?}"
+							"Notifying rebalancer of failed trusted payment: {payment_id:?}"
 						);
+						// Notify the rebalance monitor
+						let monitor_guard = self.rebalance_monitor.lock().await;
+						if let Some(monitor) = monitor_guard.as_ref() {
+							let reason = format!("Spark payment failed for payment {}", payment.id);
+							monitor.notify_trusted_payment_failed(payment_hash, reason).await;
+						}
+						drop(monitor_guard);
 						return Ok(());
 					}
-
-					let payment_hash: [u8; 32] = FromHex::from_hex(&payment_hash).map_err(|e| {
-						TrustedError::Other(format!("Invalid payment_hash hex: {e:?}"))
-					})?;
 
 					self.event_queue
 						.add_event(Event::PaymentFailed {
