@@ -208,6 +208,7 @@ pub enum ChainSource {
 }
 
 /// Configuration for initializing the wallet.
+#[derive(Clone)]
 pub struct WalletConfig {
 	/// Configuration for wallet storage.
 	pub storage_config: StorageConfig,
@@ -528,58 +529,66 @@ impl Wallet {
 
 		let tx_metadata = TxMetadataStore::new(Arc::clone(&store)).await;
 
-		let trusted: Arc<Box<DynTrustedWalletInterface>> = match &config.extra_config {
-			#[cfg(feature = "spark")]
-			ExtraConfig::Spark(sp) => Arc::new(Box::new(
-				Spark::init(
-					&config,
-					*sp,
-					Arc::clone(&store),
-					Arc::clone(&event_queue),
-					tx_metadata.clone(),
-					Arc::clone(&logger),
-					Arc::clone(&runtime),
-				)
-				.await?,
-			)),
-			#[cfg(feature = "cashu")]
-			ExtraConfig::Cashu(cashu) => Arc::new(Box::new(
-				Cashu::init(
-					&config,
-					cashu.clone(),
-					Arc::clone(&store),
-					Arc::clone(&event_queue),
-					tx_metadata.clone(),
-					Arc::clone(&logger),
-					Arc::clone(&runtime),
-				)
-				.await?,
-			)),
-			#[cfg(feature = "_test-utils")]
-			ExtraConfig::Dummy(cfg) => Arc::new(Box::new(
-				DummyTrustedWallet::new(
-					cfg.uuid,
-					&cfg.lsp,
-					&cfg.bitcoind,
-					tx_metadata.clone(),
-					Arc::clone(&event_queue),
-					Arc::clone(&runtime),
-				)
-				.await,
-			)),
-		};
-
-		let ln_wallet = Arc::new(
-			LightningWallet::init(
-				Arc::clone(&runtime),
-				config,
-				Arc::clone(&store),
-				Arc::clone(&event_queue),
-				tx_metadata.clone(),
-				Arc::clone(&logger),
-			)
-			.await?,
+		let (trusted, ln_wallet) = tokio::join!(
+			async {
+				let trusted: Arc<Box<DynTrustedWalletInterface>> = match &config.extra_config {
+					#[cfg(feature = "spark")]
+					ExtraConfig::Spark(sp) => Arc::new(Box::new(
+						Spark::init(
+							&config,
+							*sp,
+							Arc::clone(&store),
+							Arc::clone(&event_queue),
+							tx_metadata.clone(),
+							Arc::clone(&logger),
+							Arc::clone(&runtime),
+						)
+						.await?,
+					)),
+					#[cfg(feature = "cashu")]
+					ExtraConfig::Cashu(cashu) => Arc::new(Box::new(
+						Cashu::init(
+							&config,
+							cashu.clone(),
+							Arc::clone(&store),
+							Arc::clone(&event_queue),
+							tx_metadata.clone(),
+							Arc::clone(&logger),
+							Arc::clone(&runtime),
+						)
+						.await?,
+					)),
+					#[cfg(feature = "_test-utils")]
+					ExtraConfig::Dummy(cfg) => Arc::new(Box::new(
+						DummyTrustedWallet::new(
+							cfg.uuid,
+							&cfg.lsp,
+							&cfg.bitcoind,
+							tx_metadata.clone(),
+							Arc::clone(&event_queue),
+							Arc::clone(&runtime),
+						)
+						.await,
+					)),
+				};
+				Ok::<_, InitFailure>(trusted)
+			},
+			async {
+				Ok::<_, InitFailure>(Arc::new(
+					LightningWallet::init(
+						Arc::clone(&runtime),
+						config.clone(),
+						Arc::clone(&store),
+						Arc::clone(&event_queue),
+						tx_metadata.clone(),
+						Arc::clone(&logger),
+					)
+					.await?,
+				))
+			},
 		);
+		let trusted = trusted?;
+		let ln_wallet = ln_wallet?;
 
 		let wt = Arc::new(WalletTrusted(Arc::clone(&trusted)));
 
@@ -669,11 +678,13 @@ impl Wallet {
 
 	/// Lists the transactions which have been made.
 	pub async fn list_transactions(&self) -> Result<Vec<Transaction>, WalletError> {
-		let trusted_payments = self.inner.trusted.list_payments().await?;
+		let (trusted_payments, splice_outs) = tokio::join!(
+			self.inner.trusted.list_payments(),
+			store::read_splice_outs(self.inner.store.as_ref())
+		);
+		let trusted_payments = trusted_payments?;
 		let mut lightning_payments = self.inner.ln_wallet.list_payments();
 		lightning_payments.sort_by_key(|l| l.latest_update_timestamp);
-
-		let splice_outs = store::read_splice_outs(self.inner.store.as_ref()).await;
 
 		let mut res = Vec::with_capacity(
 			trusted_payments.len() + lightning_payments.len() + splice_outs.len(),
