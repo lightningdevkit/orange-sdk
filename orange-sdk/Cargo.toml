@@ -5,7 +5,7 @@ edition = "2024"
 authors = ["benthecarman <benthecarman@live.com>"]
 documentation = "https://docs.rs/orange-sdk/"
 license = "MIT OR Apache-2.0"
-keywords = [ "lightning", "bitcoin", "spark", "cashu" ]
+keywords = ["lightning", "bitcoin", "spark", "cashu"]
 readme = "../README.md"
 
 [lib]
@@ -24,7 +24,7 @@ _cashu-tests = ["_test-utils", "cdk-ldk-node", "cdk/mint", "cdk-sqlite", "cdk-ax
 graduated-rebalancer = { path = "../graduated-rebalancer", version = "0.1.0" }
 
 ldk-node = { version = "0.7.0" }
-lightning-macros = "0.2.0"
+lightning-macros = { workspace = true }
 bitcoin-payment-instructions = { workspace = true, features = ["http"] }
 chrono = { version = "0.4", default-features = false }
 rand = { version = "0.8.5", optional = true }

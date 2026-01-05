@@ -3,8 +3,11 @@
 pub(crate) mod spark_store;
 
 use crate::bitcoin::Network;
+use crate::bitcoin::hex::DisplayHex;
 use crate::bitcoin::hex::FromHex;
 use crate::logging::Logger;
+use crate::rebalancer::RebalanceEventHandlerHolder;
+use crate::runtime::Runtime;
 use crate::store::{PaymentId, TxMetadataStore, TxStatus};
 use crate::trusted_wallet::{Payment, TrustedError, TrustedWalletInterface};
 use crate::{Event, EventQueue, InitFailure, Seed, WalletConfig};
@@ -20,16 +23,13 @@ use bitcoin_payment_instructions::amount::Amount;
 
 use breez_sdk_spark::{
 	BreezSdk, EventListener, GetInfoRequest, ListPaymentsRequest, OptimizationConfig,
-	PaymentDetails, PaymentStatus, PaymentType, PrepareSendPaymentRequest, ReceivePaymentMethod,
+	PaymentDetails, PaymentType, PrepareSendPaymentRequest, ReceivePaymentMethod,
 	ReceivePaymentRequest, RegisterLightningAddressRequest, SdkBuilder, SdkError, SdkEvent,
 	SendPaymentMethod, SendPaymentRequest,
 };
 
-use graduated_rebalancer::ReceivedLightningPayment;
-
 use tokio::sync::watch;
 
-use crate::runtime::Runtime;
 use std::future::Future;
 use std::pin::Pin;
 use std::str::FromStr;
@@ -94,7 +94,6 @@ impl SparkWalletConfig {
 pub(crate) struct Spark {
 	spark_wallet: Arc<BreezSdk>,
 	shutdown_sender: watch::Sender<()>,
-	payment_success_flag: watch::Receiver<()>,
 	logger: Arc<Logger>,
 }
 
@@ -231,35 +230,6 @@ impl TrustedWalletInterface for Spark {
 		})
 	}
 
-	fn await_payment_success(
-		&self, payment_hash: [u8; 32],
-	) -> Pin<Box<dyn Future<Output = Option<ReceivedLightningPayment>> + Send + '_>> {
-		Box::pin(async move {
-			loop {
-				let res =
-					self.spark_wallet.list_payments(ListPaymentsRequest::default()).await.ok()?;
-
-				let tx = res.payments.into_iter().find(|p| {
-					if let Some(PaymentDetails::Lightning { payment_hash: ph, .. }) = &p.details {
-						let hash: Option<[u8; 32]> = FromHex::from_hex(ph).ok();
-						hash == Some(payment_hash)
-					} else {
-						false
-					}
-				})?;
-
-				if tx.status == PaymentStatus::Completed {
-					return Some(ReceivedLightningPayment {
-						id: payment_hash,
-						fee_paid_msat: Some((tx.fees * 1_000) as u64),
-					});
-				}
-
-				self.await_payment_success().await;
-			}
-		})
-	}
-
 	fn get_lightning_address(
 		&self,
 	) -> Pin<Box<dyn Future<Output = Result<Option<String>, TrustedError>> + Send + '_>> {
@@ -294,13 +264,42 @@ impl TrustedWalletInterface for Spark {
 			let _ = self.shutdown_sender.send(());
 		})
 	}
+
+	fn find_payment_by_hash(
+		&self, payment_hash: [u8; 32],
+	) -> Pin<Box<dyn Future<Output = Result<Option<[u8; 32]>, TrustedError>> + Send + '_>> {
+		Box::pin(async move {
+			let payment_hash_hex = payment_hash.to_lower_hex_string();
+			let resp = self.spark_wallet.list_payments(ListPaymentsRequest::default()).await?;
+
+			for payment in resp.payments {
+				// Only look at outbound payments
+				if payment.payment_type != PaymentType::Send {
+					continue;
+				}
+
+				// Check if the payment hash matches
+				if let Some(PaymentDetails::Lightning { payment_hash: hash, .. }) = &payment.details
+				{
+					if hash == &payment_hash_hex {
+						let id = parse_payment_id(&payment.id)?;
+						return Ok(Some(id));
+					}
+				}
+			}
+
+			Ok(None)
+		})
+	}
 }
 
 impl Spark {
 	/// Initialize a new Spark wallet instance with the given configuration.
+	#[allow(clippy::too_many_arguments)]
 	pub(crate) async fn init(
 		config: &WalletConfig, spark_config: SparkWalletConfig, store: Arc<DynStore>,
-		event_queue: Arc<EventQueue>, tx_metadata: TxMetadataStore, logger: Arc<Logger>,
+		event_queue: Arc<EventQueue>, tx_metadata: TxMetadataStore,
+		rebalance_event_handler: RebalanceEventHandlerHolder, logger: Arc<Logger>,
 		runtime: Arc<Runtime>,
 	) -> Result<Self, InitFailure> {
 		let spark_config: breez_sdk_spark::Config =
@@ -325,12 +324,11 @@ impl Spark {
 		log_info!(logger, "Started Spark wallet!");
 
 		let (shutdown_sender, shutdown_receiver) = watch::channel::<()>(());
-		let (payment_success_sender, payment_success_flag) = watch::channel(());
 
 		let listener = SparkEventHandler {
 			event_queue: Arc::clone(&event_queue),
 			tx_metadata,
-			payment_success_sender,
+			rebalance_event_handler,
 			logger: Arc::clone(&logger),
 		};
 
@@ -345,20 +343,14 @@ impl Spark {
 
 		log_info!(logger, "Spark wallet initialized");
 
-		Ok(Spark { spark_wallet, shutdown_sender, payment_success_flag, logger })
-	}
-
-	pub(crate) async fn await_payment_success(&self) {
-		let mut flag = self.payment_success_flag.clone();
-		flag.mark_unchanged();
-		let _ = flag.changed().await;
+		Ok(Spark { spark_wallet, shutdown_sender, logger })
 	}
 }
 
 struct SparkEventHandler {
 	event_queue: Arc<EventQueue>,
 	tx_metadata: TxMetadataStore,
-	payment_success_sender: watch::Sender<()>,
+	rebalance_event_handler: RebalanceEventHandlerHolder,
 	logger: Arc<Logger>,
 }
 
@@ -419,16 +411,6 @@ impl SparkEventHandler {
 							map.get(&payment_id).is_some_and(|m| m.ty.is_rebalance())
 						};
 
-						if is_rebalance {
-							log_info!(
-								self.logger,
-								"Ignoring successful payment event for rebalance payment: {payment_id:?}"
-							);
-							// make sure we still send payment success
-							self.payment_success_sender.send(()).unwrap();
-							return Ok(());
-						}
-
 						let preimage = preimage.ok_or_else(|| {
 							TrustedError::Other(
 								"Payment succeeded but preimage is missing".to_string(),
@@ -442,6 +424,19 @@ impl SparkEventHandler {
 							FromHex::from_hex(&payment_hash).map_err(|e| {
 								TrustedError::Other(format!("Invalid payment_hash hex: {e:?}"))
 							})?;
+
+						if is_rebalance {
+							log_info!(
+								self.logger,
+								"Notifying rebalancer of successful trusted payment: {payment_id:?}"
+							);
+							// Notify the rebalance event handler
+							let fee_msat = Some((payment.fees * 1_000) as u64);
+							self.rebalance_event_handler
+								.notify_trusted_payment_sent(payment_hash, fee_msat)
+								.await;
+							return Ok(());
+						}
 
 						if self.tx_metadata.set_preimage(payment_id, preimage).await.is_err() {
 							log_error!(
@@ -458,8 +453,6 @@ impl SparkEventHandler {
 								fee_paid_msat: Some((payment.fees * 1_000) as u64), // convert to msats
 							})
 							.await?;
-
-						self.payment_success_sender.send(()).unwrap();
 					},
 					_ => {
 						log_debug!(self.logger, "Unsupported payment details for Send: {payment:?}")
@@ -514,6 +507,10 @@ impl SparkEventHandler {
 			PaymentType::Send => match payment.details {
 				Some(PaymentDetails::Lightning { payment_hash, .. }) => {
 					let payment_id = PaymentId::Trusted(id);
+					let payment_hash: [u8; 32] = FromHex::from_hex(&payment_hash).map_err(|e| {
+						TrustedError::Other(format!("Invalid payment_hash hex: {e:?}"))
+					})?;
+
 					let is_rebalance = {
 						let map = self.tx_metadata.read();
 						map.get(&payment_id).is_some_and(|m| m.ty.is_rebalance())
@@ -522,14 +519,15 @@ impl SparkEventHandler {
 					if is_rebalance {
 						log_info!(
 							self.logger,
-							"Ignoring failed payment event for rebalance payment: {payment_id:?}"
+							"Notifying rebalancer of failed trusted payment: {payment_id:?}"
 						);
+						// Notify the rebalance event handler
+						let reason = format!("Spark payment failed for payment {}", payment.id);
+						self.rebalance_event_handler
+							.notify_trusted_payment_failed(payment_hash, reason)
+							.await;
 						return Ok(());
 					}
-
-					let payment_hash: [u8; 32] = FromHex::from_hex(&payment_hash).map_err(|e| {
-						TrustedError::Other(format!("Invalid payment_hash hex: {e:?}"))
-					})?;
 
 					self.event_queue
 						.add_event(Event::PaymentFailed {
