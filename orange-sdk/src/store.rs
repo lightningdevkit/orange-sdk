@@ -36,7 +36,8 @@ use std::time::Duration;
 const STORE_PRIMARY_KEY: &str = "orange_sdk";
 const STORE_SECONDARY_KEY: &str = "payment_store";
 const SPLICE_OUT_SECONDARY_KEY: &str = "splice_out";
-const REBALANCE_STATE_SECONDARY_KEY: &str = "rebalance_state";
+const REBALANCE_STATE_KEY: &str = "rebalance_state";
+const ONCHAIN_REBALANCE_STATE_KEY: &str = "onchain_rebalance_state";
 
 /// The status of a transaction. This is used to track the state of a transaction
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -453,34 +454,80 @@ impl RebalancePersistenceStore {
 }
 
 impl RebalancePersistence for RebalancePersistenceStore {
-	fn insert_rebalance_state(
+	fn insert_trusted_rebalance_state(
 		&self, state: graduated_rebalancer::RebalanceState,
 	) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
 		Box::pin(async move {
-			let key = state.expected_payment_hash.as_hex().to_string();
-			let ser = state.encode();
 			KVStore::write(
 				self.store.as_ref(),
 				STORE_PRIMARY_KEY,
-				REBALANCE_STATE_SECONDARY_KEY,
-				&key,
-				ser,
+				"",
+				REBALANCE_STATE_KEY,
+				state.encode(),
 			)
 			.await
 			.expect("We do not allow writes to fail");
 		})
 	}
 
-	fn remove_rebalance_state(
-		&self, payment_hash: [u8; 32],
+	fn remove_trusted_rebalance_state(&self) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
+		Box::pin(async move {
+			KVStore::remove(self.store.as_ref(), STORE_PRIMARY_KEY, "", REBALANCE_STATE_KEY, false)
+				.await
+				.expect("We do not allow removes to fail");
+		})
+	}
+
+	fn get_trusted_rebalance(
+		&self,
+	) -> Pin<
+		Box<
+			dyn Future<Output = Result<Option<graduated_rebalancer::RebalanceState>, ()>>
+				+ Send
+				+ '_,
+		>,
+	> {
+		Box::pin(async move {
+			let res =
+				KVStore::read(self.store.as_ref(), STORE_PRIMARY_KEY, "", REBALANCE_STATE_KEY)
+					.await;
+
+			match res {
+				Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
+				Err(_) => Err(()),
+				Ok(data_bytes) => {
+					let state: graduated_rebalancer::RebalanceState =
+						Readable::read(&mut &data_bytes[..]).map_err(|_| ())?;
+
+					Ok(Some(state))
+				},
+			}
+		})
+	}
+
+	fn insert_onchain_rebalance_state(
+		&self, state: graduated_rebalancer::OnChainRebalanceState,
 	) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
 		Box::pin(async move {
-			let key = payment_hash.as_hex().to_string();
+			KVStore::write(
+				self.store.as_ref(),
+				STORE_PRIMARY_KEY,
+				"",
+				ONCHAIN_REBALANCE_STATE_KEY,
+				state.encode(),
+			)
+			.await
+			.expect("We do not allow writes to fail");
+		})
+	}
+
+	fn remove_onchain_rebalance_state(&self) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
+		Box::pin(async move {
 			KVStore::remove(
 				self.store.as_ref(),
 				STORE_PRIMARY_KEY,
-				REBALANCE_STATE_SECONDARY_KEY,
-				&key,
+				"",
+				ONCHAIN_REBALANCE_STATE_KEY,
 				false,
 			)
 			.await
@@ -488,34 +535,34 @@ impl RebalancePersistence for RebalancePersistenceStore {
 		})
 	}
 
-	fn list_incomplete_rebalances(
+	fn get_onchain_rebalance(
 		&self,
 	) -> Pin<
-		Box<dyn Future<Output = Result<Vec<graduated_rebalancer::RebalanceState>, ()>> + Send + '_>,
+		Box<
+			dyn Future<Output = Result<Option<graduated_rebalancer::OnChainRebalanceState>, ()>>
+				+ Send
+				+ '_,
+		>,
 	> {
 		Box::pin(async move {
-			let keys = KVStore::list(
+			let res = KVStore::read(
 				self.store.as_ref(),
 				STORE_PRIMARY_KEY,
-				REBALANCE_STATE_SECONDARY_KEY,
+				"",
+				ONCHAIN_REBALANCE_STATE_KEY,
 			)
-			.await
-			.map_err(|_| ())?;
-			let mut states = Vec::with_capacity(keys.len());
-			for key in keys {
-				let data_bytes = KVStore::read(
-					self.store.as_ref(),
-					STORE_PRIMARY_KEY,
-					REBALANCE_STATE_SECONDARY_KEY,
-					&key,
-				)
-				.await
-				.map_err(|_| ())?;
-				let state: graduated_rebalancer::RebalanceState =
-					Readable::read(&mut &data_bytes[..]).map_err(|_| ())?;
-				states.push(state);
+			.await;
+
+			match res {
+				Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
+				Err(_) => Err(()),
+				Ok(data_bytes) => {
+					let state: graduated_rebalancer::OnChainRebalanceState =
+						Readable::read(&mut &data_bytes[..]).map_err(|_| ())?;
+
+					Ok(Some(state))
+				},
 			}
-			Ok(states)
 		})
 	}
 }

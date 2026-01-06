@@ -41,4 +41,11 @@ impl RebalanceMonitor {
 	) {
 		self.rebalancer.on_trusted_payment_failed(payment_hash, reason).await;
 	}
+
+	/// Notify that a channel or splice has become pending
+	pub(crate) async fn notify_channel_splice_pending(
+		&self, user_channel_id: u128, outpoint: ldk_node::bitcoin::OutPoint,
+	) {
+		self.rebalancer.on_channel_splice_pending(user_channel_id, outpoint).await;
+	}
 }

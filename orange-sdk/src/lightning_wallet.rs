@@ -44,7 +44,6 @@ pub(crate) struct LightningWalletImpl {
 	pub(crate) ldk_node: Arc<ldk_node::Node>,
 	logger: Arc<Logger>,
 	store: Arc<DynStore>,
-	channel_pending_receipt_flag: watch::Receiver<u128>,
 	splice_pending_receipt_flag: watch::Receiver<u128>,
 	rebalance_monitor_holder: RebalanceMonitorHolder,
 	lsp_node_id: PublicKey,
@@ -165,14 +164,12 @@ impl LightningWallet {
 		}
 
 		let ldk_node = Arc::new(builder.build_with_store(Arc::clone(&store))?);
-		let (channel_pending_sender, channel_pending_receipt_flag) = watch::channel(0);
 		let (splice_pending_sender, splice_pending_receipt_flag) = watch::channel(0);
 		let rebalance_monitor_holder = Arc::new(tokio::sync::Mutex::new(None));
 		let ev_handler = Arc::new(LdkEventHandler {
 			event_queue,
 			ldk_node: Arc::clone(&ldk_node),
 			tx_metadata,
-			channel_pending_sender,
 			splice_pending_sender,
 			rebalance_monitor: Arc::clone(&rebalance_monitor_holder),
 			logger: Arc::clone(&logger),
@@ -181,7 +178,6 @@ impl LightningWallet {
 			ldk_node,
 			logger,
 			store,
-			channel_pending_receipt_flag,
 			splice_pending_receipt_flag,
 			rebalance_monitor_holder,
 			lsp_node_id,
@@ -199,12 +195,6 @@ impl LightningWallet {
 		});
 
 		Ok(Self { inner })
-	}
-
-	pub(crate) async fn await_channel_pending(&self, channel_id: u128) {
-		let mut flag = self.inner.channel_pending_receipt_flag.clone();
-		flag.mark_unchanged();
-		flag.wait_for(|t| t == &channel_id).await.expect("channel pending not received");
 	}
 
 	pub(crate) async fn await_splice_pending(&self, channel_id: u128) {
@@ -502,26 +492,6 @@ impl graduated_rebalancer::LightningWallet for LightningWallet {
 		})
 	}
 
-	fn await_channel_pending(
-		&self, channel_id: u128,
-	) -> Pin<Box<dyn Future<Output = OutPoint> + Send + '_>> {
-		Box::pin(async move {
-			loop {
-				let channels = self.inner.ldk_node.list_channels();
-				let chan = channels
-					.into_iter()
-					.find(|c| c.user_channel_id.0 == channel_id && c.funding_txo.is_some());
-				match chan {
-					Some(c) => return c.funding_txo.expect("channel has no funding txo"),
-					None => {
-						self.await_channel_pending(channel_id).await;
-						// Wait for the next channel pending event
-					},
-				}
-			}
-		})
-	}
-
 	fn splice_to_lsp_channel(
 		&self, amt: Amount,
 	) -> Pin<Box<dyn Future<Output = Result<u128, Self::Error>> + Send + '_>> {
@@ -540,29 +510,13 @@ impl graduated_rebalancer::LightningWallet for LightningWallet {
 		Box::pin(async move { self.splice_balance_into_channel(amt).await.map(|c| c.0) })
 	}
 
-	fn await_splice_pending(
-		&self, channel_id: u128,
-	) -> Pin<Box<dyn Future<Output = OutPoint> + Send + '_>> {
-		Box::pin(async move {
-			// todo since we can't see if we have any active splices, we just await the next splice pending event
-			// this is kinda race-y hopefully we can fix
-			self.await_splice_pending(channel_id).await;
-			loop {
-				let channels = self.inner.ldk_node.list_channels();
-				let chan = channels
-					.into_iter()
-					.find(|c| c.user_channel_id.0 == channel_id && c.funding_txo.is_some());
-				match chan {
-					Some(c) => {
-						return c.funding_txo.expect("channel has no funding txo");
-					},
-					None => {
-						self.await_splice_pending(channel_id).await;
-						// Wait for the next channel pending event
-					},
-				}
-			}
-		})
+	fn get_channel_outpoint(&self, user_channel_id: u128) -> Option<OutPoint> {
+		self.inner
+			.ldk_node
+			.list_channels()
+			.into_iter()
+			.find(|c| c.user_channel_id.0 == user_channel_id)
+			.and_then(|c| c.funding_txo)
 	}
 }
 

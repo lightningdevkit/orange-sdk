@@ -339,7 +339,6 @@ pub(crate) struct LdkEventHandler {
 	pub(crate) event_queue: Arc<EventQueue>,
 	pub(crate) ldk_node: Arc<ldk_node::Node>,
 	pub(crate) tx_metadata: store::TxMetadataStore,
-	pub(crate) channel_pending_sender: watch::Sender<u128>,
 	pub(crate) splice_pending_sender: watch::Sender<u128>,
 	pub(crate) rebalance_monitor: RebalanceMonitorHolder,
 	pub(crate) logger: Arc<Logger>,
@@ -444,6 +443,12 @@ impl LdkEventHandler {
 			} => {
 				let funding_txo = funding_txo.unwrap(); // safe
 
+				// Notify rebalancer if this might be an on-chain rebalance
+				let monitor_guard = self.rebalance_monitor.lock().await;
+				if let Some(monitor) = monitor_guard.as_ref() {
+					monitor.notify_channel_splice_pending(user_channel_id.0, funding_txo).await;
+				}
+
 				if let Err(e) = self
 					.event_queue
 					.add_event(Event::ChannelOpened {
@@ -457,7 +462,6 @@ impl LdkEventHandler {
 					log_error!(self.logger, "Failed to add ChannelOpened event: {e:?}");
 					return;
 				}
-				let _ = self.channel_pending_sender.send(user_channel_id.0);
 			},
 			ldk_node::Event::ChannelClosed {
 				channel_id,
@@ -490,6 +494,13 @@ impl LdkEventHandler {
 				new_funding_txo,
 			} => {
 				log_debug!(self.logger, "Received SplicePending event {event:?}");
+
+				// Notify rebalancer if this might be an on-chain rebalance
+				let monitor_guard = self.rebalance_monitor.lock().await;
+				if let Some(monitor) = monitor_guard.as_ref() {
+					monitor.notify_channel_splice_pending(user_channel_id.0, new_funding_txo).await;
+				}
+
 				let _ = self.splice_pending_sender.send(user_channel_id.0);
 
 				if let Err(e) = self

@@ -634,6 +634,12 @@ impl Wallet {
 			BuildError::WalletSetupFailed
 		})?;
 
+		// Recover incomplete on-chain rebalances from previous sessions
+		rebalancer.recover_incomplete_onchain_rebalances().await.map_err(|()| {
+			log_error!(logger, "Failed to recover incomplete on-chain rebalances");
+			BuildError::WalletSetupFailed
+		})?;
+
 		// Spawn a background thread to initiate a rebalance if needed.
 		// We only do this once as we generally rebalance in response to
 		// `Event`s which indicated our balance has changed.
@@ -939,6 +945,26 @@ impl Wallet {
 				payment_type: (&details).into(),
 				time_since_epoch: Duration::from_secs(details.latest_update_timestamp),
 			});
+		}
+
+		// Handle OnchainToLightning transfers that weren't processed above
+		// (because the channel/splice transaction doesn't appear in lightning_payments)
+		for (_payment_id, tx_metadata) in tx_metadata.iter() {
+			if let TxType::OnchainToLightning { channel_txid: _, triggering_txid } = &tx_metadata.ty
+			{
+				let triggering_payment_id =
+					PaymentId::SelfCustodial(triggering_txid.to_byte_array());
+				let entry =
+					internal_transfers.entry(triggering_payment_id).or_insert(InternalTransfer {
+						receive_fee: None,
+						send_fee: None,
+						transaction: None,
+					});
+				// Set send_fee if it hasn't been set yet (on-chain fee was paid on the triggering tx)
+				if entry.send_fee.is_none() {
+					entry.send_fee = Some(Amount::ZERO);
+				}
+			}
 		}
 
 		for (id, tx_info) in internal_transfers {
