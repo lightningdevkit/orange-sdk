@@ -19,9 +19,9 @@ use bitcoin_payment_instructions::PaymentMethod;
 use bitcoin_payment_instructions::amount::Amount;
 
 use breez_sdk_spark::{
-	BreezSdk, EventListener, GetInfoRequest, ListPaymentsRequest, PaymentDetails, PaymentStatus,
-	PaymentType, PrepareSendPaymentRequest, ReceivePaymentMethod, ReceivePaymentRequest,
-	SdkBuilder, SdkError, SdkEvent, SendPaymentMethod, SendPaymentRequest,
+	BreezSdk, EventListener, GetInfoRequest, ListPaymentsRequest, OptimizationConfig,
+	PaymentDetails, PaymentStatus, PaymentType, PrepareSendPaymentRequest, ReceivePaymentMethod,
+	ReceivePaymentRequest, SdkBuilder, SdkError, SdkEvent, SendPaymentMethod, SendPaymentRequest,
 };
 
 use graduated_rebalancer::ReceivedLightningPayment;
@@ -77,6 +77,7 @@ impl SparkWalletConfig {
 			max_deposit_claim_fee: None,
 			lnurl_domain: None,
 			private_enabled_default: true,
+			optimization_config: OptimizationConfig { auto_enabled: true, multiplicity: 1 },
 		})
 	}
 }
@@ -129,6 +130,7 @@ impl TrustedWalletInterface for Spark {
 				payment_method: ReceivePaymentMethod::Bolt11Invoice {
 					description: "".to_string(), // empty description for smaller QRs and better privacy
 					amount_sats,
+					expiry_secs: None,
 				},
 			};
 			let res = self.spark_wallet.receive_payment(params).await?;
@@ -353,6 +355,9 @@ impl EventListener for SparkEventHandler {
 					self.logger,
 					"Spark payment pending event received for payment: {payment:?}"
 				);
+			},
+			SdkEvent::Optimization { optimization_event } => {
+				log_debug!(self.logger, "Spark optimization event: {optimization_event:?}");
 			},
 		}
 	}
