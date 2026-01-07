@@ -563,6 +563,8 @@ async fn test_receive_to_onchain_with_channel() {
 			ev => panic!("Expected ChannelOpened event, got {ev:?}"),
 		}
 
+		wallet.sync_ln_wallet().unwrap();
+
 		let txs = wallet.list_transactions().await.unwrap();
 		assert_eq!(txs.len(), 2);
 		let tx = txs.into_iter().last().unwrap();
