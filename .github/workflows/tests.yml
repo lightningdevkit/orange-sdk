@@ -11,6 +11,7 @@ jobs:
   rust_tests:
     name: Rust Checks
     runs-on: self-hosted
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
       - uses: actions-rs/toolchain@v1
