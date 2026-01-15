@@ -168,6 +168,7 @@ impl TrustedWalletInterface for Spark {
 					payment_request: invoice.to_string(),
 					amount: Some(sats.into()),
 					token_identifier: None,
+					conversion_options: None,
 				};
 				let prepare = self.spark_wallet.prepare_send_payment(params).await?;
 				match prepare.payment_method {
@@ -200,6 +201,7 @@ impl TrustedWalletInterface for Spark {
 					payment_request: invoice.to_string(),
 					amount: Some(sats.into()),
 					token_identifier: None,
+					conversion_options: None,
 				};
 				let prepare = self.spark_wallet.prepare_send_payment(params).await?;
 
