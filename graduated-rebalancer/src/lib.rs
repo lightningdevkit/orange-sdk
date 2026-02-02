@@ -22,6 +22,8 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 
+const REBALANCE_RETRY_WAIT_TIME_SECS: u64 = 60;
+
 /// Represents the state of an in-progress rebalance from trusted to lightning wallet
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RebalanceState {
@@ -337,16 +339,43 @@ pub struct GraduatedRebalancer<
 
 	/// In-memory cache of active on-chain rebalance (only one on-chain rebalance allowed at a time)
 	active_onchain_rebalance: Arc<tokio::sync::Mutex<Option<OnChainRebalanceState>>>,
+
+	/// Handle to cancel a scheduled retry task
+	scheduled_retry_handle: Arc<tokio::sync::Mutex<Option<tokio::task::AbortHandle>>>,
+}
+
+impl<
+		T: TrustedWallet,
+		L: LightningWallet,
+		R: RebalanceTrigger,
+		E: EventHandler,
+		P: RebalancePersistence,
+		O: Logger,
+	> Clone for GraduatedRebalancer<T, L, R, E, P, O>
+{
+	fn clone(&self) -> Self {
+		Self {
+			trusted: Arc::clone(&self.trusted),
+			ln_wallet: Arc::clone(&self.ln_wallet),
+			trigger: Arc::clone(&self.trigger),
+			event_handler: Arc::clone(&self.event_handler),
+			persistence: Arc::clone(&self.persistence),
+			logger: Arc::clone(&self.logger),
+			active_trusted_rebalance: Arc::clone(&self.active_trusted_rebalance),
+			active_onchain_rebalance: Arc::clone(&self.active_onchain_rebalance),
+			scheduled_retry_handle: Arc::clone(&self.scheduled_retry_handle),
+		}
+	}
 }
 
 impl<T, LN, R, E, P, L> GraduatedRebalancer<T, LN, R, E, P, L>
 where
-	T: TrustedWallet,
-	LN: LightningWallet,
-	R: RebalanceTrigger,
-	E: EventHandler,
-	P: RebalancePersistence,
-	L: Logger,
+	T: TrustedWallet + 'static,
+	LN: LightningWallet + 'static,
+	R: RebalanceTrigger + 'static,
+	E: EventHandler + 'static,
+	P: RebalancePersistence + 'static,
+	L: Logger + Send + Sync + 'static,
 {
 	/// Create a new graduated rebalancer
 	pub fn new(
@@ -362,7 +391,48 @@ where
 			logger,
 			active_trusted_rebalance: Arc::new(tokio::sync::Mutex::new(None)),
 			active_onchain_rebalance: Arc::new(tokio::sync::Mutex::new(None)),
+			scheduled_retry_handle: Arc::new(tokio::sync::Mutex::new(None)),
 		}
+	}
+
+	/// Cancel any scheduled retry task
+	async fn cancel_scheduled_retry(&self) {
+		let mut handle = self.scheduled_retry_handle.lock().await;
+		if let Some(abort_handle) = handle.take() {
+			log_debug!(self.logger, "Cancelling scheduled retry");
+			abort_handle.abort();
+		}
+	}
+
+	/// Schedule a retry of the rebalance after a delay.
+	/// If a rebalance is triggered before the delay, the retry will be cancelled.
+	fn schedule_retry(&self) {
+		let this = self.clone();
+		let handle_mutex = Arc::clone(&self.scheduled_retry_handle);
+
+		tokio::spawn(async move {
+			// Cancel any existing scheduled retry
+			let mut handle = handle_mutex.lock().await;
+			if let Some(abort_handle) = handle.take() {
+				abort_handle.abort();
+			}
+
+			// Create the retry task
+			let retry_this = this.clone();
+			let task = tokio::spawn(async move {
+				tokio::time::sleep(std::time::Duration::from_secs(REBALANCE_RETRY_WAIT_TIME_SECS))
+					.await;
+				log_info!(retry_this.logger, "Executing scheduled rebalance retry");
+				retry_this.do_rebalance_if_needed().await;
+			});
+
+			*handle = Some(task.abort_handle());
+
+			log_info!(
+				this.logger,
+				"Scheduled rebalance retry in {REBALANCE_RETRY_WAIT_TIME_SECS} seconds"
+			);
+		});
 	}
 
 	/// Does any rebalance if it meets the conditions of the tunables
@@ -397,72 +467,84 @@ where
 			return;
 		}
 
+		// Cancel any scheduled retry since we're actually doing a rebalance now
+		self.cancel_scheduled_retry().await;
+
 		log_info!(self.logger, "Initiating rebalance");
 
 		let transfer_amt = params.amount;
-		if let Ok(inv) = self.ln_wallet.get_bolt11_invoice(Some(transfer_amt)).await {
-			log_debug!(
-				self.logger,
-				"Attempting to pay invoice {inv} to rebalance for {transfer_amt:?}",
-			);
+		let inv = match self.ln_wallet.get_bolt11_invoice(Some(transfer_amt)).await {
+			Ok(inv) => inv,
+			Err(_) => return,
+		};
 
-			let expected_hash = inv.payment_hash().to_byte_array();
+		log_debug!(
+			self.logger,
+			"Attempting to pay invoice {inv} to rebalance for {transfer_amt:?}",
+		);
 
-			// Create and persist rebalance state
-			let mut state = RebalanceState {
-				trigger_id: params.id,
-				expected_payment_hash: expected_hash,
-				amount_msat: transfer_amt.milli_sats(),
-				ln_payment_received: false,
-				trusted_payment_sent: false,
-				trusted_payment_id: None,
-				ln_payment_id: None,
-				ln_fee_msat: None,
-				trusted_fee_msat: None,
-			};
-			self.persistence.insert_trusted_rebalance_state(state).await;
+		let expected_hash = inv.payment_hash().to_byte_array();
 
-			match self.trusted.pay(PaymentMethod::LightningBolt11(inv), transfer_amt).await {
-				Ok(trusted_payment_id) => {
-					log_debug!(
-						self.logger,
-						"Rebalance trusted transaction initiated, id {}. Will complete via observer callbacks.",
-						trusted_payment_id.as_hex()
-					);
+		// Create and persist rebalance state
+		let mut state = RebalanceState {
+			trigger_id: params.id,
+			expected_payment_hash: expected_hash,
+			amount_msat: transfer_amt.milli_sats(),
+			ln_payment_received: false,
+			trusted_payment_sent: false,
+			trusted_payment_id: None,
+			ln_payment_id: None,
+			ln_fee_msat: None,
+			trusted_fee_msat: None,
+		};
+		self.persistence.insert_trusted_rebalance_state(state).await;
 
-					// persist trusted payment id
-					state.trusted_payment_id = Some(trusted_payment_id);
-					self.persistence.update_trusted_rebalance_state(state).await;
+		match self.trusted.pay(PaymentMethod::LightningBolt11(inv), transfer_amt).await {
+			Ok(trusted_payment_id) => {
+				log_debug!(
+					self.logger,
+					"Rebalance trusted transaction initiated, id {}. Will complete via observer callbacks.",
+					trusted_payment_id.as_hex()
+				);
 
-					// Set active rebalance
-					*rebalance = Some(state);
+				// persist trusted payment id
+				state.trusted_payment_id = Some(trusted_payment_id);
+				self.persistence.update_trusted_rebalance_state(state).await;
 
-					// Post initiated event
-					self.event_handler
-						.handle_event(RebalancerEvent::RebalanceInitiated {
-							trigger_id: params.id,
-							trusted_rebalance_payment_id: trusted_payment_id,
-							amount_msat: transfer_amt.milli_sats(),
-						})
-						.await;
-				},
-				Err(e) => {
-					log_info!(self.logger, "Rebalance trusted transaction failed with {e:?}",);
+				// Set active rebalance
+				*rebalance = Some(state);
 
-					// Clean up persisted state
-					self.persistence.remove_trusted_rebalance_state().await;
+				// Post initiated event
+				self.event_handler
+					.handle_event(RebalancerEvent::RebalanceInitiated {
+						trigger_id: params.id,
+						trusted_rebalance_payment_id: trusted_payment_id,
+						amount_msat: transfer_amt.milli_sats(),
+					})
+					.await;
+			},
+			Err(e) => {
+				log_info!(self.logger, "Rebalance trusted transaction failed with {e:?}",);
 
-					// Post failure event
-					self.event_handler
-						.handle_event(RebalancerEvent::RebalanceFailed {
-							trigger_id: params.id,
-							trusted_rebalance_payment_id: None,
-							amount_msat: transfer_amt.milli_sats(),
-							reason: format!("Failed to initiate trusted payment: {e:?}"),
-						})
-						.await;
-				},
-			}
+				// Clean up persisted state
+				self.persistence.remove_trusted_rebalance_state().await;
+
+				// Post failure event
+				self.event_handler
+					.handle_event(RebalancerEvent::RebalanceFailed {
+						trigger_id: params.id,
+						trusted_rebalance_payment_id: None,
+						amount_msat: transfer_amt.milli_sats(),
+						reason: format!("Failed to initiate trusted payment: {e:?}"),
+					})
+					.await;
+
+				// Release the lock before scheduling retry
+				drop(rebalance);
+
+				// Schedule a retry
+				self.schedule_retry();
+			},
 		}
 	}
 
@@ -478,6 +560,9 @@ where
 			);
 			return;
 		}
+
+		// Cancel any scheduled retry since we're actually doing a rebalance now
+		self.cancel_scheduled_retry().await;
 
 		let is_splice = self.ln_wallet.has_channel_with_lsp();
 
@@ -500,55 +585,46 @@ where
 		*onchain_rebalance = Some(state);
 
 		// Now initiate the actual operation
-		let user_channel_id = if is_splice {
-			match self.ln_wallet.splice_to_lsp_channel(params.amount).await {
-				Ok(chan_id) => chan_id,
-				Err(e) => {
-					log_error!(self.logger, "Failed to splice to LSP channel: {e:?}");
-					// Clean up the state if we failed
-					let _ = onchain_rebalance.take();
-					self.persistence.remove_onchain_rebalance_state().await;
-					self.event_handler
-						.handle_event(RebalancerEvent::RebalanceFailed {
-							trigger_id: params.id,
-							trusted_rebalance_payment_id: None,
-							amount_msat: params.amount.milli_sats(),
-							reason: format!("Failed to splice to LSP channel: {e:?}"),
-						})
-						.await;
-					return;
-				},
-			}
+		let channel_result = if is_splice {
+			self.ln_wallet.splice_to_lsp_channel(params.amount).await
 		} else {
-			match self.ln_wallet.open_channel_with_lsp(params.amount).await {
-				Ok(chan_id) => chan_id,
-				Err(e) => {
-					log_error!(self.logger, "Failed to open channel with LSP: {e:?}");
-					// Clean up the state if we failed
-					let _ = onchain_rebalance.take();
-					self.persistence.remove_onchain_rebalance_state().await;
-					self.event_handler
-						.handle_event(RebalancerEvent::RebalanceFailed {
-							trigger_id: params.id,
-							trusted_rebalance_payment_id: None,
-							amount_msat: params.amount.milli_sats(),
-							reason: format!("Failed to open channel with LSP: {e:?}"),
-						})
-						.await;
-					return;
-				},
-			}
+			self.ln_wallet.open_channel_with_lsp(params.amount).await
 		};
 
-		// Update state with the user_channel_id
-		state.user_channel_id = Some(user_channel_id);
-		*onchain_rebalance = Some(state);
-		self.persistence.update_onchain_rebalance_state(state).await;
+		match channel_result {
+			Ok(user_channel_id) => {
+				// Update state with the user_channel_id
+				state.user_channel_id = Some(user_channel_id);
+				*onchain_rebalance = Some(state);
+				self.persistence.update_onchain_rebalance_state(state).await;
 
-		log_info!(
-			self.logger,
-			"On-chain rebalance initiated for user_channel_id {user_channel_id}. Will complete via observer callback."
-		);
+				log_info!(
+					self.logger,
+					"On-chain rebalance initiated for user_channel_id {user_channel_id}. Will complete via observer callback."
+				);
+			},
+			Err(e) => {
+				let op_name = if is_splice { "splice to" } else { "open channel with" };
+				log_error!(self.logger, "Failed to {op_name} LSP channel: {e:?}");
+				// Clean up the state if we failed
+				let _ = onchain_rebalance.take();
+				self.persistence.remove_onchain_rebalance_state().await;
+				self.event_handler
+					.handle_event(RebalancerEvent::RebalanceFailed {
+						trigger_id: params.id,
+						trusted_rebalance_payment_id: None,
+						amount_msat: params.amount.milli_sats(),
+						reason: format!("Failed to {op_name} LSP channel: {e:?}"),
+					})
+					.await;
+
+				// Release the lock before scheduling retry
+				drop(onchain_rebalance);
+
+				// Schedule a retry
+				self.schedule_retry();
+			},
+		}
 	}
 
 	/// Called when the trusted wallet confirms sending a payment
@@ -633,6 +709,12 @@ where
 				// Clean up
 				let _ = rebalance.take();
 				self.persistence.remove_trusted_rebalance_state().await;
+
+				// Release the lock before scheduling retry
+				drop(rebalance);
+
+				// Schedule a retry
+				self.schedule_retry();
 			}
 		}
 	}
