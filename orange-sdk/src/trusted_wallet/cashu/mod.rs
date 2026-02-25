@@ -21,6 +21,7 @@ use bitcoin_payment_instructions::amount::Amount;
 
 use cdk::amount::SplitTarget;
 use cdk::nuts::MeltOptions;
+use cdk::nuts::nut00::PaymentMethod as CdkPaymentMethod;
 use cdk::nuts::nut23::Amountless;
 use cdk::nuts::{CurrencyUnit, MeltQuoteState};
 use cdk::wallet::MintQuote;
@@ -92,8 +93,11 @@ impl TrustedWalletInterface for Cashu {
 				));
 			}
 
-			let mint_quote =
-				self.cashu_wallet.mint_bolt12_quote(None, None).await.map_err(|e| {
+			let mint_quote = self
+				.cashu_wallet
+				.mint_quote(CdkPaymentMethod::BOLT12, None, None, None)
+				.await
+				.map_err(|e| {
 					TrustedError::WalletOperationFailed(format!("Failed to create mint quote: {e}"))
 				})?;
 
@@ -134,8 +138,11 @@ impl TrustedWalletInterface for Cashu {
 							)));
 						},
 					};
-					let quote =
-						self.cashu_wallet.mint_quote(cdk_amount, None).await.map_err(|e| {
+					let quote = self
+						.cashu_wallet
+						.mint_quote(CdkPaymentMethod::BOLT11, Some(cdk_amount), None, None)
+						.await
+						.map_err(|e| {
 							TrustedError::WalletOperationFailed(format!(
 								"Failed to create mint quote: {e}"
 							))
@@ -191,7 +198,12 @@ impl TrustedWalletInterface for Cashu {
 				PaymentMethod::LightningBolt11(invoice) => {
 					let quote = self
 						.cashu_wallet
-						.melt_quote(invoice.to_string(), melt_options)
+						.melt_quote(
+							CdkPaymentMethod::BOLT11,
+							invoice.to_string(),
+							melt_options,
+							None,
+						)
 						.await
 						.map_err(|e| {
 							TrustedError::WalletOperationFailed(format!(
@@ -205,7 +217,7 @@ impl TrustedWalletInterface for Cashu {
 				PaymentMethod::LightningBolt12(offer) => {
 					let quote = self
 						.cashu_wallet
-						.melt_bolt12_quote(offer.to_string(), melt_options)
+						.melt_quote(CdkPaymentMethod::BOLT12, offer.to_string(), melt_options, None)
 						.await
 						.map_err(|e| {
 							TrustedError::WalletOperationFailed(format!(
@@ -253,7 +265,12 @@ impl TrustedWalletInterface for Cashu {
 						Some(q) => q,
 						None => self
 							.cashu_wallet
-							.melt_quote(invoice.to_string(), melt_options)
+							.melt_quote(
+								CdkPaymentMethod::BOLT11,
+								invoice.to_string(),
+								melt_options,
+								None,
+							)
 							.await
 							.map_err(|e| {
 								TrustedError::WalletOperationFailed(format!(
@@ -272,7 +289,7 @@ impl TrustedWalletInterface for Cashu {
 					// todo probably should check for existing active quote here as well
 
 					self.cashu_wallet
-						.melt_bolt12_quote(offer.to_string(), melt_options)
+						.melt_quote(CdkPaymentMethod::BOLT12, offer.to_string(), melt_options, None)
 						.await
 						.map_err(|e| {
 							TrustedError::WalletOperationFailed(format!(
@@ -304,9 +321,14 @@ impl TrustedWalletInterface for Cashu {
 					metadata.insert(PAYMENT_HASH_METADATA_KEY.to_string(), hash.to_string());
 				}
 
-				match cashu_wallet.melt_with_metadata(&quote_id, metadata).await {
+				let melt_result = async {
+					let prepared = cashu_wallet.prepare_melt(&quote_id, metadata).await?;
+					prepared.confirm().await
+				}
+				.await;
+				match melt_result {
 					Ok(res) => {
-						match res.state {
+						match res.state() {
 							MeltQuoteState::Paid => {
 								log_info!(logger, "Successfully sent for quote: {quote_id}");
 
@@ -321,14 +343,14 @@ impl TrustedWalletInterface for Cashu {
 									return;
 								}
 
-								let preimage: Option<PaymentPreimage> = match &res.preimage {
+								let preimage: Option<PaymentPreimage> = match res.payment_proof() {
 									Some(str) => match FromHex::from_hex(str) {
 										Ok(b) => Some(PaymentPreimage(b)),
 										Err(e) => {
 											log_error!(
 												logger,
 												"Failed to decode preimage ({:?}) for quote {quote_id}: {e}",
-												res.preimage
+												res.payment_proof()
 											);
 											None
 										},
@@ -379,7 +401,7 @@ impl TrustedWalletInterface for Cashu {
 									);
 								}
 
-								let fee_paid_sat: u64 = res.fee_paid.into();
+								let fee_paid_sat: u64 = res.fee_paid().into();
 								let _ = event_queue
 									.add_event(Event::PaymentSuccessful {
 										payment_id,
@@ -551,9 +573,7 @@ impl Cashu {
 			.await
 			.ok()
 			.flatten()
-			.map(|info| {
-				info.nuts.nut04.supported_methods().contains(&&cdk::nuts::PaymentMethod::Bolt12)
-			})
+			.map(|info| info.nuts.nut04.supported_methods().contains(&&CdkPaymentMethod::BOLT12))
 			.unwrap_or(false);
 
 		let (shutdown_sender, mut shutdown_receiver) = watch::channel::<()>(());
@@ -620,9 +640,9 @@ impl Cashu {
 			runtime.spawn_background_task(async move {
 				match w.restore().await {
 					Err(e) => log_error!(l, "Failed to restore cashu mint: {e}"),
-					Ok(amt) => {
-						if amt > cdk::Amount::ZERO {
-							log_info!(l, "Restored cashu mint: {}, amt: {amt}", w.mint_url);
+					Ok(restored) => {
+						if restored.unspent > cdk::Amount::ZERO {
+							log_info!(l, "Restored cashu mint: {}: {:#?}", w.mint_url, restored);
 						}
 						if let Err(e) = write_has_recovered(&store, true).await {
 							log_error!(l, "Failed to write has_recovered flag: {e:?}");

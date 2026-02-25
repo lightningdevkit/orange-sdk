@@ -5,6 +5,7 @@ use std::sync::{Arc, RwLock};
 
 use async_trait::async_trait;
 use cdk::cdk_database::WalletDatabase;
+use cdk::wallet::types::WalletSaga;
 use ldk_node::DynStore;
 use ldk_node::lightning::io;
 use ldk_node::lightning::util::persist::KVStore;
@@ -37,6 +38,8 @@ const KEYSET_COUNTERS_KEY: &str = "keyset_counters";
 const TRANSACTIONS_KEY: &str = "transactions";
 const KEYSETS_TABLE_KEY: &str = "keysets_table";
 const KEYSET_U32_MAPPING_KEY: &str = "keyset_u32_mapping";
+const SAGAS_KEY: &str = "sagas";
+const PROOF_RESERVATIONS_KEY: &str = "proof_reservations";
 const HAS_RECOVERED_KEY: &str = "has_recovered";
 
 /// Error type for database operations
@@ -276,12 +279,10 @@ impl CashuKvDatabase {
 }
 
 #[async_trait]
-impl WalletDatabase for CashuKvDatabase {
-	type Err = cdk::cdk_database::Error;
-
+impl WalletDatabase<cdk::cdk_database::Error> for CashuKvDatabase {
 	async fn add_mint(
 		&self, mint_url: MintUrl, mint_info: Option<MintInfo>,
-	) -> Result<(), Self::Err> {
+	) -> Result<(), cdk::cdk_database::Error> {
 		// Save mint URL using hashed key
 		let mint_key = Self::generate_mint_key(&mint_url);
 		let mint_data = serde_json::to_vec(&mint_url)
@@ -305,7 +306,7 @@ impl WalletDatabase for CashuKvDatabase {
 		Ok(())
 	}
 
-	async fn remove_mint(&self, mint_url: MintUrl) -> Result<(), Self::Err> {
+	async fn remove_mint(&self, mint_url: MintUrl) -> Result<(), cdk::cdk_database::Error> {
 		let mint_key = Self::generate_mint_key(&mint_url);
 
 		// Remove mint URL by writing empty data
@@ -340,7 +341,9 @@ impl WalletDatabase for CashuKvDatabase {
 		Ok(())
 	}
 
-	async fn get_mint(&self, mint_url: MintUrl) -> Result<Option<MintInfo>, Self::Err> {
+	async fn get_mint(
+		&self, mint_url: MintUrl,
+	) -> Result<Option<MintInfo>, cdk::cdk_database::Error> {
 		// Check cache first
 		{
 			let cache = self.mints_cache.read().unwrap();
@@ -353,14 +356,16 @@ impl WalletDatabase for CashuKvDatabase {
 		self.load_mint_info(&mint_url).await.map_err(Into::into)
 	}
 
-	async fn get_mints(&self) -> Result<HashMap<MintUrl, Option<MintInfo>>, Self::Err> {
+	async fn get_mints(
+		&self,
+	) -> Result<HashMap<MintUrl, Option<MintInfo>>, cdk::cdk_database::Error> {
 		let cache = self.mints_cache.read().unwrap();
 		Ok(cache.clone())
 	}
 
 	async fn update_mint_url(
 		&self, old_mint_url: MintUrl, new_mint_url: MintUrl,
-	) -> Result<(), Self::Err> {
+	) -> Result<(), cdk::cdk_database::Error> {
 		// Get the mint info from the old URL
 		let mint_info = self.get_mint(old_mint_url.clone()).await?;
 
@@ -383,7 +388,7 @@ impl WalletDatabase for CashuKvDatabase {
 
 	async fn add_mint_keysets(
 		&self, mint_url: MintUrl, keysets: Vec<KeySetInfo>,
-	) -> Result<(), Self::Err> {
+	) -> Result<(), cdk::cdk_database::Error> {
 		let mut existing_u32 = false;
 		let mut updated_keysets = Vec::new();
 
@@ -503,7 +508,7 @@ impl WalletDatabase for CashuKvDatabase {
 
 	async fn get_mint_keysets(
 		&self, mint_url: MintUrl,
-	) -> Result<Option<Vec<KeySetInfo>>, Self::Err> {
+	) -> Result<Option<Vec<KeySetInfo>>, cdk::cdk_database::Error> {
 		let key = Self::generate_mint_keysets_key(&mint_url);
 
 		match KVStore::read(self.store.as_ref(), CASHU_PRIMARY_KEY, MINT_KEYSETS_KEY, &key).await {
@@ -520,7 +525,9 @@ impl WalletDatabase for CashuKvDatabase {
 		}
 	}
 
-	async fn get_keyset_by_id(&self, keyset_id: &Id) -> Result<Option<KeySetInfo>, Self::Err> {
+	async fn get_keyset_by_id(
+		&self, keyset_id: &Id,
+	) -> Result<Option<KeySetInfo>, cdk::cdk_database::Error> {
 		// Read directly from the dedicated KEYSETS_TABLE keyed by the keyset ID for efficiency
 		let key = format!("keyset_{}", keyset_id);
 		match KVStore::read(self.store.as_ref(), CASHU_PRIMARY_KEY, KEYSETS_TABLE_KEY, &key).await {
@@ -535,7 +542,7 @@ impl WalletDatabase for CashuKvDatabase {
 		}
 	}
 
-	async fn add_mint_quote(&self, quote: MintQuote) -> Result<(), Self::Err> {
+	async fn add_mint_quote(&self, quote: MintQuote) -> Result<(), cdk::cdk_database::Error> {
 		let key = quote.id.clone();
 		let data =
 			serde_json::to_vec(&quote).map_err(|e| DatabaseError::Serialization(e.to_string()))?;
@@ -547,7 +554,9 @@ impl WalletDatabase for CashuKvDatabase {
 		Ok(())
 	}
 
-	async fn get_mint_quote(&self, quote_id: &str) -> Result<Option<MintQuote>, Self::Err> {
+	async fn get_mint_quote(
+		&self, quote_id: &str,
+	) -> Result<Option<MintQuote>, cdk::cdk_database::Error> {
 		match KVStore::read(self.store.as_ref(), CASHU_PRIMARY_KEY, MINT_QUOTES_KEY, quote_id).await
 		{
 			Ok(data) => {
@@ -563,7 +572,7 @@ impl WalletDatabase for CashuKvDatabase {
 		}
 	}
 
-	async fn get_mint_quotes(&self) -> Result<Vec<MintQuote>, Self::Err> {
+	async fn get_mint_quotes(&self) -> Result<Vec<MintQuote>, cdk::cdk_database::Error> {
 		let keys = KVStore::list(self.store.as_ref(), CASHU_PRIMARY_KEY, MINT_QUOTES_KEY)
 			.await
 			.map_err(DatabaseError::Io)?;
@@ -584,7 +593,7 @@ impl WalletDatabase for CashuKvDatabase {
 		Ok(quotes)
 	}
 
-	async fn remove_mint_quote(&self, quote_id: &str) -> Result<(), Self::Err> {
+	async fn remove_mint_quote(&self, quote_id: &str) -> Result<(), cdk::cdk_database::Error> {
 		// Mark as removed by writing empty data
 		KVStore::remove(self.store.as_ref(), CASHU_PRIMARY_KEY, MINT_QUOTES_KEY, quote_id, false)
 			.await
@@ -593,7 +602,7 @@ impl WalletDatabase for CashuKvDatabase {
 		Ok(())
 	}
 
-	async fn add_melt_quote(&self, quote: MeltQuote) -> Result<(), Self::Err> {
+	async fn add_melt_quote(&self, quote: MeltQuote) -> Result<(), cdk::cdk_database::Error> {
 		let key = quote.id.clone();
 		let data =
 			serde_json::to_vec(&quote).map_err(|e| DatabaseError::Serialization(e.to_string()))?;
@@ -605,7 +614,9 @@ impl WalletDatabase for CashuKvDatabase {
 		Ok(())
 	}
 
-	async fn get_melt_quote(&self, quote_id: &str) -> Result<Option<MeltQuote>, Self::Err> {
+	async fn get_melt_quote(
+		&self, quote_id: &str,
+	) -> Result<Option<MeltQuote>, cdk::cdk_database::Error> {
 		match KVStore::read(self.store.as_ref(), CASHU_PRIMARY_KEY, MELT_QUOTES_KEY, quote_id).await
 		{
 			Ok(data) => {
@@ -621,7 +632,7 @@ impl WalletDatabase for CashuKvDatabase {
 		}
 	}
 
-	async fn get_melt_quotes(&self) -> Result<Vec<MeltQuote>, Self::Err> {
+	async fn get_melt_quotes(&self) -> Result<Vec<MeltQuote>, cdk::cdk_database::Error> {
 		let keys = KVStore::list(self.store.as_ref(), CASHU_PRIMARY_KEY, MELT_QUOTES_KEY)
 			.await
 			.map_err(DatabaseError::Io)?;
@@ -642,7 +653,7 @@ impl WalletDatabase for CashuKvDatabase {
 		Ok(quotes)
 	}
 
-	async fn remove_melt_quote(&self, quote_id: &str) -> Result<(), Self::Err> {
+	async fn remove_melt_quote(&self, quote_id: &str) -> Result<(), cdk::cdk_database::Error> {
 		KVStore::remove(self.store.as_ref(), CASHU_PRIMARY_KEY, MELT_QUOTES_KEY, quote_id, false)
 			.await
 			.map_err(DatabaseError::Io)?;
@@ -650,7 +661,7 @@ impl WalletDatabase for CashuKvDatabase {
 		Ok(())
 	}
 
-	async fn add_keys(&self, keyset: KeySet) -> Result<(), Self::Err> {
+	async fn add_keys(&self, keyset: KeySet) -> Result<(), cdk::cdk_database::Error> {
 		keyset.verify_id().map_err(|e| cdk::cdk_database::Error::Database(e.to_string().into()))?;
 
 		if self.get_keys(&keyset.id).await?.is_some() {
@@ -668,7 +679,7 @@ impl WalletDatabase for CashuKvDatabase {
 		Ok(())
 	}
 
-	async fn get_keys(&self, id: &Id) -> Result<Option<Keys>, Self::Err> {
+	async fn get_keys(&self, id: &Id) -> Result<Option<Keys>, cdk::cdk_database::Error> {
 		let key = id.to_string();
 
 		match KVStore::read(self.store.as_ref(), CASHU_PRIMARY_KEY, KEYS_KEY, &key).await {
@@ -685,7 +696,7 @@ impl WalletDatabase for CashuKvDatabase {
 		}
 	}
 
-	async fn remove_keys(&self, id: &Id) -> Result<(), Self::Err> {
+	async fn remove_keys(&self, id: &Id) -> Result<(), cdk::cdk_database::Error> {
 		let key = id.to_string();
 
 		KVStore::remove(self.store.as_ref(), CASHU_PRIMARY_KEY, KEYS_KEY, &key, false)
@@ -697,7 +708,7 @@ impl WalletDatabase for CashuKvDatabase {
 
 	async fn update_proofs(
 		&self, added: Vec<ProofInfo>, removed_ys: Vec<PublicKey>,
-	) -> Result<(), Self::Err> {
+	) -> Result<(), cdk::cdk_database::Error> {
 		// Add new proofs
 		for proof in &added {
 			let key = Self::generate_proof_key(proof);
@@ -735,7 +746,7 @@ impl WalletDatabase for CashuKvDatabase {
 	async fn get_proofs(
 		&self, mint_url: Option<MintUrl>, unit: Option<CurrencyUnit>, state: Option<Vec<State>>,
 		spending_conditions: Option<Vec<SpendingConditions>>,
-	) -> Result<Vec<ProofInfo>, Self::Err> {
+	) -> Result<Vec<ProofInfo>, cdk::cdk_database::Error> {
 		let cache = self.proofs_cache.read().unwrap();
 		let mut filtered_proofs = cache.clone();
 
@@ -767,12 +778,14 @@ impl WalletDatabase for CashuKvDatabase {
 
 	async fn get_balance(
 		&self, mint_url: Option<MintUrl>, unit: Option<CurrencyUnit>, state: Option<Vec<State>>,
-	) -> Result<u64, Self::Err> {
+	) -> Result<u64, cdk::cdk_database::Error> {
 		let proofs = self.get_proofs(mint_url, unit, state, None).await?;
 		Ok(proofs.iter().map(|p| u64::from(p.proof.amount)).sum())
 	}
 
-	async fn update_proofs_state(&self, ys: Vec<PublicKey>, state: State) -> Result<(), Self::Err> {
+	async fn update_proofs_state(
+		&self, ys: Vec<PublicKey>, state: State,
+	) -> Result<(), cdk::cdk_database::Error> {
 		// Update proofs in storage and cache
 		for y in &ys {
 			let key = format!("proof_{}", hex::encode(y.serialize()));
@@ -817,7 +830,9 @@ impl WalletDatabase for CashuKvDatabase {
 		Ok(())
 	}
 
-	async fn increment_keyset_counter(&self, keyset_id: &Id, count: u32) -> Result<u32, Self::Err> {
+	async fn increment_keyset_counter(
+		&self, keyset_id: &Id, count: u32,
+	) -> Result<u32, cdk::cdk_database::Error> {
 		let key = keyset_id.to_string();
 
 		// Read current counter
@@ -843,7 +858,9 @@ impl WalletDatabase for CashuKvDatabase {
 		Ok(new_count)
 	}
 
-	async fn add_transaction(&self, transaction: Transaction) -> Result<(), Self::Err> {
+	async fn add_transaction(
+		&self, transaction: Transaction,
+	) -> Result<(), cdk::cdk_database::Error> {
 		let key = transaction.id().to_string();
 		let data = serde_json::to_vec(&transaction)
 			.map_err(|e| DatabaseError::Serialization(e.to_string()))?;
@@ -857,7 +874,7 @@ impl WalletDatabase for CashuKvDatabase {
 
 	async fn get_transaction(
 		&self, transaction_id: TransactionId,
-	) -> Result<Option<Transaction>, Self::Err> {
+	) -> Result<Option<Transaction>, cdk::cdk_database::Error> {
 		let key = transaction_id.to_string();
 
 		match KVStore::read(self.store.as_ref(), CASHU_PRIMARY_KEY, TRANSACTIONS_KEY, &key).await {
@@ -877,7 +894,7 @@ impl WalletDatabase for CashuKvDatabase {
 	async fn list_transactions(
 		&self, mint_url: Option<MintUrl>, direction: Option<TransactionDirection>,
 		unit: Option<CurrencyUnit>,
-	) -> Result<Vec<Transaction>, Self::Err> {
+	) -> Result<Vec<Transaction>, cdk::cdk_database::Error> {
 		let keys = KVStore::list(self.store.as_ref(), CASHU_PRIMARY_KEY, TRANSACTIONS_KEY)
 			.await
 			.map_err(DatabaseError::Io)?;
@@ -923,7 +940,9 @@ impl WalletDatabase for CashuKvDatabase {
 		Ok(transactions)
 	}
 
-	async fn remove_transaction(&self, transaction_id: TransactionId) -> Result<(), Self::Err> {
+	async fn remove_transaction(
+		&self, transaction_id: TransactionId,
+	) -> Result<(), cdk::cdk_database::Error> {
 		let key = transaction_id.to_string();
 
 		KVStore::remove(self.store.as_ref(), CASHU_PRIMARY_KEY, TRANSACTIONS_KEY, &key, false)
@@ -931,6 +950,256 @@ impl WalletDatabase for CashuKvDatabase {
 			.map_err(DatabaseError::Io)?;
 
 		Ok(())
+	}
+
+	async fn get_unissued_mint_quotes(&self) -> Result<Vec<MintQuote>, cdk::cdk_database::Error> {
+		let all_quotes = self.get_mint_quotes().await?;
+		Ok(all_quotes
+			.into_iter()
+			.filter(|q| q.amount_issued == cdk::Amount::ZERO || q.payment_method.is_bolt12())
+			.collect())
+	}
+
+	async fn get_proofs_by_ys(
+		&self, ys: Vec<PublicKey>,
+	) -> Result<Vec<ProofInfo>, cdk::cdk_database::Error> {
+		let cache = self.proofs_cache.read().unwrap();
+		Ok(cache.iter().filter(|p| ys.contains(&p.y)).cloned().collect())
+	}
+
+	async fn add_saga(&self, saga: WalletSaga) -> Result<(), cdk::cdk_database::Error> {
+		let key = saga.id.to_string();
+		let data =
+			serde_json::to_vec(&saga).map_err(|e| DatabaseError::Serialization(e.to_string()))?;
+		KVStore::write(self.store.as_ref(), CASHU_PRIMARY_KEY, SAGAS_KEY, &key, data)
+			.await
+			.map_err(DatabaseError::Io)?;
+		Ok(())
+	}
+
+	async fn get_saga(
+		&self, id: &uuid::Uuid,
+	) -> Result<Option<WalletSaga>, cdk::cdk_database::Error> {
+		let key = id.to_string();
+		match KVStore::read(self.store.as_ref(), CASHU_PRIMARY_KEY, SAGAS_KEY, &key).await {
+			Ok(data) if !data.is_empty() => {
+				let saga: WalletSaga = serde_json::from_slice(&data)
+					.map_err(|e| DatabaseError::Serialization(e.to_string()))?;
+				Ok(Some(saga))
+			},
+			Ok(_) => Ok(None),
+			Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
+			Err(e) => Err(DatabaseError::Io(e).into()),
+		}
+	}
+
+	async fn update_saga(&self, saga: WalletSaga) -> Result<bool, cdk::cdk_database::Error> {
+		let key = saga.id.to_string();
+		let data =
+			serde_json::to_vec(&saga).map_err(|e| DatabaseError::Serialization(e.to_string()))?;
+		KVStore::write(self.store.as_ref(), CASHU_PRIMARY_KEY, SAGAS_KEY, &key, data)
+			.await
+			.map_err(DatabaseError::Io)?;
+		Ok(true)
+	}
+
+	async fn delete_saga(&self, id: &uuid::Uuid) -> Result<(), cdk::cdk_database::Error> {
+		let key = id.to_string();
+		KVStore::remove(self.store.as_ref(), CASHU_PRIMARY_KEY, SAGAS_KEY, &key, false)
+			.await
+			.map_err(DatabaseError::Io)?;
+		Ok(())
+	}
+
+	async fn get_incomplete_sagas(&self) -> Result<Vec<WalletSaga>, cdk::cdk_database::Error> {
+		let keys = KVStore::list(self.store.as_ref(), CASHU_PRIMARY_KEY, SAGAS_KEY)
+			.await
+			.map_err(DatabaseError::Io)?;
+		let mut sagas = Vec::new();
+		for key in keys {
+			let data = KVStore::read(self.store.as_ref(), CASHU_PRIMARY_KEY, SAGAS_KEY, &key)
+				.await
+				.map_err(DatabaseError::Io)?;
+			if !data.is_empty() {
+				if let Ok(saga) = serde_json::from_slice::<WalletSaga>(&data) {
+					sagas.push(saga);
+				}
+			}
+		}
+		Ok(sagas)
+	}
+
+	async fn reserve_proofs(
+		&self, ys: Vec<PublicKey>, operation_id: &uuid::Uuid,
+	) -> Result<(), cdk::cdk_database::Error> {
+		// Store which Y values are reserved by this operation
+		let key = operation_id.to_string();
+		let ys_data: Vec<String> = ys.iter().map(|y| hex::encode(y.serialize())).collect();
+		let data = serde_json::to_vec(&ys_data)
+			.map_err(|e| DatabaseError::Serialization(e.to_string()))?;
+		KVStore::write(self.store.as_ref(), CASHU_PRIMARY_KEY, PROOF_RESERVATIONS_KEY, &key, data)
+			.await
+			.map_err(DatabaseError::Io)?;
+
+		self.update_proofs_state(ys, State::Reserved).await
+	}
+
+	async fn release_proofs(
+		&self, operation_id: &uuid::Uuid,
+	) -> Result<(), cdk::cdk_database::Error> {
+		let key = operation_id.to_string();
+		match KVStore::read(self.store.as_ref(), CASHU_PRIMARY_KEY, PROOF_RESERVATIONS_KEY, &key)
+			.await
+		{
+			Ok(data) if !data.is_empty() => {
+				let ys_hex: Vec<String> = serde_json::from_slice(&data)
+					.map_err(|e| DatabaseError::Serialization(e.to_string()))?;
+				let ys: Vec<PublicKey> = ys_hex
+					.iter()
+					.filter_map(|h| {
+						let bytes = hex::decode(h).ok()?;
+						PublicKey::from_slice(&bytes).ok()
+					})
+					.collect();
+				if !ys.is_empty() {
+					self.update_proofs_state(ys, State::Unspent).await?;
+				}
+				KVStore::remove(
+					self.store.as_ref(),
+					CASHU_PRIMARY_KEY,
+					PROOF_RESERVATIONS_KEY,
+					&key,
+					false,
+				)
+				.await
+				.map_err(DatabaseError::Io)?;
+			},
+			_ => {},
+		}
+		Ok(())
+	}
+
+	async fn get_reserved_proofs(
+		&self, operation_id: &uuid::Uuid,
+	) -> Result<Vec<ProofInfo>, cdk::cdk_database::Error> {
+		let key = operation_id.to_string();
+		match KVStore::read(self.store.as_ref(), CASHU_PRIMARY_KEY, PROOF_RESERVATIONS_KEY, &key)
+			.await
+		{
+			Ok(data) if !data.is_empty() => {
+				let ys_hex: Vec<String> = serde_json::from_slice(&data)
+					.map_err(|e| DatabaseError::Serialization(e.to_string()))?;
+				let ys: Vec<PublicKey> = ys_hex
+					.iter()
+					.filter_map(|h| {
+						let bytes = hex::decode(h).ok()?;
+						PublicKey::from_slice(&bytes).ok()
+					})
+					.collect();
+				self.get_proofs_by_ys(ys).await
+			},
+			_ => Ok(Vec::new()),
+		}
+	}
+
+	async fn reserve_melt_quote(
+		&self, quote_id: &str, operation_id: &uuid::Uuid,
+	) -> Result<(), cdk::cdk_database::Error> {
+		if let Some(mut quote) = self.get_melt_quote(quote_id).await? {
+			if quote.used_by_operation.is_some() {
+				return Err(cdk::cdk_database::Error::Database(
+					"Quote already in use by another operation".to_string().into(),
+				));
+			}
+			quote.used_by_operation = Some(operation_id.to_string());
+			self.add_melt_quote(quote).await?;
+		}
+		Ok(())
+	}
+
+	async fn release_melt_quote(
+		&self, operation_id: &uuid::Uuid,
+	) -> Result<(), cdk::cdk_database::Error> {
+		let quotes = self.get_melt_quotes().await?;
+		let op_str = operation_id.to_string();
+		for mut quote in quotes {
+			if quote.used_by_operation.as_deref() == Some(&op_str) {
+				quote.used_by_operation = None;
+				self.add_melt_quote(quote).await?;
+			}
+		}
+		Ok(())
+	}
+
+	async fn reserve_mint_quote(
+		&self, quote_id: &str, operation_id: &uuid::Uuid,
+	) -> Result<(), cdk::cdk_database::Error> {
+		if let Some(mut quote) = self.get_mint_quote(quote_id).await? {
+			if quote.used_by_operation.is_some() {
+				return Err(cdk::cdk_database::Error::Database(
+					"Quote already in use by another operation".to_string().into(),
+				));
+			}
+			quote.used_by_operation = Some(operation_id.to_string());
+			self.add_mint_quote(quote).await?;
+		}
+		Ok(())
+	}
+
+	async fn release_mint_quote(
+		&self, operation_id: &uuid::Uuid,
+	) -> Result<(), cdk::cdk_database::Error> {
+		let quotes = self.get_mint_quotes().await?;
+		let op_str = operation_id.to_string();
+		for mut quote in quotes {
+			if quote.used_by_operation.as_deref() == Some(&op_str) {
+				quote.used_by_operation = None;
+				self.add_mint_quote(quote).await?;
+			}
+		}
+		Ok(())
+	}
+
+	async fn kv_read(
+		&self, primary_namespace: &str, secondary_namespace: &str, key: &str,
+	) -> Result<Option<Vec<u8>>, cdk::cdk_database::Error> {
+		match KVStore::read(self.store.as_ref(), primary_namespace, secondary_namespace, key).await
+		{
+			Ok(data) if !data.is_empty() => Ok(Some(data.to_vec())),
+			Ok(_) => Ok(None),
+			Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
+			Err(e) => Err(DatabaseError::Io(e).into()),
+		}
+	}
+
+	async fn kv_list(
+		&self, primary_namespace: &str, secondary_namespace: &str,
+	) -> Result<Vec<String>, cdk::cdk_database::Error> {
+		KVStore::list(self.store.as_ref(), primary_namespace, secondary_namespace)
+			.await
+			.map_err(|e| DatabaseError::Io(e).into())
+	}
+
+	async fn kv_write(
+		&self, primary_namespace: &str, secondary_namespace: &str, key: &str, value: &[u8],
+	) -> Result<(), cdk::cdk_database::Error> {
+		KVStore::write(
+			self.store.as_ref(),
+			primary_namespace,
+			secondary_namespace,
+			key,
+			value.to_vec(),
+		)
+		.await
+		.map_err(|e| DatabaseError::Io(e).into())
+	}
+
+	async fn kv_remove(
+		&self, primary_namespace: &str, secondary_namespace: &str, key: &str,
+	) -> Result<(), cdk::cdk_database::Error> {
+		KVStore::remove(self.store.as_ref(), primary_namespace, secondary_namespace, key, false)
+			.await
+			.map_err(|e| DatabaseError::Io(e).into())
 	}
 }
 
