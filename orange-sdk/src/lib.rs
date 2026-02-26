@@ -529,6 +529,27 @@ impl Wallet {
 
 		let tx_metadata = TxMetadataStore::new(Arc::clone(&store)).await;
 
+		// Cashu must init before LDK Node because CashuKvDatabase does
+		// synchronous SQLite reads that deadlock with LDK Node's background
+		// store writes. Other backends can init concurrently.
+		#[cfg(feature = "cashu")]
+		let cashu_wallet = if let ExtraConfig::Cashu(cashu) = &config.extra_config {
+			Some(
+				Cashu::init(
+					&config,
+					cashu.clone(),
+					Arc::clone(&store),
+					Arc::clone(&event_queue),
+					tx_metadata.clone(),
+					Arc::clone(&logger),
+					Arc::clone(&runtime),
+				)
+				.await?,
+			)
+		} else {
+			None
+		};
+
 		let (trusted, ln_wallet) = tokio::join!(
 			async {
 				let trusted: Arc<Box<DynTrustedWalletInterface>> = match &config.extra_config {
@@ -546,18 +567,7 @@ impl Wallet {
 						.await?,
 					)),
 					#[cfg(feature = "cashu")]
-					ExtraConfig::Cashu(cashu) => Arc::new(Box::new(
-						Cashu::init(
-							&config,
-							cashu.clone(),
-							Arc::clone(&store),
-							Arc::clone(&event_queue),
-							tx_metadata.clone(),
-							Arc::clone(&logger),
-							Arc::clone(&runtime),
-						)
-						.await?,
-					)),
+					ExtraConfig::Cashu(_) => Arc::new(Box::new(cashu_wallet.expect("initialized above"))),
 					#[cfg(feature = "_test-utils")]
 					ExtraConfig::Dummy(cfg) => Arc::new(Box::new(
 						DummyTrustedWallet::new(

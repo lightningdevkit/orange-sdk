@@ -16,6 +16,9 @@ test-cashu *args:
 cli:
     cd examples/cli && cargo run
 
+cli-cashu *args:
+    cd examples/cli && cargo run -- --cashu --npubcash-url https://npubx.cash --mint-url {{ args }}
+
 cli-logs:
     tail -n 50 -f examples/cli/wallet_data/bitcoin/wallet.log
 

@@ -16,7 +16,7 @@ name = "orange_sdk"
 default = ["spark"]
 uniffi = ["dep:uniffi", "spark", "cashu", "rand", "pin-project-lite"]
 spark = ["breez-sdk-spark", "uuid", "serde_json"]
-cashu = ["cdk", "serde_json"]
+cashu = ["cdk", "cdk/npubcash", "serde_json"]
 _test-utils = ["corepc-node", 'electrsd', "cashu", "uuid/v7", "rand"]
 _cashu-tests = ["_test-utils", "cdk-ldk-node", "cdk/mint", "cdk-sqlite", "cdk-axum", "axum"]
 

@@ -6,8 +6,8 @@ use rustyline::error::ReadlineError;
 
 use orange_sdk::bitcoin_payment_instructions::amount::Amount;
 use orange_sdk::{
-	ChainSource, Event, ExtraConfig, LoggerType, Mnemonic, PaymentInfo, Seed, SparkWalletConfig,
-	StorageConfig, Tunables, Wallet, WalletConfig, bitcoin::Network,
+	CashuConfig, ChainSource, CurrencyUnit, Event, ExtraConfig, LoggerType, Mnemonic, PaymentInfo,
+	Seed, SparkWalletConfig, StorageConfig, Tunables, Wallet, WalletConfig, bitcoin::Network,
 };
 use rand::RngCore;
 use std::fs;
@@ -23,6 +23,15 @@ const NETWORK: Network = Network::Bitcoin; // Supports Bitcoin and Regtest
 #[derive(Parser)]
 #[command(author, version, about, long_about = None)]
 struct Cli {
+	/// Use Cashu wallet instead of Spark
+	#[arg(long)]
+	cashu: bool,
+	/// Cashu mint URL (requires --cashu)
+	#[arg(long, requires = "cashu")]
+	mint_url: String,
+	/// npub.cash URL for lightning address support (requires --cashu)
+	#[arg(long, requires = "cashu")]
+	npubcash_url: Option<String>,
 	#[command(subcommand)]
 	command: Option<Commands>,
 }
@@ -74,11 +83,21 @@ struct WalletState {
 	shutdown: Arc<AtomicBool>,
 }
 
-fn get_config(network: Network) -> Result<WalletConfig> {
+fn get_config(network: Network, cli: &Cli) -> Result<WalletConfig> {
 	let storage_path = format!("./wallet_data/{network}");
 
 	// Generate or load seed
 	let seed = generate_or_load_seed(&storage_path)?;
+
+	let extra_config = if cli.cashu {
+		ExtraConfig::Cashu(CashuConfig {
+			mint_url: cli.mint_url.clone(),
+			unit: CurrencyUnit::Sat,
+			npubcash_url: cli.npubcash_url.clone(),
+		})
+	} else {
+		ExtraConfig::Spark(SparkWalletConfig::default())
+	};
 
 	match network {
 		Network::Regtest => {
@@ -103,7 +122,7 @@ fn get_config(network: Network) -> Result<WalletConfig> {
 				network,
 				seed,
 				tunables: Tunables::default(),
-				extra_config: ExtraConfig::Spark(SparkWalletConfig::default()),
+				extra_config,
 			})
 		},
 		Network::Bitcoin => {
@@ -132,7 +151,7 @@ fn get_config(network: Network) -> Result<WalletConfig> {
 				network,
 				seed,
 				tunables: Tunables::default(),
-				extra_config: ExtraConfig::Spark(SparkWalletConfig::default()),
+				extra_config,
 			})
 		},
 		_ => Err(anyhow::anyhow!("Unsupported network: {network:?}")),
@@ -140,9 +159,9 @@ fn get_config(network: Network) -> Result<WalletConfig> {
 }
 
 impl WalletState {
-	async fn new() -> Result<Self> {
+	async fn new(cli: &Cli) -> Result<Self> {
 		let shutdown = Arc::new(AtomicBool::new(false));
-		let config = get_config(NETWORK)
+		let config = get_config(NETWORK, cli)
 			.with_context(|| format!("Failed to get wallet config for network: {NETWORK:?}"))?;
 
 		println!("{} Initializing wallet...", "⚡".bright_yellow());
@@ -241,7 +260,7 @@ async fn main() -> Result<()> {
 	println!();
 
 	// Initialize wallet once at startup
-	let mut state = WalletState::new().await?;
+	let mut state = WalletState::new(&cli).await?;
 
 	// Set up signal handling for graceful shutdown
 	let shutdown_state = state.shutdown.clone();

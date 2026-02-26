@@ -8,7 +8,7 @@ name = "orange-cli"
 path = "src/main.rs"
 
 [dependencies]
-orange-sdk = { path = "../../orange-sdk" }
+orange-sdk = { path = "../../orange-sdk", features = ["cashu"] }
 tokio = { version = "1.0", features = ["full"] }
 clap = { version = "4.0", features = ["derive"] }
 anyhow = "1.0"

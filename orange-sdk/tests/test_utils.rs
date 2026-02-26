@@ -503,6 +503,7 @@ async fn build_test_nodes() -> TestParams {
 			extra_config: ExtraConfig::Cashu(orange_sdk::CashuConfig {
 				mint_url: format!("http://127.0.0.1:{}", mint_addr.port()),
 				unit: orange_sdk::CurrencyUnit::Sat,
+				npubcash_url: None,
 			}),
 		};
 		let wallet = Arc::new(Wallet::new(wallet_config).await.unwrap());
