@@ -21,7 +21,8 @@ use bitcoin_payment_instructions::amount::Amount;
 use breez_sdk_spark::{
 	BreezSdk, EventListener, GetInfoRequest, ListPaymentsRequest, OptimizationConfig,
 	PaymentDetails, PaymentStatus, PaymentType, PrepareSendPaymentRequest, ReceivePaymentMethod,
-	ReceivePaymentRequest, SdkBuilder, SdkError, SdkEvent, SendPaymentMethod, SendPaymentRequest,
+	ReceivePaymentRequest, RegisterLightningAddressRequest, SdkBuilder, SdkError, SdkEvent,
+	SendPaymentMethod, SendPaymentRequest,
 };
 
 use graduated_rebalancer::ReceivedLightningPayment;
@@ -37,7 +38,7 @@ use std::time::Duration;
 use uuid::Uuid;
 
 /// Configuration options for the Spark wallet.
-#[derive(Debug, Copy, Clone)]
+#[derive(Debug, Clone)]
 pub struct SparkWalletConfig {
 	/// How often to sync the wallet with the blockchain, in seconds.
 	/// Default is 60 seconds.
@@ -46,11 +47,17 @@ pub struct SparkWalletConfig {
 	/// lightning when sending and receiving. This has the benefit of lower fees
 	/// but is at the cost of privacy.
 	pub prefer_spark_over_lightning: bool,
+	/// The domain used for receiving through lnurl-pay and lightning address.
+	pub lnurl_domain: Option<String>,
 }
 
 impl Default for SparkWalletConfig {
 	fn default() -> Self {
-		SparkWalletConfig { sync_interval_secs: 60, prefer_spark_over_lightning: false }
+		SparkWalletConfig {
+			sync_interval_secs: 60,
+			prefer_spark_over_lightning: false,
+			lnurl_domain: Some("breez.tips".to_string()),
+		}
 	}
 }
 
@@ -59,7 +66,7 @@ impl Default for SparkWalletConfig {
 const BREEZ_API_KEY: &str = "MIIBajCCARygAwIBAgIHPnfOjAhBgzAFBgMrZXAwEDEOMAwGA1UEAxMFQnJlZXowHhcNMjUwOTE5MjEzNTU1WhcNMzUwOTE3MjEzNTU1WjAqMRMwEQYDVQQKEwpvcmFuZ2Utc2RrMRMwEQYDVQQDEwpvcmFuZ2Utc2RrMCowBQYDK2VwAyEA0IP1y98gPByiIMoph1P0G6cctLb864rNXw1LRLOpXXejezB5MA4GA1UdDwEB/wQEAwIFoDAMBgNVHRMBAf8EAjAAMB0GA1UdDgQWBBTaOaPuXmtLDTJVv++VYBiQr9gHCTAfBgNVHSMEGDAWgBTeqtaSVvON53SSFvxMtiCyayiYazAZBgNVHREEEjAQgQ5iZW5Ac3BpcmFsLnh5ejAFBgMrZXADQQCry+1LkA3nrYa1sovS5iFI1Tkpmr/R0nM/4gJtsO93vFOkm3vBEGwjKAV7lrGzFcFbbuyM1wEJPi4Po1XCEG0D";
 
 impl SparkWalletConfig {
-	fn to_breez_config(self, network: Network) -> Result<breez_sdk_spark::Config, TrustedError> {
+	fn into_breez_config(self, network: Network) -> Result<breez_sdk_spark::Config, TrustedError> {
 		let network = match network {
 			Network::Bitcoin => breez_sdk_spark::Network::Mainnet,
 			Network::Regtest => breez_sdk_spark::Network::Regtest,
@@ -75,7 +82,7 @@ impl SparkWalletConfig {
 			real_time_sync_server_url: None,
 			api_key: Some(BREEZ_API_KEY.to_string()),
 			max_deposit_claim_fee: None,
-			lnurl_domain: None,
+			lnurl_domain: self.lnurl_domain,
 			private_enabled_default: true,
 			optimization_config: OptimizationConfig { auto_enabled: true, multiplicity: 1 },
 		})
@@ -253,6 +260,34 @@ impl TrustedWalletInterface for Spark {
 		})
 	}
 
+	fn get_lightning_address(
+		&self,
+	) -> Pin<Box<dyn Future<Output = Result<Option<String>, TrustedError>> + Send + '_>> {
+		Box::pin(async move {
+			match self.spark_wallet.get_lightning_address().await? {
+				None => Ok(None),
+				Some(addr) => Ok(Some(addr.lightning_address)),
+			}
+		})
+	}
+
+	fn register_lightning_address(
+		&self, name: String,
+	) -> Pin<Box<dyn Future<Output = Result<(), TrustedError>> + Send + '_>> {
+		Box::pin(async move {
+			let res = self.get_lightning_address().await?;
+			if res.is_some() {
+				return Err(TrustedError::Other(
+					"Wallet already has a lightning address".to_string(),
+				));
+			}
+
+			let params = RegisterLightningAddressRequest { username: name, description: None };
+			self.spark_wallet.register_lightning_address(params).await?;
+			Ok(())
+		})
+	}
+
 	fn stop(&self) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
 		Box::pin(async move {
 			log_info!(self.logger, "Stopping Spark wallet");
@@ -268,7 +303,8 @@ impl Spark {
 		event_queue: Arc<EventQueue>, tx_metadata: TxMetadataStore, logger: Arc<Logger>,
 		runtime: Arc<Runtime>,
 	) -> Result<Self, InitFailure> {
-		let spark_config: breez_sdk_spark::Config = spark_config.to_breez_config(config.network)?;
+		let spark_config: breez_sdk_spark::Config =
+			spark_config.into_breez_config(config.network)?;
 
 		let seed = match &config.seed {
 			Seed::Seed64(bytes) => breez_sdk_spark::Seed::Entropy(bytes.to_vec()),

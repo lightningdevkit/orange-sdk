@@ -21,6 +21,7 @@ use bitcoin_payment_instructions::amount::Amount;
 
 use cdk::amount::SplitTarget;
 use cdk::nuts::MeltOptions;
+use cdk::nuts::nut00::PaymentMethod as CdkPaymentMethod;
 use cdk::nuts::nut23::Amountless;
 use cdk::nuts::{CurrencyUnit, MeltQuoteState};
 use cdk::wallet::MintQuote;
@@ -51,6 +52,8 @@ pub struct CashuConfig {
 	pub mint_url: String,
 	/// The currency unit to use (typically Sat)
 	pub unit: CurrencyUnit,
+	/// Optional npub.cash URL for lightning address support (e.g., `https://npubx.cash`)
+	pub npubcash_url: Option<String>,
 }
 
 /// A wallet implementation using the Cashu (CDK) SDK.
@@ -62,11 +65,13 @@ pub struct Cashu {
 	payment_success_sender: watch::Sender<()>,
 	payment_success_flag: watch::Receiver<()>,
 	logger: Arc<Logger>,
-	supports_bolt12: bool,
+	supports_bolt12: Arc<std::sync::atomic::AtomicBool>,
 	mint_quote_sender: mpsc::Sender<MintQuote>,
 	event_queue: Arc<EventQueue>,
 	tx_metadata: TxMetadataStore,
 	runtime: Arc<Runtime>,
+	npubcash_url: Option<String>,
+	npub: Option<String>,
 }
 
 impl TrustedWalletInterface for Cashu {
@@ -86,14 +91,17 @@ impl TrustedWalletInterface for Cashu {
 		&self,
 	) -> Pin<Box<dyn Future<Output = Result<String, TrustedError>> + Send + '_>> {
 		Box::pin(async move {
-			if !self.supports_bolt12 {
+			if !self.supports_bolt12.load(std::sync::atomic::Ordering::Relaxed) {
 				return Err(TrustedError::UnsupportedOperation(
 					"Cashu mint does not support BOLT 12".to_owned(),
 				));
 			}
 
-			let mint_quote =
-				self.cashu_wallet.mint_bolt12_quote(None, None).await.map_err(|e| {
+			let mint_quote = self
+				.cashu_wallet
+				.mint_quote(CdkPaymentMethod::BOLT12, None, None, None)
+				.await
+				.map_err(|e| {
 					TrustedError::WalletOperationFailed(format!("Failed to create mint quote: {e}"))
 				})?;
 
@@ -134,8 +142,11 @@ impl TrustedWalletInterface for Cashu {
 							)));
 						},
 					};
-					let quote =
-						self.cashu_wallet.mint_quote(cdk_amount, None).await.map_err(|e| {
+					let quote = self
+						.cashu_wallet
+						.mint_quote(CdkPaymentMethod::BOLT11, Some(cdk_amount), None, None)
+						.await
+						.map_err(|e| {
 							TrustedError::WalletOperationFailed(format!(
 								"Failed to create mint quote: {e}"
 							))
@@ -191,7 +202,12 @@ impl TrustedWalletInterface for Cashu {
 				PaymentMethod::LightningBolt11(invoice) => {
 					let quote = self
 						.cashu_wallet
-						.melt_quote(invoice.to_string(), melt_options)
+						.melt_quote(
+							CdkPaymentMethod::BOLT11,
+							invoice.to_string(),
+							melt_options,
+							None,
+						)
 						.await
 						.map_err(|e| {
 							TrustedError::WalletOperationFailed(format!(
@@ -205,7 +221,7 @@ impl TrustedWalletInterface for Cashu {
 				PaymentMethod::LightningBolt12(offer) => {
 					let quote = self
 						.cashu_wallet
-						.melt_bolt12_quote(offer.to_string(), melt_options)
+						.melt_quote(CdkPaymentMethod::BOLT12, offer.to_string(), melt_options, None)
 						.await
 						.map_err(|e| {
 							TrustedError::WalletOperationFailed(format!(
@@ -253,7 +269,12 @@ impl TrustedWalletInterface for Cashu {
 						Some(q) => q,
 						None => self
 							.cashu_wallet
-							.melt_quote(invoice.to_string(), melt_options)
+							.melt_quote(
+								CdkPaymentMethod::BOLT11,
+								invoice.to_string(),
+								melt_options,
+								None,
+							)
 							.await
 							.map_err(|e| {
 								TrustedError::WalletOperationFailed(format!(
@@ -263,7 +284,7 @@ impl TrustedWalletInterface for Cashu {
 					}
 				},
 				PaymentMethod::LightningBolt12(offer) => {
-					if !self.supports_bolt12 {
+					if !self.supports_bolt12.load(std::sync::atomic::Ordering::Relaxed) {
 						return Err(TrustedError::UnsupportedOperation(
 							"Cashu mint does not support BOLT 12".to_owned(),
 						));
@@ -272,7 +293,7 @@ impl TrustedWalletInterface for Cashu {
 					// todo probably should check for existing active quote here as well
 
 					self.cashu_wallet
-						.melt_bolt12_quote(offer.to_string(), melt_options)
+						.melt_quote(CdkPaymentMethod::BOLT12, offer.to_string(), melt_options, None)
 						.await
 						.map_err(|e| {
 							TrustedError::WalletOperationFailed(format!(
@@ -304,9 +325,14 @@ impl TrustedWalletInterface for Cashu {
 					metadata.insert(PAYMENT_HASH_METADATA_KEY.to_string(), hash.to_string());
 				}
 
-				match cashu_wallet.melt_with_metadata(&quote_id, metadata).await {
+				let melt_result = async {
+					let prepared = cashu_wallet.prepare_melt(&quote_id, metadata).await?;
+					prepared.confirm().await
+				}
+				.await;
+				match melt_result {
 					Ok(res) => {
-						match res.state {
+						match res.state() {
 							MeltQuoteState::Paid => {
 								log_info!(logger, "Successfully sent for quote: {quote_id}");
 
@@ -321,14 +347,14 @@ impl TrustedWalletInterface for Cashu {
 									return;
 								}
 
-								let preimage: Option<PaymentPreimage> = match &res.preimage {
+								let preimage: Option<PaymentPreimage> = match res.payment_proof() {
 									Some(str) => match FromHex::from_hex(str) {
 										Ok(b) => Some(PaymentPreimage(b)),
 										Err(e) => {
 											log_error!(
 												logger,
 												"Failed to decode preimage ({:?}) for quote {quote_id}: {e}",
-												res.preimage
+												res.payment_proof()
 											);
 											None
 										},
@@ -379,7 +405,7 @@ impl TrustedWalletInterface for Cashu {
 									);
 								}
 
-								let fee_paid_sat: u64 = res.fee_paid.into();
+								let fee_paid_sat: u64 = res.fee_paid().into();
 								let _ = event_queue
 									.add_event(Event::PaymentSuccessful {
 										payment_id,
@@ -472,6 +498,35 @@ impl TrustedWalletInterface for Cashu {
 		})
 	}
 
+	fn get_lightning_address(
+		&self,
+	) -> Pin<Box<dyn Future<Output = Result<Option<String>, TrustedError>> + Send + '_>> {
+		Box::pin(async {
+			match (&self.npubcash_url, &self.npub) {
+				(Some(url), Some(npub)) => {
+					let domain = url.trim_start_matches("https://").trim_start_matches("http://");
+					Ok(Some(format!("{npub}@{domain}")))
+				},
+				_ => Ok(None),
+			}
+		})
+	}
+
+	fn register_lightning_address(
+		&self, _name: String,
+	) -> Pin<Box<dyn Future<Output = Result<(), TrustedError>> + Send + '_>> {
+		Box::pin(async {
+			if self.npubcash_url.is_none() {
+				return Err(TrustedError::UnsupportedOperation(
+					"npubcash_url is not configured".to_string(),
+				));
+			}
+			// npub.cash addresses are deterministic from the Nostr keys,
+			// and set_mint_url is called during init. Nothing to do here.
+			Ok(())
+		})
+	}
+
 	fn stop(&self) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
 		Box::pin(async move {
 			log_info!(self.logger, "Stopping Cashu wallet");
@@ -530,15 +585,18 @@ impl Cashu {
 				})?,
 		);
 
-		let supports_bolt12 = cashu_wallet
-			.fetch_mint_info()
-			.await
-			.ok()
-			.flatten()
-			.map(|info| {
-				info.nuts.nut04.supported_methods().contains(&&cdk::nuts::PaymentMethod::Bolt12)
-			})
-			.unwrap_or(false);
+		let supports_bolt12 = Arc::new(std::sync::atomic::AtomicBool::new(false));
+		{
+			let w = Arc::clone(&cashu_wallet);
+			let flag = Arc::clone(&supports_bolt12);
+			runtime.spawn_cancellable_background_task(async move {
+				if let Some(info) = w.fetch_mint_info().await.ok().flatten() {
+					if info.nuts.nut04.supported_methods().contains(&&CdkPaymentMethod::BOLT12) {
+						flag.store(true, std::sync::atomic::Ordering::Relaxed);
+					}
+				}
+			});
+		}
 
 		let (shutdown_sender, mut shutdown_receiver) = watch::channel::<()>(());
 		let (payment_success_sender, payment_success_flag) = watch::channel(());
@@ -604,14 +662,74 @@ impl Cashu {
 			runtime.spawn_background_task(async move {
 				match w.restore().await {
 					Err(e) => log_error!(l, "Failed to restore cashu mint: {e}"),
-					Ok(amt) => {
-						if amt > cdk::Amount::ZERO {
-							log_info!(l, "Restored cashu mint: {}, amt: {amt}", w.mint_url);
+					Ok(restored) => {
+						if restored.unspent > cdk::Amount::ZERO {
+							log_info!(l, "Restored cashu mint: {}: {:#?}", w.mint_url, restored);
 						}
 						if let Err(e) = write_has_recovered(&store, true).await {
 							log_error!(l, "Failed to write has_recovered flag: {e:?}");
 						}
 					},
+				}
+			});
+		}
+
+		// Initialize npub.cash if configured
+		let npubcash_url = cashu_config.npubcash_url.clone();
+		let mut npub: Option<String> = None;
+
+		if let Some(ref url) = npubcash_url {
+			npub = Some(Self::derive_npub(&seed).map_err(|e| {
+				InitFailure::TrustedFailure(TrustedError::WalletOperationFailed(format!(
+					"Failed to derive npub: {e}"
+				)))
+			})?);
+
+			// Enable npub.cash and start polling in background to avoid blocking init
+			let wallet_for_npubcash = Arc::clone(&cashu_wallet);
+			let sender_for_npubcash = mint_quote_sender.clone();
+			let logger_for_npubcash = Arc::clone(&logger);
+			let mut shutdown_for_npubcash = shutdown_sender.subscribe();
+			let url = url.clone();
+			runtime.spawn_cancellable_background_task(async move {
+				if let Err(e) = wallet_for_npubcash.enable_npubcash(url.clone()).await {
+					log_error!(logger_for_npubcash, "Failed to enable npub.cash: {e}");
+					return;
+				}
+				log_info!(logger_for_npubcash, "npub.cash enabled with URL: {url}");
+
+				let poll_interval = Duration::from_secs(30);
+				let mut interval = tokio::time::interval(poll_interval);
+				loop {
+					tokio::select! {
+						_ = shutdown_for_npubcash.changed() => {
+							log_info!(logger_for_npubcash, "npub.cash polling shutdown");
+							return;
+						}
+						_ = interval.tick() => {
+							match wallet_for_npubcash.sync_npubcash_quotes().await {
+								Ok(quotes) => {
+									for quote in quotes {
+										if matches!(quote.state, cdk::nuts::MintQuoteState::Paid) {
+											let id = quote.id.clone();
+											if let Err(e) = sender_for_npubcash.send(quote).await {
+												log_error!(
+													logger_for_npubcash,
+													"Failed to send npub.cash quote {id} for monitoring: {e}"
+												);
+											}
+										}
+									}
+								},
+								Err(e) => {
+									log_error!(
+										logger_for_npubcash,
+										"Failed to sync npub.cash quotes: {e}"
+									);
+								},
+							}
+						}
+					}
 				}
 			});
 		}
@@ -628,7 +746,25 @@ impl Cashu {
 			event_queue,
 			tx_metadata,
 			runtime,
+			npubcash_url,
+			npub,
 		})
+	}
+
+	/// Derive the npub (bech32-encoded Nostr public key) from the wallet seed.
+	///
+	/// Uses the same derivation as CDK's `derive_npubcash_keys`: the first 32 bytes
+	/// of the seed as a secp256k1 secret key, then bech32-encodes the x-only public key.
+	fn derive_npub(seed: &[u8; 64]) -> Result<String, String> {
+		use ldk_node::bitcoin::bech32::{Bech32, Hrp, encode};
+		use ldk_node::bitcoin::secp256k1::{Secp256k1, SecretKey};
+
+		let sk =
+			SecretKey::from_slice(&seed[..32]).map_err(|e| format!("Invalid secret key: {e}"))?;
+		let secp = Secp256k1::new();
+		let (xonly, _) = sk.public_key(&secp).x_only_public_key();
+		let hrp = Hrp::parse("npub").expect("valid hrp");
+		encode::<Bech32>(hrp, &xonly.serialize()).map_err(|e| format!("bech32 encode: {e}"))
 	}
 
 	/// Convert an ID string to a 32-byte array

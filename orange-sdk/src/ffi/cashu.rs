@@ -45,24 +45,34 @@ pub struct CashuConfig {
 	pub mint_url: String,
 	/// The currency unit to use (typically Sat)
 	pub unit: CurrencyUnit,
+	/// Optional npub.cash URL for lightning address support
+	pub npubcash_url: Option<String>,
 }
 
 #[uniffi::export]
 impl CashuConfig {
 	#[uniffi::constructor]
-	pub fn new(mint_url: String, unit: CurrencyUnit) -> Self {
-		CashuConfig { mint_url, unit }
+	pub fn new(mint_url: String, unit: CurrencyUnit, npubcash_url: Option<String>) -> Self {
+		CashuConfig { mint_url, unit, npubcash_url }
 	}
 }
 
 impl From<CashuConfig> for OrangeCashuConfig {
 	fn from(config: CashuConfig) -> Self {
-		OrangeCashuConfig { mint_url: config.mint_url, unit: config.unit.into() }
+		OrangeCashuConfig {
+			mint_url: config.mint_url,
+			unit: config.unit.into(),
+			npubcash_url: config.npubcash_url,
+		}
 	}
 }
 
 impl From<OrangeCashuConfig> for CashuConfig {
 	fn from(config: OrangeCashuConfig) -> Self {
-		CashuConfig { mint_url: config.mint_url, unit: config.unit.into() }
+		CashuConfig {
+			mint_url: config.mint_url,
+			unit: config.unit.into(),
+			npubcash_url: config.npubcash_url,
+		}
 	}
 }

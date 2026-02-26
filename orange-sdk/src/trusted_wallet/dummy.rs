@@ -412,6 +412,22 @@ impl TrustedWalletInterface for DummyTrustedWallet {
 		})
 	}
 
+	fn get_lightning_address(
+		&self,
+	) -> Pin<Box<dyn Future<Output = Result<Option<String>, TrustedError>> + Send + '_>> {
+		Box::pin(async { Ok(None) })
+	}
+
+	fn register_lightning_address(
+		&self, _name: String,
+	) -> Pin<Box<dyn Future<Output = Result<(), TrustedError>> + Send + '_>> {
+		Box::pin(async {
+			Err(TrustedError::UnsupportedOperation(
+				"register_lightning_address is not supported in DummyTrustedWallet".to_string(),
+			))
+		})
+	}
+
 	fn stop(&self) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
 		Box::pin(async move {
 			let _ = self.ldk_node.stop();

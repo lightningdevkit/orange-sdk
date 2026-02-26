@@ -296,4 +296,16 @@ impl Wallet {
 	pub fn event_handled(&self) -> bool {
 		self.inner.event_handled().is_ok()
 	}
+
+	/// Gets the lightning address for this wallet, if one is set.
+	pub async fn get_lightning_address(&self) -> Result<Option<String>, WalletError> {
+		let result = self.inner.get_lightning_address().await?;
+		Ok(result)
+	}
+
+	/// Attempts to register the lightning address for this wallet.
+	pub async fn register_lightning_address(&self, name: String) -> Result<(), WalletError> {
+		self.inner.register_lightning_address(name).await?;
+		Ok(())
+	}
 }

@@ -289,7 +289,10 @@ where
 	test(params.clone()).await;
 
 	// Always clean up
-	params.stop().await;
+	let timeout = Duration::from_secs(10);
+	if tokio::time::timeout(timeout, params.stop()).await.is_err() {
+		eprintln!("Warning: parms stop timed out after {timeout:?}");
+	}
 }
 
 async fn build_test_nodes() -> TestParams {
@@ -373,7 +376,7 @@ async fn build_test_nodes() -> TestParams {
 			t.local_addr().unwrap().port()
 		};
 		let cdk_addr = SocketAddr::from_str(format!("127.0.0.1:{cdk_port}").as_str()).unwrap();
-		let cdk = cdk_ldk_node::CdkLdkNode::new(
+		let cdk = cdk_ldk_node::CdkLdkNodeBuilder::new(
 			Network::Regtest,
 			cdk_ldk_node::ChainSource::BitcoinRpc(BitcoinRpcConfig {
 				host: "127.0.0.1".to_string(),
@@ -385,8 +388,8 @@ async fn build_test_nodes() -> TestParams {
 			tmp.to_str().unwrap().to_string(),
 			FeeReserve { min_fee_reserve: Default::default(), percent_fee_reserve: 0.0 },
 			vec![cdk_addr.into()],
-			None,
 		)
+		.build()
 		.unwrap();
 		let cdk = Arc::new(cdk);
 
@@ -408,7 +411,7 @@ async fn build_test_nodes() -> TestParams {
 			builder
 				.add_payment_processor(
 					orange_sdk::CurrencyUnit::Sat,
-					cdk::nuts::PaymentMethod::Bolt11,
+					cdk::nuts::PaymentMethod::BOLT11,
 					MintMeltLimits::new(0, u64::MAX),
 					cdk.clone(),
 				)
@@ -418,7 +421,7 @@ async fn build_test_nodes() -> TestParams {
 			builder
 				.add_payment_processor(
 					orange_sdk::CurrencyUnit::Sat,
-					cdk::nuts::PaymentMethod::Bolt12,
+					cdk::nuts::PaymentMethod::BOLT12,
 					MintMeltLimits::new(0, u64::MAX),
 					cdk.clone(),
 				)
@@ -431,7 +434,12 @@ async fn build_test_nodes() -> TestParams {
 
 			let listener = tokio::net::TcpListener::bind(mint_addr).await.unwrap();
 
-			let v1_service = cdk_axum::create_mint_router(Arc::clone(&mint), true).await.unwrap();
+			let v1_service = cdk_axum::create_mint_router(
+				Arc::clone(&mint),
+				vec!["bolt11".to_string(), "bolt12".to_string()],
+			)
+			.await
+			.unwrap();
 
 			let axum_result = axum::serve(listener, v1_service);
 
@@ -498,6 +506,7 @@ async fn build_test_nodes() -> TestParams {
 			extra_config: ExtraConfig::Cashu(orange_sdk::CashuConfig {
 				mint_url: format!("http://127.0.0.1:{}", mint_addr.port()),
 				unit: orange_sdk::CurrencyUnit::Sat,
+				npubcash_url: None,
 			}),
 		};
 		let wallet = Arc::new(Wallet::new(wallet_config).await.unwrap());
