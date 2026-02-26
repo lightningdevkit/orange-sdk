@@ -289,7 +289,10 @@ where
 	test(params.clone()).await;
 
 	// Always clean up
-	params.stop().await;
+	let timeout = Duration::from_secs(10);
+	if tokio::time::timeout(timeout, params.stop()).await.is_err() {
+		eprintln!("Warning: parms stop timed out after {timeout:?}");
+	}
 }
 
 async fn build_test_nodes() -> TestParams {
