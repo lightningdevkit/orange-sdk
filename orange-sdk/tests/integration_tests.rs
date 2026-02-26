@@ -441,9 +441,9 @@ async fn test_receive_onchain() {
 		// a rebalance should be initiated, we need to mine the channel opening transaction
 		// for it to be confirmed and reflected in the wallet's history
 		generate_blocks(&bitcoind, &electrsd, 6).await;
-		tokio::time::sleep(Duration::from_secs(5)).await; // wait for sync
+		wallet.sync_ln_wallet().unwrap();
 		generate_blocks(&bitcoind, &electrsd, 6).await; // confirm the channel opening transaction
-		tokio::time::sleep(Duration::from_secs(5)).await; // wait for sync
+		wallet.sync_ln_wallet().unwrap();
 
 		//  wait for rebalance to be initiated
 		println!("waiting for channel opened event");
@@ -553,7 +553,7 @@ async fn test_receive_to_onchain_with_channel() {
 
 		// confirm splice
 		generate_blocks(&bitcoind, &electrsd, 6).await;
-		tokio::time::sleep(Duration::from_secs(5)).await;
+		wallet.sync_ln_wallet().unwrap();
 
 		let event = wait_next_event(&wallet).await;
 		match event {
@@ -562,8 +562,6 @@ async fn test_receive_to_onchain_with_channel() {
 			},
 			ev => panic!("Expected ChannelOpened event, got {ev:?}"),
 		}
-
-		wallet.sync_ln_wallet().unwrap();
 
 		let txs = wallet.list_transactions().await.unwrap();
 		assert_eq!(txs.len(), 2);
@@ -839,14 +837,9 @@ async fn test_pay_onchain_from_self_custody() {
 		let info = PaymentInfo::build(instr, Some(send_amount)).unwrap();
 		wallet.pay(&info).await.unwrap();
 
-		// sleep for a second to wait for proper broadcast
-		tokio::time::sleep(Duration::from_secs(1)).await;
-
 		// confirm the tx
 		generate_blocks(&bitcoind, &electrsd, 6).await;
-
-		// sleep for a second to wait for sync
-		tokio::time::sleep(Duration::from_secs(1)).await;
+		wallet.sync_ln_wallet().unwrap();
 
 		// wait for payment to complete
 		test_utils::wait_for_condition("on-chain payment completion", || async {
@@ -945,14 +938,9 @@ async fn test_pay_onchain_from_channel() {
 		let info = PaymentInfo::build(instr, Some(send_amount)).unwrap();
 		wallet.pay(&info).await.unwrap();
 
-		// sleep for a second to wait for proper broadcast
-		tokio::time::sleep(Duration::from_secs(1)).await;
-
 		// confirm the tx
 		generate_blocks(&bitcoind, &electrsd, 6).await;
-
-		// sleep for a second to wait for sync
-		tokio::time::sleep(Duration::from_secs(1)).await;
+		wallet.sync_ln_wallet().unwrap();
 
 		// wait for payment to complete
 		test_utils::wait_for_condition("on-chain payment completion", || async {

@@ -33,21 +33,30 @@ use std::sync::Arc;
 use std::time::Duration;
 use uuid::Uuid;
 
-/// Waits for an async condition to be true, polling at a specified interval until a timeout.
+/// Waits for an async condition to be true, polling with exponential backoff until a timeout.
 pub async fn wait_for_condition<F, Fut>(condition_name: &str, mut condition: F)
 where
 	F: FnMut() -> Fut,
 	Fut: Future<Output = bool>,
 {
-	// longer timeout if running in CI as things can be slower there
-	let iterations = if std::env::var("CI").is_ok() { 120 } else { 20 };
-	for _ in 0..iterations {
+	let timeout = if std::env::var("CI").is_ok() {
+		Duration::from_secs(120)
+	} else {
+		Duration::from_secs(20)
+	};
+	let start = tokio::time::Instant::now();
+	let mut delay = Duration::from_millis(50);
+	loop {
 		if condition().await {
 			return;
 		}
-		tokio::time::sleep(Duration::from_secs(1)).await;
+		if start.elapsed() >= timeout {
+			panic!("Timeout waiting for condition: {condition_name}");
+		}
+		tokio::time::sleep(delay).await;
+		// Exponential backoff, cap at 1 second
+		delay = (delay * 2).min(Duration::from_secs(1));
 	}
-	panic!("Timeout waiting for condition: {condition_name}");
 }
 
 /// Waits for the next event from the wallet, polling every second for up to 20 seconds.
@@ -84,11 +93,11 @@ async fn create_bitcoind(uuid: Uuid) -> (Arc<Bitcoind>, Arc<ElectrsD>) {
 		ElectrsD::with_conf(electrsd::downloaded_exe_path().unwrap(), &bitcoind, &electrsd_conf)
 			.unwrap_or_else(|_| panic!("Failed to start electrsd for test {uuid}"));
 
-	// mine 101 blocks to get some spendable funds, split it up into multiple calls
+	// mine 101 blocks to get some spendable funds, split it up into batches
 	// to avoid potentially hitting RPC timeouts on slower CI systems
 	let address = bitcoind.client.new_address().unwrap();
-	for _ in 0..101 {
-		let _block_hashes = bitcoind.client.generate_to_address(1, &address).unwrap();
+	for batch_size in [50, 51] {
+		let _block_hashes = bitcoind.client.generate_to_address(batch_size, &address).unwrap();
 	}
 
 	wait_for_block(&electrsd.client, 101).await;
@@ -305,7 +314,7 @@ async fn build_test_nodes() -> TestParams {
 
 	// open a channel from payer to LSP
 	third_party.open_channel(lsp.node_id(), lsp_listen.clone(), 10_000_000, None, None).unwrap();
-	wait_for_tx_broadcast(&bitcoind);
+	wait_for_tx_broadcast(&bitcoind).await;
 	generate_blocks(&bitcoind, &electrsd, 6).await;
 
 	// wait for channel ready (needs blocking wait as we are not in async context here)
@@ -457,7 +466,7 @@ async fn build_test_nodes() -> TestParams {
 					None,
 				)
 				.unwrap();
-			wait_for_tx_broadcast(&bitcoind_clone);
+			wait_for_tx_broadcast(&bitcoind_clone).await;
 			generate_blocks(&bitcoind_clone, &electrsd, 6).await;
 
 			// wait for sync/channel ready
@@ -542,14 +551,24 @@ pub async fn open_channel_from_lsp(wallet: &orange_sdk::Wallet, payer: Arc<Node>
 	recv_amt
 }
 
-fn wait_for_tx_broadcast(bitcoind: &Bitcoind) {
-	let iterations = if std::env::var("CI").is_ok() { 120 } else { 10 };
-	for _ in 0..iterations {
+async fn wait_for_tx_broadcast(bitcoind: &Bitcoind) {
+	let timeout = if std::env::var("CI").is_ok() {
+		Duration::from_secs(30)
+	} else {
+		Duration::from_millis(2500)
+	};
+	let start = tokio::time::Instant::now();
+	let mut delay = Duration::from_millis(50);
+	loop {
 		let num_txs = bitcoind.client.get_mempool_info().unwrap().size;
 		if num_txs > 0 {
 			break;
 		}
-		std::thread::sleep(Duration::from_millis(250));
+		if start.elapsed() >= timeout {
+			panic!("Timeout waiting for tx broadcast");
+		}
+		tokio::time::sleep(delay).await;
+		delay = (delay * 2).min(Duration::from_millis(500));
 	}
 }
 
