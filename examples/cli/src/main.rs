@@ -28,7 +28,7 @@ struct Cli {
 	cashu: bool,
 	/// Cashu mint URL (requires --cashu)
 	#[arg(long, requires = "cashu")]
-	mint_url: String,
+	mint_url: Option<String>,
 	/// npub.cash URL for lightning address support (requires --cashu)
 	#[arg(long, requires = "cashu")]
 	npubcash_url: Option<String>,
@@ -90,8 +90,12 @@ fn get_config(network: Network, cli: &Cli) -> Result<WalletConfig> {
 	let seed = generate_or_load_seed(&storage_path)?;
 
 	let extra_config = if cli.cashu {
+		let mint_url = cli
+			.mint_url
+			.clone()
+			.ok_or_else(|| anyhow::anyhow!("--mint_url is required when using --cashu"))?;
 		ExtraConfig::Cashu(CashuConfig {
-			mint_url: cli.mint_url.clone(),
+			mint_url,
 			unit: CurrencyUnit::Sat,
 			npubcash_url: cli.npubcash_url.clone(),
 		})
