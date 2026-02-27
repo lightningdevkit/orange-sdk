@@ -85,6 +85,9 @@ impl SparkWalletConfig {
 			lnurl_domain: self.lnurl_domain,
 			private_enabled_default: true,
 			optimization_config: OptimizationConfig { auto_enabled: true, multiplicity: 1 },
+			stable_balance_config: None,
+			max_concurrent_claims: 4,
+			support_lnurl_verify: false,
 		})
 	}
 }
@@ -138,6 +141,7 @@ impl TrustedWalletInterface for Spark {
 					description: "".to_string(), // empty description for smaller QRs and better privacy
 					amount_sats,
 					expiry_secs: None,
+					payment_hash: None,
 				},
 			};
 			let res = self.spark_wallet.receive_payment(params).await?;
@@ -176,6 +180,7 @@ impl TrustedWalletInterface for Spark {
 					amount: Some(sats.into()),
 					token_identifier: None,
 					conversion_options: None,
+					fee_policy: None,
 				};
 				let prepare = self.spark_wallet.prepare_send_payment(params).await?;
 				match prepare.payment_method {
@@ -209,6 +214,7 @@ impl TrustedWalletInterface for Spark {
 					amount: Some(sats.into()),
 					token_identifier: None,
 					conversion_options: None,
+					fee_policy: None,
 				};
 				let prepare = self.spark_wallet.prepare_send_payment(params).await?;
 
@@ -240,8 +246,9 @@ impl TrustedWalletInterface for Spark {
 					self.spark_wallet.list_payments(ListPaymentsRequest::default()).await.ok()?;
 
 				let tx = res.payments.into_iter().find(|p| {
-					if let Some(PaymentDetails::Lightning { payment_hash: ph, .. }) = &p.details {
-						let hash: Option<[u8; 32]> = FromHex::from_hex(ph).ok();
+					if let Some(PaymentDetails::Lightning { htlc_details, .. }) = &p.details {
+						let hash: Option<[u8; 32]> =
+							FromHex::from_hex(&htlc_details.payment_hash).ok();
 						hash == Some(payment_hash)
 					} else {
 						false
@@ -412,7 +419,7 @@ impl SparkEventHandler {
 		match payment.payment_type {
 			PaymentType::Send => {
 				match payment.details {
-					Some(PaymentDetails::Lightning { preimage, payment_hash, .. }) => {
+					Some(PaymentDetails::Lightning { htlc_details, .. }) => {
 						let payment_id = PaymentId::Trusted(id);
 						let is_rebalance = {
 							let map = self.tx_metadata.read();
@@ -429,17 +436,17 @@ impl SparkEventHandler {
 							return Ok(());
 						}
 
-						let preimage = preimage.ok_or_else(|| {
+						let preimage_hex = htlc_details.preimage.ok_or_else(|| {
 							TrustedError::Other(
 								"Payment succeeded but preimage is missing".to_string(),
 							)
 						})?;
 
-						let preimage: [u8; 32] = FromHex::from_hex(&preimage).map_err(|e| {
+						let preimage: [u8; 32] = FromHex::from_hex(&preimage_hex).map_err(|e| {
 							TrustedError::Other(format!("Invalid preimage hex: {e:?}"))
 						})?;
-						let payment_hash: [u8; 32] =
-							FromHex::from_hex(&payment_hash).map_err(|e| {
+						let payment_hash: [u8; 32] = FromHex::from_hex(&htlc_details.payment_hash)
+							.map_err(|e| {
 								TrustedError::Other(format!("Invalid payment_hash hex: {e:?}"))
 							})?;
 
@@ -468,9 +475,9 @@ impl SparkEventHandler {
 			},
 			PaymentType::Receive => {
 				match payment.details {
-					Some(PaymentDetails::Lightning { payment_hash, .. }) => {
-						let payment_hash: [u8; 32] =
-							FromHex::from_hex(&payment_hash).map_err(|e| {
+					Some(PaymentDetails::Lightning { htlc_details, .. }) => {
+						let payment_hash: [u8; 32] = FromHex::from_hex(&htlc_details.payment_hash)
+							.map_err(|e| {
 								TrustedError::Other(format!("Invalid payment_hash hex: {e:?}"))
 							})?;
 
@@ -512,7 +519,7 @@ impl SparkEventHandler {
 
 		match payment.payment_type {
 			PaymentType::Send => match payment.details {
-				Some(PaymentDetails::Lightning { payment_hash, .. }) => {
+				Some(PaymentDetails::Lightning { htlc_details, .. }) => {
 					let payment_id = PaymentId::Trusted(id);
 					let is_rebalance = {
 						let map = self.tx_metadata.read();
@@ -527,9 +534,10 @@ impl SparkEventHandler {
 						return Ok(());
 					}
 
-					let payment_hash: [u8; 32] = FromHex::from_hex(&payment_hash).map_err(|e| {
-						TrustedError::Other(format!("Invalid payment_hash hex: {e:?}"))
-					})?;
+					let payment_hash: [u8; 32] = FromHex::from_hex(&htlc_details.payment_hash)
+						.map_err(|e| {
+							TrustedError::Other(format!("Invalid payment_hash hex: {e:?}"))
+						})?;
 
 					self.event_queue
 						.add_event(Event::PaymentFailed {

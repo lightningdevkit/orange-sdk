@@ -28,7 +28,7 @@ lightning-macros = "0.2.0"
 bitcoin-payment-instructions = { workspace = true, features = ["http"] }
 chrono = { version = "0.4", default-features = false }
 rand = { version = "0.8.5", optional = true }
-breez-sdk-spark = { git = "https://github.com/breez/spark-sdk.git", rev = "ef76a0bc517bea38fafaff8f657e82b5b52569b9", default-features = false, features = ["rustls-tls"], optional = true }
+breez-sdk-spark = { git = "https://github.com/breez/spark-sdk.git", rev = "1000f276d2f16592b5f6eb8fce29228f34ff88bf", default-features = false, optional = true }
 tokio = { version = "1.0", default-features = false, features = ["rt-multi-thread", "sync", "macros"] }
 uuid = { version = "1.0", default-features = false, optional = true }
 cdk = { version = "0.15.1", default-features = false, features = ["wallet"], optional = true }
