@@ -2,6 +2,7 @@
 
 use crate::EventQueue;
 use crate::bitcoin::hashes::Hash;
+use crate::rebalancer::RebalanceEventHandlerHolder;
 use crate::runtime::Runtime;
 use crate::store::{PaymentId, TxMetadataStore, TxStatus};
 use crate::trusted_wallet::{Payment, TrustedError, TrustedWalletInterface};
@@ -9,11 +10,9 @@ use bitcoin_payment_instructions::PaymentMethod;
 use bitcoin_payment_instructions::amount::Amount;
 use corepc_node::client::bitcoin::Network;
 use corepc_node::{Node as Bitcoind, get_available_port};
-use graduated_rebalancer::ReceivedLightningPayment;
-use ldk_node::lightning::ln::channelmanager;
 use ldk_node::lightning::ln::msgs::SocketAddress;
 use ldk_node::lightning_invoice::{Bolt11Invoice, Bolt11InvoiceDescription, Description};
-use ldk_node::payment::{PaymentKind, PaymentStatus};
+use ldk_node::payment::{PaymentDirection, PaymentKind};
 use ldk_node::{Event, Node};
 use rand::RngCore;
 use std::env::temp_dir;
@@ -21,7 +20,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
-use tokio::sync::{RwLock, watch};
+use tokio::sync::RwLock;
 use uuid::Uuid;
 
 /// A dummy implementation of `TrustedWalletInterface` for testing purposes.
@@ -32,7 +31,6 @@ pub(crate) struct DummyTrustedWallet {
 	current_bal_msats: Arc<AtomicU64>,
 	payments: Arc<RwLock<Vec<Payment>>>,
 	ldk_node: Arc<Node>,
-	payment_success_flag: watch::Receiver<()>,
 }
 
 #[derive(Clone)]
@@ -50,7 +48,8 @@ impl DummyTrustedWallet {
 	/// Creates a new `DummyTrustedWallet` instance.
 	pub(crate) async fn new(
 		uuid: Uuid, lsp: &Node, bitcoind: &Bitcoind, tx_metadata: TxMetadataStore,
-		event_queue: Arc<EventQueue>, rt: Arc<Runtime>,
+		event_queue: Arc<EventQueue>, rebalance_event_handler: RebalanceEventHandlerHolder,
+		rt: Arc<Runtime>,
 	) -> Self {
 		let mut builder = ldk_node::Builder::new();
 		builder.set_network(Network::Regtest);
@@ -81,11 +80,10 @@ impl DummyTrustedWallet {
 		let current_bal_msats = Arc::new(AtomicU64::new(0));
 		let payments: Arc<RwLock<Vec<Payment>>> = Arc::new(RwLock::new(vec![]));
 
-		let (payment_success_sender, payment_success_flag) = watch::channel(());
-
 		let events_ref = Arc::clone(&ldk_node);
 		let bal = Arc::clone(&current_bal_msats);
 		let pays = Arc::clone(&payments);
+		let rebalance_handler = Arc::clone(&rebalance_event_handler);
 		rt.spawn_cancellable_background_task(async move {
 			loop {
 				let event = events_ref.next_event_async().await;
@@ -114,6 +112,16 @@ impl DummyTrustedWallet {
 							map.get(&payment_id).is_some_and(|m| m.ty.is_rebalance())
 						};
 
+						// Notify rebalancer if this is a rebalance payment
+						if is_rebalance {
+							println!(
+								"Notifying rebalancer of successful trusted payment: {payment_id:?}"
+							);
+							rebalance_handler
+								.notify_trusted_payment_sent(payment_hash.0, fee_paid_msat)
+								.await;
+						}
+
 						// Send a PaymentSuccessful event if not a rebalance
 						if !is_rebalance {
 							if tx_metadata
@@ -133,8 +141,6 @@ impl DummyTrustedWallet {
 								.await
 								.unwrap();
 						}
-
-						payment_success_sender.send(()).unwrap();
 					},
 					Event::PaymentFailed { payment_id, payment_hash, reason } => {
 						// convert id
@@ -154,8 +160,20 @@ impl DummyTrustedWallet {
 							map.get(&payment_id).is_some_and(|m| m.ty.is_rebalance())
 						};
 
-						// Send a PaymentFailed event if not a rebalance
-						if !is_rebalance {
+						// Notify rebalancer or send event depending on payment type
+						if is_rebalance {
+							println!(
+								"Notifying rebalancer of failed trusted payment: {payment_id:?}"
+							);
+							if let Some(hash) = payment_hash {
+								let reason_str = reason
+									.map(|r| format!("{:?}", r))
+									.unwrap_or_else(|| "Unknown".to_string());
+								rebalance_handler
+									.notify_trusted_payment_failed(hash.0, reason_str)
+									.await;
+							}
+						} else {
 							event_queue
 								.add_event(crate::Event::PaymentFailed {
 									payment_id,
@@ -254,13 +272,7 @@ impl DummyTrustedWallet {
 			panic!("No usable channels found {channels:?}");
 		}
 
-		DummyTrustedWallet { current_bal_msats, payments, ldk_node, payment_success_flag }
-	}
-
-	pub(crate) async fn await_payment_success(&self) {
-		let mut flag = self.payment_success_flag.clone();
-		flag.mark_unchanged();
-		let _ = flag.changed().await;
+		DummyTrustedWallet { current_bal_msats, payments, ldk_node }
 	}
 }
 
@@ -378,40 +390,6 @@ impl TrustedWalletInterface for DummyTrustedWallet {
 		})
 	}
 
-	fn await_payment_success(
-		&self, payment_hash: [u8; 32],
-	) -> Pin<Box<dyn Future<Output = Option<ReceivedLightningPayment>> + Send + '_>> {
-		Box::pin(async move {
-			let id = channelmanager::PaymentId(payment_hash);
-			loop {
-				if let Some(payment) = self.ldk_node.payment(&id) {
-					let counterparty_skimmed_fee_msat = match payment.kind {
-						PaymentKind::Bolt11 { hash, .. } => {
-							debug_assert!(hash.0 == payment_hash, "Payment Hash mismatch");
-							None
-						},
-						PaymentKind::Bolt11Jit { hash, counterparty_skimmed_fee_msat, .. } => {
-							debug_assert!(hash.0 == payment_hash, "Payment Hash mismatch");
-							counterparty_skimmed_fee_msat
-						},
-						_ => return None, /* Ignore other payment kinds, we only care about the one we just sent. */
-					};
-					match payment.status {
-						PaymentStatus::Succeeded => {
-							return Some(ReceivedLightningPayment {
-								id: payment.id.0,
-								fee_paid_msat: counterparty_skimmed_fee_msat,
-							});
-						},
-						PaymentStatus::Pending => {},
-						PaymentStatus::Failed => return None,
-					}
-				}
-				self.await_payment_success().await;
-			}
-		})
-	}
-
 	fn get_lightning_address(
 		&self,
 	) -> Pin<Box<dyn Future<Output = Result<Option<String>, TrustedError>> + Send + '_>> {
@@ -431,6 +409,32 @@ impl TrustedWalletInterface for DummyTrustedWallet {
 	fn stop(&self) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
 		Box::pin(async move {
 			let _ = self.ldk_node.stop();
+		})
+	}
+
+	fn find_payment_by_hash(
+		&self, payment_hash: [u8; 32],
+	) -> Pin<Box<dyn Future<Output = Result<Option<[u8; 32]>, TrustedError>> + Send + '_>> {
+		Box::pin(async move {
+			for payment in self.ldk_node.list_payments() {
+				// Only look at outbound payments
+				if payment.direction != PaymentDirection::Outbound {
+					continue;
+				}
+
+				let hash = match &payment.kind {
+					PaymentKind::Bolt11 { hash, .. } | PaymentKind::Bolt11Jit { hash, .. } => {
+						Some(hash.0)
+					},
+					_ => None,
+				};
+
+				if hash == Some(payment_hash) {
+					return Ok(Some(mangle_payment_id(payment.id.0)));
+				}
+			}
+
+			Ok(None)
 		})
 	}
 }
