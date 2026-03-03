@@ -218,17 +218,29 @@ impl TrustedWalletInterface for Spark {
 				};
 				let prepare = self.spark_wallet.prepare_send_payment(params).await?;
 
-				let res = self
-					.spark_wallet
-					.send_payment(SendPaymentRequest {
-						prepare_response: prepare,
-						options: None,
-						idempotency_key: None,
-					})
-					.await?;
+				let uuid = Uuid::now_v7();
+				// spawn payment send in background since it can take a while and we don't want to block the caller
+				let w = Arc::clone(&self.spark_wallet);
+				let logger = Arc::clone(&self.logger);
+				tokio::spawn(async move {
+					match w
+						.send_payment(SendPaymentRequest {
+							prepare_response: prepare,
+							options: None,
+							idempotency_key: Some(uuid.to_string()),
+						})
+						.await
+					{
+						Ok(res) => {
+							log_info!(logger, "Payment sent successfully: {res:?}");
+						},
+						Err(e) => {
+							log_error!(logger, "Failed to send payment: {e:?}");
+						},
+					}
+				});
 
-				let id = parse_payment_id(&res.payment.id)?;
-				Ok(id)
+				Ok(parse_payment_id(&uuid.to_string())?)
 			} else {
 				Err(TrustedError::UnsupportedOperation(
 					"Only BOLT 11 is currently supported".to_owned(),
