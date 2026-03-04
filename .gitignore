@@ -5,8 +5,12 @@ Cargo.lock
 maven-central-package
 *.so
 
+# macOS system files
+.DS_Store
+
 # Ignore generated swift related files
 .swiftpm/
+.build/
 OrangeSDKFFI.*
 orange_sdk.swift
 liborange_sdk.dylib
