@@ -1,4 +1,25 @@
-//! An implementation of `TrustedWalletInterface` using the Cashu (CDK) SDK.
+//! Cashu ecash trusted wallet backend.
+//!
+//! This module implements [`TrustedWalletInterface`] using the
+//! [Cashu Development Kit (CDK)](https://docs.rs/cdk). Cashu is an ecash protocol where tokens
+//! are issued by a mint and can be used for instant, private payments.
+//!
+//! # Configuration
+//!
+//! Use [`CashuConfig`] to specify:
+//! - `mint_url` – the Cashu mint to connect to
+//! - `unit` – the currency unit (typically `CurrencyUnit::Sat`)
+//! - `npubcash_url` – optional [npub.cash](https://npub.cash) URL for Lightning address support
+//!
+//! # Feature flag
+//!
+//! This module is only available when the `cashu` feature is enabled (disabled by default).
+//! Enable it in your `Cargo.toml`:
+//!
+//! ```toml
+//! [dependencies]
+//! orange-sdk = { version = "0.1", features = ["cashu"] }
+//! ```
 
 use crate::bitcoin::hex::DisplayHex;
 use crate::logging::Logger;
@@ -45,14 +66,30 @@ pub mod cashu_store;
 
 use cashu_store::{CashuKvDatabase, read_has_recovered, write_has_recovered};
 
-/// Configuration for the Cashu wallet
+/// Configuration for the Cashu ecash wallet backend.
+///
+/// # Example
+///
+/// ```rust,no_run
+/// use orange_sdk::trusted_wallet::cashu::CashuConfig;
+/// use orange_sdk::CurrencyUnit;
+///
+/// let config = CashuConfig {
+///     mint_url: "https://mint.example.com".to_string(),
+///     unit: CurrencyUnit::Sat,
+///     npubcash_url: Some("https://npub.cash".to_string()),
+/// };
+/// ```
 #[derive(Debug, Clone)]
 pub struct CashuConfig {
-	/// The mint URL to connect to
+	/// The URL of the Cashu mint to connect to (e.g. `https://mint.example.com`).
 	pub mint_url: String,
-	/// The currency unit to use (typically Sat)
+	/// The currency unit for ecash tokens (typically [`CurrencyUnit::Sat`]).
 	pub unit: CurrencyUnit,
-	/// Optional npub.cash URL for lightning address support (e.g., `https://npubx.cash`)
+	/// Optional [npub.cash](https://npub.cash) URL for Lightning address support.
+	///
+	/// When set, the wallet can register and receive payments via a Lightning address
+	/// backed by the npub.cash service.
 	pub npubcash_url: Option<String>,
 }
 
