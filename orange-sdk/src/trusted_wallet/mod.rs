@@ -1,4 +1,18 @@
-//! This module defines the `TrustedWalletInterface` trait and its associated types.
+//! Trusted wallet backends for the graduated custody model.
+//!
+//! This module defines the [`TrustedWalletInterface`] trait and provides concrete
+//! implementations for different custodial backends:
+//!
+//! - **`spark`** (feature `spark`, enabled by default) – Uses the [Breez Spark SDK](https://breez.technology)
+//!   for custodial Lightning payments with low fees and instant settlement.
+//! - **`cashu`** (feature `cashu`) – Uses the [Cashu Development Kit (CDK)](https://docs.rs/cdk)
+//!   for ecash-based custody via a Cashu mint. Supports [npub.cash](https://npub.cash) for
+//!   Lightning address integration.
+//! - **`dummy`** (feature `_test-utils`) – A test-only in-memory implementation.
+//!
+//! The trusted wallet holds small balances for instant, low-fee payments while the
+//! [`Wallet`](crate::Wallet) automatically moves larger amounts into self-custodial
+//! Lightning channels via the rebalancer.
 
 use crate::store::TxStatus;
 
@@ -43,7 +57,15 @@ pub struct Payment {
 
 pub(crate) type DynTrustedWalletInterface = dyn TrustedWalletInterface + Send + Sync;
 
-/// Represents a trait for a trusted wallet interface.
+/// The interface that all trusted wallet backends must implement.
+///
+/// This trait is **sealed** — it cannot be implemented outside of this crate. The available
+/// implementations are `Spark` (feature `spark`), `Cashu` (feature `cashu`), and
+/// `DummyTrustedWallet` (feature `_test-utils`, test-only).
+///
+/// Users don't interact with this trait directly. Instead, choose a backend via
+/// [`ExtraConfig`] when building a [`WalletConfig`](crate::WalletConfig), and the
+/// [`Wallet`](crate::Wallet) handles dispatching internally.
 pub trait TrustedWalletInterface: Send + Sync + private::Sealed {
 	/// Returns the current balance of the wallet.
 	fn get_balance(
@@ -134,16 +156,23 @@ impl<T: ?Sized + TrustedWalletInterface> graduated_rebalancer::TrustedWallet for
 	}
 }
 
+/// Selects and configures the trusted wallet backend.
+///
+/// Pass one of these variants in [`WalletConfig::extra_config`](crate::WalletConfig::extra_config)
+/// to choose which custodial backend the wallet uses:
+///
+/// - `Spark` – Breez Spark SDK (requires feature `spark`, enabled by default)
+/// - `Cashu` – Cashu ecash via CDK (requires feature `cashu`)
+/// - `Dummy` – in-memory test backend (requires feature `_test-utils`)
 #[derive(Clone)]
-/// Extra configuration needed for different types of wallets.
 pub enum ExtraConfig {
-	/// Configuration for Spark wallet.
+	/// Use the Spark backend. See [`SparkWalletConfig`](crate::SparkWalletConfig) for options.
 	#[cfg(feature = "spark")]
 	Spark(crate::SparkWalletConfig),
-	/// Configuration for Cashu wallet.
+	/// Use the Cashu ecash backend. See [`CashuConfig`](cashu::CashuConfig) for options.
 	#[cfg(feature = "cashu")]
 	Cashu(cashu::CashuConfig),
-	/// Configuration for dummy wallet (test-only).
+	/// Use the in-memory dummy backend (test-only).
 	#[cfg(feature = "_test-utils")]
 	Dummy(dummy::DummyTrustedWalletExtraConfig),
 }
@@ -164,22 +193,26 @@ mod private {
 	impl Sealed for super::dummy::DummyTrustedWallet {}
 }
 
-/// An error type for the Spark wallet implementation.
+/// Errors from trusted wallet backend operations.
+///
+/// Any of the trusted backends (Spark, Cashu, Dummy) may return these errors. They are
+/// surfaced to the caller as [`WalletError::TrustedFailure`](crate::WalletError::TrustedFailure)
+/// or [`InitFailure::TrustedFailure`](crate::InitFailure::TrustedFailure).
 #[derive(Debug)]
 pub enum TrustedError {
-	/// Not enough funds to complete the operation.
+	/// The wallet does not have enough funds to complete the operation.
 	InsufficientFunds,
-	/// The wallet operation failed with a specific message.
+	/// A backend-specific operation failed.
 	WalletOperationFailed(String),
-	/// The provided network is invalid.
+	/// The configured Bitcoin network does not match the backend's network.
 	InvalidNetwork,
-	/// The spark wallet does not yet support the operation.
+	/// The requested operation is not supported by this backend.
 	UnsupportedOperation(String),
-	/// Failed to convert an amount.
+	/// An amount conversion error (e.g. overflow or invalid unit).
 	AmountError,
-	/// An I/O error occurred.
+	/// An I/O error occurred during a storage or network operation.
 	IOError(ldk_node::lightning::io::Error),
-	/// An unspecified error occurred.
+	/// An unspecified error with a descriptive message.
 	Other(String),
 }
 

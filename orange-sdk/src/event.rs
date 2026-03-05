@@ -23,7 +23,29 @@ pub(crate) const EVENT_QUEUE_PERSISTENCE_PRIMARY_NAMESPACE: &str = "";
 pub(crate) const EVENT_QUEUE_PERSISTENCE_SECONDARY_NAMESPACE: &str = "";
 pub(crate) const EVENT_QUEUE_PERSISTENCE_KEY: &str = "orange_events";
 
-/// An event emitted by [`Wallet`], which should be handled by the user.
+/// An event emitted by [`Wallet`] that should be handled by the user.
+///
+/// Events are retrieved via [`Wallet::next_event`](crate::Wallet::next_event),
+/// [`Wallet::next_event_async`](crate::Wallet::next_event_async), or
+/// [`Wallet::wait_next_event`](crate::Wallet::wait_next_event). After processing an event,
+/// you **must** call [`Wallet::event_handled`](crate::Wallet::event_handled) to advance the queue.
+///
+/// Events are persisted, so they will survive process restarts and will be re-delivered
+/// until acknowledged.
+///
+/// # Event types
+///
+/// | Event | Meaning |
+/// |-------|---------|
+/// | [`PaymentSuccessful`](Self::PaymentSuccessful) | An outgoing payment completed |
+/// | [`PaymentFailed`](Self::PaymentFailed) | An outgoing payment failed |
+/// | [`PaymentReceived`](Self::PaymentReceived) | An incoming Lightning payment arrived |
+/// | [`OnchainPaymentReceived`](Self::OnchainPaymentReceived) | An incoming on-chain payment arrived |
+/// | [`ChannelOpened`](Self::ChannelOpened) | A Lightning channel is ready to use |
+/// | [`ChannelClosed`](Self::ChannelClosed) | A Lightning channel was closed (rebalancing auto-disabled) |
+/// | [`RebalanceInitiated`](Self::RebalanceInitiated) | A trusted-to-Lightning rebalance started |
+/// | [`RebalanceSuccessful`](Self::RebalanceSuccessful) | A trusted-to-Lightning rebalance completed |
+/// | [`SplicePending`](Self::SplicePending) | An on-chain splice into a channel is pending confirmation |
 ///
 /// [`Wallet`]: [`crate::Wallet`]
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -201,9 +223,16 @@ impl_writeable_tlv_based_enum!(Event,
 	},
 );
 
-/// A queue for events emitted by the [`Wallet`].
+/// A persistent, ordered queue of [`Event`]s emitted by the [`Wallet`].
+///
+/// The queue is backed by the wallet's [`KVStore`] so events survive restarts. Events are
+/// delivered in FIFO order and remain at the head of the queue until acknowledged via
+/// [`Wallet::event_handled`](crate::Wallet::event_handled).
+///
+/// Users typically interact with this through the [`Wallet`] methods rather than directly.
 ///
 /// [`Wallet`]: [`crate::Wallet`]
+/// [`KVStore`]: ldk_node::lightning::util::persist::KVStore
 pub struct EventQueue {
 	queue: Arc<Mutex<VecDeque<Event>>>,
 	waker: Arc<Mutex<Option<Waker>>>,

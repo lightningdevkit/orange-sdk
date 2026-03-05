@@ -1,11 +1,34 @@
 #![deny(missing_docs)]
 #![allow(clippy::type_complexity)]
 
-//! A library for managing graduated rebalancing between trusted and lightning wallets.
+//! Graduated rebalancing between trusted and Lightning wallets.
 //!
-//! This crate provides a `GraduatedRebalancer` that automatically manages the balance
-//! between trusted wallets (for small amounts) and lightning wallets (for larger amounts)
-//! based on configurable thresholds.
+//! This crate provides [`GraduatedRebalancer`], a generic engine that automatically moves
+//! funds from a trusted wallet backend into self-custodial Lightning channels based on
+//! configurable thresholds.
+//!
+//! # How it works
+//!
+//! The rebalancer supports two transfer paths:
+//!
+//! 1. **Trusted → Lightning:** When the trusted wallet balance exceeds the configured limit,
+//!    the rebalancer pays a Lightning invoice from the trusted wallet to the self-custodial
+//!    Lightning node, effectively moving funds into self-custody.
+//!
+//! 2. **On-chain → Lightning:** When on-chain funds are available, the rebalancer opens a
+//!    new Lightning channel or splices funds into an existing channel with the LSP.
+//!
+//! Both paths are triggered via the [`RebalanceTrigger`] trait, which determines *when* and
+//! *how much* to rebalance. Events are reported via the [`EventHandler`] trait.
+//!
+//! # Usage
+//!
+//! This crate is designed to be generic over wallet implementations. Provide types that
+//! implement [`TrustedWallet`] and [`LightningWallet`], along with a [`RebalanceTrigger`]
+//! and an [`EventHandler`], then construct a [`GraduatedRebalancer`].
+//!
+//! The [`orange-sdk`](https://docs.rs/orange-sdk) crate provides a concrete integration
+//! of this rebalancer with its wallet infrastructure.
 
 use bitcoin_payment_instructions::amount::Amount;
 use bitcoin_payment_instructions::PaymentMethod;
@@ -206,7 +229,16 @@ impl EventHandler for IgnoringEventHandler {
 	}
 }
 
-/// The main graduated rebalancer that manages balance between trusted and lightning wallets
+/// The core rebalancing engine.
+///
+/// Manages the automatic transfer of funds from a trusted wallet into self-custodial
+/// Lightning channels. It is generic over the wallet implementations, trigger logic,
+/// event handling, and logger.
+///
+/// All rebalance operations are serialized through an internal mutex to prevent
+/// concurrent balance modifications.
+///
+/// See the [crate-level documentation](crate) for an overview of how rebalancing works.
 pub struct GraduatedRebalancer<
 	T: TrustedWallet,
 	L: LightningWallet,

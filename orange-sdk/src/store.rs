@@ -1,15 +1,9 @@
-//! A library implementing the full backend for a modern, highly usable, Bitcoin wallet focusing on
-//! maximizing security and self-custody without trading off user experience.
+//! Transaction metadata storage and types.
 //!
-//! This crate should do everything you need to build a great Bitcoin wallet, except the UI.
-//!
-//! In order to maximize the user experience, small balances are held in a trusted service (XXX
-//! which one), avoiding expensive setup fees, while larger balances are moved into on-chain
-//! lightning channels, ensuring trust is minimized in the trusted service.
-//!
-//! Despite funds being stored in multiple places, the full balance can be treated as a single
-//! wallet - payments can draw on both balances simultaneously and deposits are automatically
-//! shifted to minimize fees and ensure maximal security.
+//! This module defines the public types used to represent transactions ([`Transaction`],
+//! [`PaymentId`], [`TxStatus`], [`PaymentType`]) and the internal storage layer
+//! ([`TxMetadataStore`]) that tracks payment metadata across both trusted and self-custodial
+//! wallets.
 
 use bitcoin_payment_instructions::amount::Amount;
 
@@ -34,14 +28,14 @@ const STORE_PRIMARY_KEY: &str = "orange_sdk";
 const STORE_SECONDARY_KEY: &str = "payment_store";
 const SPLICE_OUT_SECONDARY_KEY: &str = "splice_out";
 
-/// The status of a transaction. This is used to track the state of a transaction
+/// The lifecycle state of a [`Transaction`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TxStatus {
-	/// A pending transaction has not yet been paid.
+	/// The payment has been initiated but not yet settled.
 	Pending,
-	/// A completed transaction has been paid.
+	/// The payment settled successfully.
 	Completed,
-	/// A transaction that has failed.
+	/// The payment failed (e.g. no route, insufficient funds, timeout).
 	Failed,
 }
 
@@ -67,28 +61,31 @@ impl Readable for TxStatus {
 	}
 }
 
-/// A transaction is a record of a payment made or received. It contains information about the
-/// transaction, such as the amount, fee, and status. It is used to track the state of a payment
-/// and to provide information about the payment to the user.
+/// A unified record of a payment made or received, returned by [`Wallet::list_transactions`](crate::Wallet::list_transactions).
+///
+/// Transactions cover both trusted and self-custodial payments. Internal rebalance
+/// transfers are merged into single entries with combined fees.
 #[derive(Debug, Clone)]
 pub struct Transaction {
-	/// The unique identifier for the payment.
+	/// Unique identifier for this payment.
+	///
+	/// Use the variant ([`PaymentId::Trusted`] vs [`PaymentId::SelfCustodial`]) to determine
+	/// which wallet layer handled the payment.
 	pub id: PaymentId,
-	/// The transaction status, either (Pending, Completed, or Failed)
+	/// Current lifecycle state of this transaction.
 	pub status: TxStatus,
-	/// Indicates whether the payment is outbound (`true`) or inbound (`false`).
+	/// `true` for outbound (sent) payments, `false` for inbound (received).
 	pub outbound: bool,
-	/// The amount of the payment
-	///
-	/// None if the payment is not yet completed
+	/// The payment amount, or `None` if not yet known (e.g. pending inbound).
 	pub amount: Option<Amount>,
-	/// The fee paid for the payment
+	/// The fee paid for this transaction, or `None` if not yet known.
 	///
-	/// None if the payment is not yet completed
+	/// For internal rebalance transfers, this is the combined fee across both
+	/// the trusted and Lightning legs of the transfer.
 	pub fee: Option<Amount>,
-	/// Represents the type of payment, including its method and associated metadata.
+	/// The payment method and associated metadata (Lightning BOLT 11/12, on-chain, etc.).
 	pub payment_type: PaymentType,
-	/// The time the transaction was created
+	/// When this transaction was created, as a duration since the Unix epoch.
 	pub time_since_epoch: Duration,
 }
 
@@ -128,14 +125,16 @@ impl From<Transaction> for StoreTransaction {
 	}
 }
 
-/// A PaymentId is a unique identifier for a payment. It can be either a Lightning payment or a
-/// Trusted payment. It is used to track the state of a payment and to provide information about
-/// the payment to the user.
+/// A unique identifier for a payment, tagged by which wallet layer handled it.
+///
+/// The string representation uses a `SC-` prefix for self-custodial payments and a `TR-`
+/// prefix for trusted payments, followed by the hex-encoded 32-byte ID. This format
+/// round-trips via [`Display`](std::fmt::Display) and [`FromStr`](std::str::FromStr).
 #[derive(Debug, Copy, Clone, Hash, PartialEq, Eq)]
 pub enum PaymentId {
-	/// A self-custodial payment identifier.
+	/// A payment handled by the self-custodial Lightning node.
 	SelfCustodial([u8; 32]),
-	/// A trusted payment identifier.
+	/// A payment handled by the trusted wallet backend (Spark, Cashu, etc.).
 	Trusted([u8; 32]),
 }
 
@@ -173,7 +172,10 @@ impl_writeable_tlv_based_enum!(PaymentId,
 	{1, Trusted} => (),
 );
 
-/// Represents the type of payment, including its method and associated metadata.
+/// The payment method and associated metadata for a [`Transaction`].
+///
+/// For outgoing Lightning payments, the `payment_preimage` field serves as cryptographic
+/// proof of payment and is populated once the payment reaches [`TxStatus::Completed`].
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub enum PaymentType {
 	/// An outgoing Lightning payment paying a BOLT 12 offer.
