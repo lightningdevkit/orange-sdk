@@ -4,6 +4,7 @@ use colored::Colorize;
 use rustyline::DefaultEditor;
 use rustyline::error::ReadlineError;
 
+use orange_sdk::bitcoin::hex::DisplayHex;
 use orange_sdk::bitcoin_payment_instructions::amount::Amount;
 use orange_sdk::{
 	CashuConfig, ChainSource, CurrencyUnit, Event, ExtraConfig, LoggerType, Mnemonic, PaymentInfo,
@@ -226,6 +227,21 @@ impl WalletState {
 								"✅".bright_green(),
 								amount_msat,
 								fee_msat
+							);
+						},
+						Event::RebalanceFailed {
+							trigger_payment_id,
+							trusted_rebalance_payment_id,
+							amount_msat,
+							reason,
+						} => {
+							println!(
+								"{} Rebalance failed: {} msat, trigger_payment_id: {}, trusted_rebalance_payment_id: {:?}, reason: {}",
+								"❌".bright_red(),
+								amount_msat,
+								trigger_payment_id,
+								trusted_rebalance_payment_id.map(|id| id.to_lower_hex_string()),
+								reason
 							);
 						},
 						Event::SplicePending { new_funding_txo, .. } => {

@@ -10,4 +10,5 @@ license = "MIT OR Apache-2.0"
 bitcoin-payment-instructions = { workspace = true }
 lightning = { workspace = true }
 lightning-invoice = { workspace = true }
-tokio = { version = "1", default-features = false }
+lightning-macros = { workspace = true }
+tokio = { version = "1", default-features = false, features = ["sync", "macros", "rt", "time"] }

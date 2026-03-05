@@ -19,6 +19,7 @@ panic = 'abort'     # Abort on panic
 bitcoin-payment-instructions = { version = "0.6.0" }
 lightning = { version = "0.2.0" }
 lightning-invoice = { version = "0.34.0" }
+lightning-macros = "0.2.0"
 
 [profile.release]
 panic = "abort"
