@@ -75,21 +75,43 @@ type Rebalancer = GraduatedRebalancer<
 	Logger,
 >;
 
-/// Represents the balances of the wallet, including available and pending balances.
+/// The wallet's balance breakdown across its different storage layers.
+///
+/// Funds in an orange-sdk [`Wallet`] live in up to three places:
+///
+/// | Layer | Field | Spendable? |
+/// |-------|-------|------------|
+/// | Trusted backend (Spark / Cashu) | [`trusted`](Self::trusted) | Yes |
+/// | Lightning channel | [`lightning`](Self::lightning) | Yes |
+/// | On-chain (pending splice / channel open) | [`pending_balance`](Self::pending_balance) | No |
+///
+/// Use [`available_balance`](Self::available_balance) to get the total amount the wallet can
+/// spend right now (trusted + lightning).
 #[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Balances {
-	/// The balance in trusted wallet
+	/// Balance held in the trusted wallet backend (e.g. Spark or Cashu).
+	///
+	/// These funds are available for instant, low-fee payments but are custodied
+	/// by a third party.
 	pub trusted: Amount,
-	/// The balance in lightning wallet available for spending.
+	/// Balance available in self-custodial Lightning channels.
+	///
+	/// These funds are fully self-custodial and can be spent over Lightning
+	/// without any third-party trust.
 	pub lightning: Amount,
-	/// The balance that is pending and not yet spendable.
-	/// This includes all on-chain balances. The on-chain balance will become
-	/// available after it has been spliced into a lightning channel.
+	/// Balance that is not yet spendable.
+	///
+	/// This includes all on-chain balances (e.g. funds waiting for a channel open
+	/// or splice-in to confirm). Once the on-chain transaction confirms and the
+	/// channel is ready, these funds move into [`lightning`](Self::lightning).
 	pub pending_balance: Amount,
 }
 
 impl Balances {
-	/// Returns the total available balance, which is the sum of the lightning and trusted balances.
+	/// Returns the total spendable balance (trusted + lightning).
+	///
+	/// This excludes [`pending_balance`](Self::pending_balance) since those funds are not
+	/// yet available for spending.
 	pub fn available_balance(&self) -> Amount {
 		self.lightning.saturating_add(self.trusted)
 	}
@@ -137,17 +159,27 @@ pub struct Wallet {
 	inner: Arc<WalletImpl>,
 }
 
-/// Represents the seed used for wallet generation.
+/// The secret key material used to derive all wallet keys.
+///
+/// Two representations are supported:
+///
+/// - [`Mnemonic`](Self::Mnemonic) – a standard BIP 39 mnemonic phrase (12 or 24 words).
+///   This is the recommended form for end-user wallets because it can be backed up on paper.
+/// - [`Seed64`](Self::Seed64) – a raw 64-byte seed, useful for programmatic key derivation
+///   or when the seed is already available from another source.
+///
+/// The same seed will always produce the same wallet addresses and keys, which is what
+/// enables recovery (see [`Wallet::new`] for recovery details).
 #[derive(Debug, Clone)]
 pub enum Seed {
-	/// A BIP 39 mnemonic seed.
+	/// A BIP 39 mnemonic seed phrase.
 	Mnemonic {
-		/// The mnemonic phrase.
+		/// The mnemonic phrase (typically 12 or 24 words).
 		mnemonic: Mnemonic,
-		/// The passphrase for the mnemonic.
+		/// Optional BIP 39 passphrase (sometimes called the "25th word").
 		passphrase: Option<String>,
 	},
-	/// A 64-byte seed for the wallet.
+	/// A raw 64-byte seed for the wallet.
 	Seed64([u8; 64]),
 }
 
@@ -172,84 +204,137 @@ pub struct VssConfig {
 	pub headers: VssAuth,
 }
 
-/// Configuration for wallet storage, either local SQLite or VSS.
+/// Configuration for wallet persistence.
+///
+/// Controls where the wallet stores channel state, transaction metadata, and event history.
+///
+/// Currently only local SQLite is supported. A VSS (Versioned Storage Service) backend is
+/// planned, which will enable cross-device state synchronization and Lightning channel recovery
+/// from seed.
 #[derive(Debug, Clone)]
 pub enum StorageConfig {
-	/// Local SQLite database configuration.
+	/// Store all data in a local SQLite database at the given directory path.
+	///
+	/// The directory will be created if it does not exist.
 	LocalSQLite(String),
 	// todo VSS(VssConfig),
 }
 
-/// Configuration for the blockchain data source.
+/// The blockchain data source used to monitor on-chain transactions and fee rates.
+///
+/// The wallet needs a connection to the Bitcoin network to track on-chain balances,
+/// confirm channel opens/closes, and estimate fees. Three backend types are supported:
+///
+/// - [`Electrum`](Self::Electrum) – connects to an Electrum server (supports SSL via `ssl://` prefix).
+/// - [`Esplora`](Self::Esplora) – connects to an Esplora HTTP API (e.g. `https://blockstream.info/api`).
+/// - [`BitcoindRPC`](Self::BitcoindRPC) – connects directly to a Bitcoin Core node via JSON-RPC.
 #[derive(Debug, Clone)]
 pub enum ChainSource {
-	/// Electrum server configuration.
+	/// Connect to an Electrum server.
+	///
+	/// Use the `ssl://` prefix for TLS connections (e.g. `ssl://electrum.blockstream.info:60002`).
 	Electrum(String),
-	/// Esplora server configuration.
+	/// Connect to an Esplora HTTP API, with optional Basic authentication.
 	Esplora {
-		/// Esplora url
+		/// The base URL of the Esplora server (e.g. `https://blockstream.info/api`).
 		url: String,
-		/// Optional for Basic authentication for the Esplora server.
+		/// Optional username for HTTP Basic authentication.
 		username: Option<String>,
-		/// Optional for Basic authentication for the Esplora server.
+		/// Optional password for HTTP Basic authentication.
 		password: Option<String>,
 	},
-	/// Bitcoind RPC configuration.
+	/// Connect directly to a Bitcoin Core node via JSON-RPC.
 	BitcoindRPC {
-		/// The host of the Bitcoind rpc server (e.g. 127.0.0.1).
+		/// The host of the Bitcoin Core RPC server (e.g. `127.0.0.1`).
 		host: String,
-		/// The port of the Bitcoind rpc server (e.g. 8332).
+		/// The port of the Bitcoin Core RPC server (e.g. `8332` for mainnet).
 		port: u16,
-		/// The username for the Bitcoind rpc server.
+		/// The RPC username (configured in `bitcoin.conf`).
 		user: String,
-		/// The password for the Bitcoind rpc server.
+		/// The RPC password (configured in `bitcoin.conf`).
 		password: String,
 	},
 }
 
-/// Configuration for initializing the wallet.
+/// Everything needed to initialize a [`Wallet`].
+///
+/// This struct bundles together all the configuration required to create a wallet instance:
+/// storage, networking, keys, thresholds, and the trusted wallet backend.
+///
+/// See the [crate-level documentation](crate) for a full configuration example.
 #[derive(Clone)]
 pub struct WalletConfig {
-	/// Configuration for wallet storage.
+	/// Where the wallet persists its state (channel data, transaction metadata, events).
 	pub storage_config: StorageConfig,
-	/// The type of logger to use.
+	/// How the wallet emits log output.
 	pub logger_type: LoggerType,
-	/// Configuration for the blockchain data source.
+	/// The blockchain data source for on-chain monitoring and fee estimation.
 	pub chain_source: ChainSource,
-	/// Lightning Service Provider (LSP) configuration.
-	/// The address to connect to the LSP, the LSP node id, and an optional auth token.
+	/// Lightning Service Provider (LSP) connection details.
+	///
+	/// The tuple contains:
+	/// 1. The LSP's network address (e.g. `127.0.0.1:9735`)
+	/// 2. The LSP's node public key
+	/// 3. An optional authentication token
+	///
+	/// The LSP is used to open JIT (Just-In-Time) channels for receiving Lightning payments.
 	pub lsp: (SocketAddress, PublicKey, Option<String>),
-	/// URL to download a scorer from. This is for the lightning node to get its route
-	/// scorer from a remote server instead of having to probe and find optimal routes
-	/// locally.
+	/// Optional URL to download a pre-built route scorer.
+	///
+	/// When set, the Lightning node fetches its route scorer from this remote server instead of
+	/// probing and discovering optimal routes locally. This speeds up initial routing decisions.
 	pub scorer_url: Option<String>,
-	/// URL to Rapid Gossip Sync server to get gossip data from.
+	/// Optional URL to a [Rapid Gossip Sync](https://docs.rs/lightning-rapid-gossip-sync) server.
+	///
+	/// When set, the Lightning node downloads compressed gossip data from this server instead
+	/// of learning the network graph through peer gossip, significantly reducing sync time.
 	pub rgs_url: Option<String>,
-	/// The Bitcoin network the wallet operates on.
+	/// The Bitcoin network to operate on (e.g. `Network::Bitcoin`, `Network::Testnet`).
 	pub network: Network,
-	/// The seed used for wallet generation.
+	/// The secret key material for this wallet. See [`Seed`] for options.
 	pub seed: Seed,
-	/// Configuration parameters for when the wallet decides to use the lightning or trusted wallet.
+	/// Thresholds that control when funds move between the trusted and Lightning wallets.
 	pub tunables: Tunables,
-	/// Extra configuration specific to the trusted wallet implementation.
+	/// Backend-specific configuration for the trusted wallet (Spark, Cashu, etc.).
 	pub extra_config: ExtraConfig,
 }
 
-/// Configuration parameters for when the wallet decides to use the lightning or trusted wallet.
+/// Thresholds that control the wallet's graduated custody behavior.
+///
+/// These parameters govern how the wallet distributes funds between the trusted backend
+/// and self-custodial Lightning channels, and how it generates payment URIs.
+///
+/// The default values are a reasonable starting point for most wallets:
+///
+/// | Parameter | Default | Purpose |
+/// |-----------|---------|---------|
+/// | `trusted_balance_limit` | 100,000 sats | Trigger rebalance to Lightning above this |
+/// | `rebalance_min` | 5,000 sats | Don't bother rebalancing amounts smaller than this |
+/// | `onchain_receive_threshold` | 10,000 sats | Include on-chain address in receive URIs above this |
+/// | `enable_amountless_receive_on_chain` | `true` | Include on-chain address for open-amount receives |
 #[derive(Debug, Clone, Copy)]
 pub struct Tunables {
-	/// The maximum balance that can be held in the trusted wallet.
-	pub trusted_balance_limit: Amount,
-	/// Trusted balances below this threshold will not be transferred to non-trusted balance
-	/// even if we have capacity to do so without paying for a new channel.
+	/// The maximum balance allowed in the trusted wallet before triggering automatic rebalancing.
 	///
-	/// This avoids unnecessary transfers and fees.
+	/// When the trusted balance exceeds this limit, excess funds are automatically moved into
+	/// a self-custodial Lightning channel. Set this based on how much you're comfortable
+	/// holding in the trusted backend.
+	pub trusted_balance_limit: Amount,
+	/// The minimum amount worth rebalancing from trusted to Lightning.
+	///
+	/// Amounts below this threshold won't be transferred even if there's available Lightning
+	/// capacity, avoiding unnecessary small transfers and their associated fees.
 	pub rebalance_min: Amount,
-	/// Payment instructions generated using [`Wallet::get_single_use_receive_uri`] for an amount
-	/// below this threshold will not include an on-chain address.
+	/// The minimum receive amount for which an on-chain address is included in payment URIs.
+	///
+	/// When generating a receive URI via [`Wallet::get_single_use_receive_uri`], amounts
+	/// below this threshold will only include a Lightning invoice (no on-chain fallback).
+	/// This avoids on-chain dust for small payments.
 	pub onchain_receive_threshold: Amount,
-	/// Payment instructions generated using [`Wallet::get_single_use_receive_uri`] with no amount
-	/// will only include an on-chain address if this is set.
+	/// Whether to include an on-chain address in open-amount (no specific amount) receive URIs.
+	///
+	/// When `true`, [`Wallet::get_single_use_receive_uri`] called with `amount: None` will
+	/// include an on-chain address alongside the Lightning invoice.
 	pub enable_amountless_receive_on_chain: bool,
 }
 
@@ -264,7 +349,8 @@ impl Default for Tunables {
 	}
 }
 
-/// Represents errors that can occur when building a [`PaymentInfo`] from [`PaymentInstructions`].
+/// Errors returned by [`PaymentInfo::build`] when the provided amount is incompatible
+/// with the [`PaymentInstructions`].
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub enum PaymentInfoBuildError {
 	/// The amount given does not match either of the fixed amounts specified in the
@@ -290,7 +376,10 @@ pub enum PaymentInfoBuildError {
 	},
 }
 
-/// A payable version of [`PaymentInstructions`] (i.e. with a set amount).
+/// A validated, ready-to-pay combination of [`PaymentInstructions`] and an [`Amount`].
+///
+/// Created via [`PaymentInfo::build`], which validates that the amount is compatible
+/// with the payment instructions. Pass this to [`Wallet::pay`] to initiate the payment.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PaymentInfo {
 	/// The payment instructions (e.g., BOLT 11 invoice, on-chain address).
@@ -300,13 +389,16 @@ pub struct PaymentInfo {
 }
 
 impl PaymentInfo {
-	/// Prepares us to pay a [`PaymentInstructions`] by setting the amount.
+	/// Creates a [`PaymentInfo`] by pairing [`PaymentInstructions`] with an amount.
 	///
-	/// If [`PaymentInstructions`] is a [`PaymentInstructions::ConfigurableAmount`], the amount must be
-	/// within the specified range (if any).
+	/// The amount is validated against the payment instructions:
 	///
-	/// If [`PaymentInstructions`] is a [`PaymentInstructions::FixedAmount`], the amount must match the
-	/// fixed on-chain or lightning amount specified.
+	/// - **[`ConfigurableAmount`](PaymentInstructions::ConfigurableAmount):** the amount is
+	///   required and must fall within the optional min/max range.
+	/// - **[`FixedAmount`](PaymentInstructions::FixedAmount):** the amount is optional (it
+	///   defaults to the fixed amount) but if provided must match.
+	///
+	/// Returns [`PaymentInfoBuildError`] if the amount is missing, out of range, or mismatched.
 	pub fn build(
 		instructions: PaymentInstructions, amount: Option<Amount>,
 	) -> Result<PaymentInfo, PaymentInfoBuildError> {
@@ -397,16 +489,19 @@ impl PaymentInfo {
 	}
 }
 
-/// Represents possible failures during wallet initialization.
+/// Errors that can occur during [`Wallet::new`].
+///
+/// Initialization can fail due to I/O issues (e.g. storage), Lightning node setup errors,
+/// or problems connecting to the trusted wallet backend.
 #[derive(Debug)]
 pub enum InitFailure {
-	/// I/O error during initialization.
+	/// An I/O error occurred (e.g. failed to create storage directory).
 	IoError(io::Error),
-	/// Failure to build the LDK node.
+	/// Failed to build the underlying LDK node (invalid configuration).
 	LdkNodeBuildFailure(BuildError),
-	/// Failure to start the LDK node.
+	/// Failed to start the underlying LDK node (e.g. port already in use).
 	LdkNodeStartFailure(NodeError),
-	/// Failure in the trusted wallet implementation.
+	/// The trusted wallet backend failed to initialize.
 	TrustedFailure(TrustedError),
 }
 
@@ -434,12 +529,12 @@ impl From<TrustedError> for InitFailure {
 	}
 }
 
-/// Represents possible errors during wallet operations.
+/// Errors that can occur during wallet operations (payments, balance queries, etc.).
 #[derive(Debug)]
 pub enum WalletError {
-	/// Failure in the LDK node.
+	/// The self-custodial Lightning node encountered an error.
 	LdkNodeFailure(NodeError),
-	/// Failure in the trusted wallet implementation.
+	/// The trusted wallet backend encountered an error.
 	TrustedFailure(TrustedError),
 }
 
@@ -455,18 +550,37 @@ impl From<NodeError> for WalletError {
 	}
 }
 
-/// Represents a single-use Bitcoin URI for receiving payments.
+/// A single-use [BIP 21](https://github.com/bitcoin/bips/blob/master/bip-0021.mediawiki) Bitcoin
+/// URI for receiving a payment.
+///
+/// Generated by [`Wallet::get_single_use_receive_uri`]. The URI may contain both an on-chain
+/// address and a BOLT 11 Lightning invoice (a "unified" URI), allowing the payer to choose the
+/// best payment method. Whether an on-chain address is included depends on the wallet's
+/// [`Tunables`] and the requested amount.
+///
+/// The [`Display`](std::fmt::Display) implementation formats this as a BIP 21 URI string
+/// suitable for encoding in a QR code.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SingleUseReceiveUri {
-	/// The optional on-chain Bitcoin address. Will be present based on the
-	/// wallet's configured tunables.
+	/// The on-chain Bitcoin address, if included.
+	///
+	/// Present when the requested amount exceeds [`Tunables::onchain_receive_threshold`],
+	/// or when [`Tunables::enable_amountless_receive_on_chain`] is `true` and no amount
+	/// was specified.
 	pub address: Option<bitcoin::Address>,
-	/// The BOLT 11 Lightning invoice.
+	/// The BOLT 11 Lightning invoice for this payment.
 	pub invoice: Bolt11Invoice,
-	/// The optional amount for the payment.
+	/// The requested amount, if one was specified.
 	pub amount: Option<Amount>,
-	/// Whether the URI was generated from a trusted wallet or from
-	/// the self-custodial LN wallet.
+	/// Whether the invoice was generated by the trusted wallet backend or the
+	/// self-custodial LDK node.
+	///
+	/// When `amount` is `Some`, this reflects the routing decision: small amounts
+	/// use the trusted backend (`true`), larger amounts use the LDK node (`false`).
+	///
+	/// When `amount` is `None` (amountless receive), this is always `false` even
+	/// though the invoice is generated by the trusted backend, since the wallet
+	/// cannot predict which layer will ultimately receive the payment.
 	pub from_trusted: bool,
 }
 
@@ -661,7 +775,11 @@ impl Wallet {
 		Ok(Wallet { inner })
 	}
 
-	/// Sets whether the wallet should automatically rebalance from trusted/onchain to lightning.
+	/// Enables or disables automatic rebalancing from trusted/on-chain to Lightning.
+	///
+	/// Rebalancing is enabled by default. It is automatically disabled when a channel closes
+	/// (to avoid an open-close loop). Call this with `true` to re-enable it after handling
+	/// a [`Event::ChannelClosed`] event.
 	pub async fn set_rebalance_enabled(&self, value: bool) {
 		store::set_rebalance_enabled(self.inner.store.as_ref(), value).await
 	}
@@ -671,7 +789,9 @@ impl Wallet {
 		store::get_rebalance_enabled(self.inner.store.as_ref()).await
 	}
 
-	/// Returns the lightning wallet's node id.
+	/// Returns the public key of the underlying Lightning node.
+	///
+	/// This is the node's identity on the Lightning Network and can be shared with peers.
 	pub fn node_id(&self) -> PublicKey {
 		self.inner.ln_wallet.inner.ldk_node.node_id()
 	}
@@ -681,12 +801,19 @@ impl Wallet {
 		self.inner.ln_wallet.is_connected_to_lsp()
 	}
 
-	/// List our current channels
+	/// Lists all open Lightning channels and their details (capacity, balance, state, etc.).
 	pub fn channels(&self) -> Vec<ChannelDetails> {
 		self.inner.ln_wallet.inner.ldk_node.list_channels()
 	}
 
-	/// Lists the transactions which have been made.
+	/// Lists completed transactions and in-flight outbound payments, sorted by time.
+	///
+	/// Returns a unified list covering both trusted and self-custodial payments.
+	/// Internal rebalance transfers are merged into single logical transactions
+	/// with combined fees.
+	///
+	/// **Note:** Pending inbound invoices (issued but unpaid) and pending rebalances
+	/// are excluded from the results.
 	pub async fn list_transactions(&self) -> Result<Vec<Transaction>, WalletError> {
 		let (trusted_payments, splice_outs) = tokio::join!(
 			self.inner.trusted.list_payments(),
@@ -956,7 +1083,9 @@ impl Wallet {
 		Ok(res)
 	}
 
-	/// Gets our current total balance
+	/// Returns the wallet's current balance across all layers (trusted, Lightning, and pending).
+	///
+	/// See [`Balances`] for details on each field.
 	pub async fn get_balance(&self) -> Result<Balances, WalletError> {
 		let trusted_balance = self.inner.trusted.get_balance().await?;
 		let ln_balance = self.inner.ln_wallet.get_balance();
@@ -1074,20 +1203,29 @@ impl Wallet {
 	//
 	// }
 
-	/// Estimates the fees required to pay a [`PaymentInstructions`]
+	/// Estimates the fees required to pay a [`PaymentInstructions`].
+	///
+	/// **Note:** Fee estimation is not yet implemented and currently always returns zero.
 	pub async fn estimate_fee(&self, _payment_info: &PaymentInstructions) -> Amount {
 		// todo implement fee estimation
 		Amount::ZERO
 	}
 
-	/// Initiates a payment using the provided [`PaymentInfo`]. This will pay from the trusted
-	/// wallet if possible, otherwise it will pay from the lightning wallet.
+	/// Sends a payment using the provided [`PaymentInfo`].
 	///
-	/// If applicable, this will also initiate a rebalance from the trusted wallet to the
-	/// lightning wallet based on the resulting balance and configured tunables.
+	/// The wallet automatically selects the best funding source using this priority:
 	///
-	/// Returns once the payment is pending, however, this does not mean that the
-	/// payment has been completed. The payment may still fail.
+	/// 1. **Trusted wallet over Lightning** (BOLT 11/12) – lowest fees for small payments
+	/// 2. **Self-custodial Lightning** (BOLT 11/12) – if trusted balance is insufficient
+	/// 3. **Trusted wallet on-chain** – for on-chain payment methods
+	/// 4. **Self-custodial on-chain** (splice-out) – last resort
+	///
+	/// After a successful payment, automatic rebalancing may be triggered if the
+	/// resulting trusted balance exceeds [`Tunables::trusted_balance_limit`].
+	///
+	/// Returns a [`PaymentId`] once the payment has been **initiated**. The payment
+	/// may still be in-flight; listen for [`Event::PaymentSuccessful`] or
+	/// [`Event::PaymentFailed`] to confirm the outcome.
 	pub async fn pay(&self, instructions: &PaymentInfo) -> Result<PaymentId, WalletError> {
 		let trusted_balance = self.inner.trusted.get_balance().await?;
 		let ln_balance = self.inner.ln_wallet.get_balance();
@@ -1295,9 +1433,18 @@ impl Wallet {
 		))
 	}
 
-	/// Initiates closing all channels in the lightning wallet. The channel will not be closed
-	/// until a [`Event::ChannelClosed`] event is emitted.
-	/// This will disable rebalancing before closing channels, so that we don't try to reopen them.
+	/// Initiates closing all open Lightning channels.
+	///
+	/// Usable channels are closed cooperatively; non-usable channels (e.g. peer offline)
+	/// are force-closed. Force closes have higher on-chain fees and a time-locked delay
+	/// before funds become spendable.
+	///
+	/// This automatically disables rebalancing (see [`set_rebalance_enabled`](Self::set_rebalance_enabled))
+	/// to prevent the wallet from immediately reopening channels.
+	///
+	/// The close is asynchronous — channels are not fully closed until you receive
+	/// [`Event::ChannelClosed`] events. On-chain funds from the closed channels will
+	/// appear in [`Balances::pending_balance`] until confirmed.
 	pub async fn close_channels(&self) -> Result<(), WalletError> {
 		// we are explicitly disabling rebalancing here, so that we don't try to
 		// reopen channels after closing them.
@@ -1316,7 +1463,7 @@ impl Wallet {
 	// 	Ok(())
 	// }
 
-	/// Returns the wallet's configured tunables.
+	/// Returns the [`Tunables`] that were used to configure this wallet.
 	pub fn get_tunables(&self) -> Tunables {
 		self.inner.tunables
 	}
@@ -1381,18 +1528,26 @@ impl Wallet {
 		res
 	}
 
-	/// Gets the lightning address for this wallet, if one is set.
+	/// Returns the wallet's registered [Lightning Address](https://lightningaddress.com),
+	/// if one has been set via [`register_lightning_address`](Self::register_lightning_address).
 	pub async fn get_lightning_address(&self) -> Result<Option<String>, WalletError> {
 		Ok(self.inner.trusted.get_lightning_address().await?)
 	}
 
-	/// Attempts to register the lightning address for this wallet.
+	/// Registers a [Lightning Address](https://lightningaddress.com) (e.g. `name@domain.com`)
+	/// for this wallet.
+	///
+	/// The `name` parameter is the local part (before the `@`). The domain is determined
+	/// by the trusted wallet backend configuration.
 	pub async fn register_lightning_address(&self, name: String) -> Result<(), WalletError> {
 		Ok(self.inner.trusted.register_lightning_address(name).await?)
 	}
 
-	/// Stops the wallet, which will stop the underlying LDK node and any background tasks.
-	/// This will ensure that any critical tasks have completed before stopping.
+	/// Gracefully shuts down the wallet.
+	///
+	/// This waits for any in-progress rebalances to complete, stops the trusted wallet
+	/// backend, shuts down the Lightning node, and cancels background tasks. Call this
+	/// before dropping the wallet to ensure data is persisted and resources are released.
 	pub async fn stop(&self) {
 		// wait for the balance mutex to ensure no other tasks are running
 		log_info!(self.inner.logger, "Stopping...");
