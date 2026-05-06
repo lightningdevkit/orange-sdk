@@ -1201,6 +1201,38 @@ impl WalletDatabase<cdk::cdk_database::Error> for CashuKvDatabase {
 			.await
 			.map_err(|e| DatabaseError::Io(e).into())
 	}
+
+	// P2PK signing keys are not used by orange-sdk. The stubs below trip a debug assert if
+	// anything (orange-sdk or cdk internals) ever exercises them, so we notice before silently
+	// losing key material; release builds keep the safe defaults.
+	async fn add_p2pk_key(
+		&self, _pubkey: &PublicKey, _derivation_path: ldk_node::bitcoin::bip32::DerivationPath,
+		_derivation_index: u32,
+	) -> Result<(), cdk::cdk_database::Error> {
+		debug_assert!(false, "orange-sdk does not support P2PK keys: add_p2pk_key called");
+		Ok(())
+	}
+
+	async fn get_p2pk_key(
+		&self, _pubkey: &PublicKey,
+	) -> Result<Option<cdk::wallet::types::P2PKSigningKey>, cdk::cdk_database::Error> {
+		debug_assert!(false, "orange-sdk does not support P2PK keys: get_p2pk_key called");
+		Ok(None)
+	}
+
+	async fn list_p2pk_keys(
+		&self,
+	) -> Result<Vec<cdk::wallet::types::P2PKSigningKey>, cdk::cdk_database::Error> {
+		debug_assert!(false, "orange-sdk does not support P2PK keys: list_p2pk_keys called");
+		Ok(Vec::new())
+	}
+
+	async fn latest_p2pk(
+		&self,
+	) -> Result<Option<cdk::wallet::types::P2PKSigningKey>, cdk::cdk_database::Error> {
+		debug_assert!(false, "orange-sdk does not support P2PK keys: latest_p2pk called");
+		Ok(None)
+	}
 }
 
 pub(super) async fn read_has_recovered(store: &Arc<dyn DynStore>) -> Result<bool, TrustedError> {
