@@ -56,7 +56,7 @@ impl DummyTrustedWallet {
 		builder.set_network(Network::Regtest);
 		let mut seed: [u8; 64] = [0; 64];
 		rand::thread_rng().fill_bytes(&mut seed);
-		builder.set_entropy_seed_bytes(seed);
+		let node_entropy = ldk_node::entropy::NodeEntropy::from_seed_bytes(seed);
 		builder.set_gossip_source_p2p();
 
 		let cookie = bitcoind.params.get_cookie_values().unwrap().unwrap();
@@ -74,7 +74,7 @@ impl DummyTrustedWallet {
 		let socket_addr = SocketAddress::TcpIpV4 { addr: [127, 0, 0, 1], port };
 		builder.set_listening_addresses(vec![socket_addr.clone()]).unwrap();
 
-		let ldk_node = Arc::new(builder.build().unwrap());
+		let ldk_node = Arc::new(builder.build(node_entropy).unwrap());
 
 		ldk_node.start().unwrap();
 
@@ -95,6 +95,7 @@ impl DummyTrustedWallet {
 						fee_paid_msat,
 						payment_hash,
 						payment_preimage,
+						bolt12_invoice: _,
 					} => {
 						// convert id
 						let id = mangle_payment_id(payment_id.unwrap().0);

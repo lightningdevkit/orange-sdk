@@ -145,7 +145,7 @@ fn create_lsp(uuid: Uuid, bitcoind: &Bitcoind) -> Arc<Node> {
 	builder.set_network(Network::Regtest);
 	let mut seed: [u8; 64] = [0; 64];
 	rand::thread_rng().fill_bytes(&mut seed);
-	builder.set_entropy_seed_bytes(seed);
+	let node_entropy = ldk_node::entropy::NodeEntropy::from_seed_bytes(seed);
 	builder.set_gossip_source_p2p();
 
 	builder.set_node_alias("LSP".to_string()).unwrap();
@@ -172,6 +172,7 @@ fn create_lsp(uuid: Uuid, bitcoind: &Bitcoind) -> Arc<Node> {
 		min_channel_opening_fee_msat: 0,
 		max_client_to_self_delay: 1024,
 		client_trusts_lsp: true,
+		disable_client_reserve: false,
 	};
 	builder.set_liquidity_provider_lsps2(lsps2_service_config);
 
@@ -180,7 +181,7 @@ fn create_lsp(uuid: Uuid, bitcoind: &Bitcoind) -> Arc<Node> {
 	builder.set_listening_addresses(vec![addr.clone()]).unwrap();
 	builder.set_listening_addresses(vec![addr]).unwrap();
 
-	let ldk_node = Arc::new(builder.build().unwrap());
+	let ldk_node = Arc::new(builder.build(node_entropy).unwrap());
 
 	ldk_node.start().unwrap();
 
@@ -203,7 +204,7 @@ fn create_third_party(uuid: Uuid, bitcoind: &Bitcoind) -> Arc<Node> {
 	builder.set_network(Network::Regtest);
 	let mut seed: [u8; 64] = [0; 64];
 	rand::thread_rng().fill_bytes(&mut seed);
-	builder.set_entropy_seed_bytes(seed);
+	let node_entropy = ldk_node::entropy::NodeEntropy::from_seed_bytes(seed);
 	builder.set_gossip_source_p2p();
 
 	builder.set_node_alias("third-party".to_string()).unwrap();
@@ -224,7 +225,7 @@ fn create_third_party(uuid: Uuid, bitcoind: &Bitcoind) -> Arc<Node> {
 	builder.set_listening_addresses(vec![addr.clone()]).unwrap();
 	builder.set_listening_addresses(vec![addr]).unwrap();
 
-	let ldk_node = Arc::new(builder.build().unwrap());
+	let ldk_node = Arc::new(builder.build(node_entropy).unwrap());
 
 	ldk_node.start().unwrap();
 
@@ -550,7 +551,7 @@ pub async fn open_channel_from_lsp(wallet: &orange_sdk::Wallet, payer: Arc<Node>
 		orange_sdk::Event::PaymentReceived { payment_hash, amount_msat, lsp_fee_msats, .. } => {
 			assert!(lsp_fee_msats.is_some()); // we expect a fee to be paid for opening a channel
 			assert_eq!(recv_amt.milli_sats(), amount_msat + lsp_fee_msats.unwrap_or(0)); // the fee will be deducted from the amount received
-			assert_eq!(payment_hash.0, uri.invoice.payment_hash().to_byte_array());
+			assert_eq!(payment_hash, uri.invoice.payment_hash());
 		},
 		_ => panic!("Expected PaymentReceived event"),
 	}

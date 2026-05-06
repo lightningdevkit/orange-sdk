@@ -137,7 +137,7 @@ async fn test_pay_from_trusted() {
 		match event {
 			Event::PaymentSuccessful { payment_hash, fee_paid_msat, .. } => {
 				assert!(fee_paid_msat.is_some());
-				assert_eq!(payment_hash.0, invoice.payment_hash().to_byte_array());
+				assert_eq!(payment_hash, invoice.payment_hash());
 			},
 			e => panic!("Expected PaymentSuccessful event, got {e:?}"),
 		}

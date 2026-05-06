@@ -5,6 +5,7 @@ use std::sync::Arc;
 
 use crate::io;
 
+use crate::dyn_store::DynStore;
 use breez_sdk_spark::sync_storage::{
 	IncomingChange, OutgoingChange, Record, RecordChange, RecordId, UnversionedRecordChange,
 };
@@ -12,7 +13,6 @@ use breez_sdk_spark::{
 	Contact, DepositInfo, ListContactsRequest, Payment, PaymentDetails, PaymentMetadata,
 	SetLnurlMetadataItem, StorageError, StorageListPaymentsRequest, UpdateDepositPayload,
 };
-use ldk_node::DynStore;
 use ldk_node::lightning::util::persist::KVSTORE_NAMESPACE_KEY_MAX_LEN;
 use ldk_node::lightning::util::persist::KVStore;
 
@@ -32,7 +32,7 @@ const REVISION_KEY: &str = "revision";
 const LOCAL_REVISION_KEY: &str = "local_revision";
 
 #[derive(Clone)]
-pub(crate) struct SparkStore(pub(crate) Arc<DynStore>);
+pub(crate) struct SparkStore(pub(crate) Arc<dyn DynStore>);
 
 /// The Spark sdk can produce keys that are too long, we just truncate them here
 fn sanitize_key(key: String) -> String {

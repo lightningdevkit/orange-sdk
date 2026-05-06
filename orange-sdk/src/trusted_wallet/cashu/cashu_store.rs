@@ -3,10 +3,10 @@ use std::fmt::Debug;
 use std::str::FromStr;
 use std::sync::{Arc, RwLock};
 
+use crate::dyn_store::DynStore;
 use async_trait::async_trait;
 use cdk::cdk_database::WalletDatabase;
 use cdk::wallet::types::WalletSaga;
-use ldk_node::DynStore;
 use ldk_node::lightning::io;
 use ldk_node::lightning::util::persist::KVStore;
 
@@ -113,7 +113,7 @@ impl From<DatabaseError> for cdk::cdk_database::Error {
 
 /// A KV store-based implementation of the Cashu WalletDatabase trait
 pub struct CashuKvDatabase {
-	store: Arc<DynStore>,
+	store: Arc<dyn DynStore>,
 	// In-memory caches for frequently accessed data
 	mints_cache: Arc<RwLock<HashMap<MintUrl, Option<MintInfo>>>>,
 	proofs_cache: Arc<RwLock<Vec<ProofInfo>>>,
@@ -143,7 +143,7 @@ impl CashuKvDatabase {
 	///
 	/// Returns a `Result` containing the initialized database or a `DatabaseError` if
 	/// initialization fails.
-	pub async fn new(store: Arc<DynStore>) -> Result<Self, DatabaseError> {
+	pub(crate) async fn new(store: Arc<dyn DynStore>) -> Result<Self, DatabaseError> {
 		let database = Self {
 			store,
 			mints_cache: Arc::new(RwLock::new(HashMap::new())),
@@ -1203,7 +1203,7 @@ impl WalletDatabase<cdk::cdk_database::Error> for CashuKvDatabase {
 	}
 }
 
-pub(super) async fn read_has_recovered(store: &Arc<DynStore>) -> Result<bool, TrustedError> {
+pub(super) async fn read_has_recovered(store: &Arc<dyn DynStore>) -> Result<bool, TrustedError> {
 	match KVStore::read(store.as_ref(), CASHU_PRIMARY_KEY, "", HAS_RECOVERED_KEY).await {
 		Ok(data) => {
 			if data.is_empty() {
@@ -1217,7 +1217,7 @@ pub(super) async fn read_has_recovered(store: &Arc<DynStore>) -> Result<bool, Tr
 }
 
 pub(super) async fn write_has_recovered(
-	store: &Arc<DynStore>, has_recovered: bool,
+	store: &Arc<dyn DynStore>, has_recovered: bool,
 ) -> Result<(), TrustedError> {
 	let data = vec![if has_recovered { 1 } else { 0 }];
 

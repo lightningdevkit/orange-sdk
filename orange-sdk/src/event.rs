@@ -1,6 +1,7 @@
 use crate::logging::Logger;
 use crate::store::{self, PaymentId};
 
+use crate::dyn_store::DynStore;
 use ldk_node::bitcoin::secp256k1::PublicKey;
 use ldk_node::bitcoin::{OutPoint, Txid};
 use ldk_node::lightning::events::{ClosureReason, PaymentFailureReason};
@@ -11,7 +12,7 @@ use ldk_node::lightning::util::ser::{Writeable, Writer};
 use ldk_node::lightning::{impl_writeable_tlv_based_enum, log_debug, log_error, log_warn};
 use ldk_node::lightning_types::payment::{PaymentHash, PaymentPreimage};
 use ldk_node::payment::{ConfirmationStatus, PaymentKind};
-use ldk_node::{CustomTlvRecord, DynStore, UserChannelId};
+use ldk_node::{CustomTlvRecord, UserChannelId};
 
 use std::collections::VecDeque;
 use std::sync::Arc;
@@ -207,12 +208,12 @@ impl_writeable_tlv_based_enum!(Event,
 pub struct EventQueue {
 	queue: Arc<Mutex<VecDeque<Event>>>,
 	waker: Arc<Mutex<Option<Waker>>>,
-	kv_store: Arc<DynStore>,
+	kv_store: Arc<dyn DynStore>,
 	logger: Arc<Logger>,
 }
 
 impl EventQueue {
-	pub(crate) fn new(kv_store: Arc<DynStore>, logger: Arc<Logger>) -> Self {
+	pub(crate) fn new(kv_store: Arc<dyn DynStore>, logger: Arc<Logger>) -> Self {
 		let queue = Arc::new(Mutex::new(VecDeque::new()));
 		let waker = Arc::new(Mutex::new(None));
 		Self { queue, waker, kv_store, logger }
@@ -335,6 +336,7 @@ impl LdkEventHandler {
 				payment_hash,
 				payment_preimage,
 				fee_paid_msat,
+				bolt12_invoice: _,
 			} => {
 				let preimage = payment_preimage.unwrap(); // safe
 				let payment_id = PaymentId::SelfCustodial(payment_id.unwrap().0); // safe

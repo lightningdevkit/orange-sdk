@@ -27,13 +27,16 @@ use ldk_node::lightning::util::logger::Logger as _;
 use ldk_node::lightning::{log_debug, log_error, log_info, log_trace, log_warn};
 use ldk_node::lightning_invoice::Bolt11Invoice;
 use ldk_node::payment::{PaymentDirection, PaymentKind};
-use ldk_node::{BuildError, ChannelDetails, DynStore, NodeError};
+use ldk_node::{BuildError, ChannelDetails, NodeError};
+
+use crate::dyn_store::DynStore;
 
 use std::collections::HashMap;
 use std::fmt::{self, Debug, Write};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
+mod dyn_store;
 mod event;
 #[cfg(feature = "uniffi")]
 mod ffi;
@@ -112,7 +115,7 @@ struct WalletImpl {
 	/// Metadata store for tracking transactions.
 	tx_metadata: TxMetadataStore,
 	/// Key-value store for persistent storage.
-	store: Arc<DynStore>,
+	store: Arc<dyn DynStore>,
 	/// Logger for logging wallet operations.
 	logger: Arc<Logger>,
 	/// The Tokio runtime for asynchronous operations.
@@ -519,7 +522,7 @@ impl Wallet {
 			BuildError::RuntimeSetupFailed
 		})?);
 
-		let store: Arc<DynStore> = match &config.storage_config {
+		let store: Arc<dyn DynStore> = match &config.storage_config {
 			StorageConfig::LocalSQLite(path) => {
 				Arc::new(SqliteStore::new(path.into(), Some("orange.sqlite".to_owned()), None)?)
 			},

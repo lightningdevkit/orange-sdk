@@ -7,7 +7,7 @@ use crate::store::{PaymentId, TxMetadataStore, TxStatus};
 use crate::trusted_wallet::{Payment, TrustedError, TrustedWalletInterface};
 use crate::{Event, EventQueue, InitFailure, Seed, WalletConfig};
 
-use ldk_node::DynStore;
+use crate::dyn_store::DynStore;
 use ldk_node::bitcoin::hashes::Hash;
 use ldk_node::bitcoin::hashes::sha256::Hash as Sha256;
 use ldk_node::bitcoin::hex::FromHex;
@@ -251,7 +251,7 @@ impl TrustedWalletInterface for Cashu {
 
 			let quote = match method {
 				PaymentMethod::LightningBolt11(invoice) => {
-					payment_hash = Some(PaymentHash(invoice.payment_hash().to_byte_array()));
+					payment_hash = Some(invoice.payment_hash());
 
 					// if we have an active quote for this invoice, use it
 					// otherwise create a new one
@@ -539,7 +539,7 @@ const PAYMENT_HASH_METADATA_KEY: &str = "payment_hash";
 
 impl Cashu {
 	pub(crate) async fn init(
-		config: &WalletConfig, cashu_config: CashuConfig, store: Arc<DynStore>,
+		config: &WalletConfig, cashu_config: CashuConfig, store: Arc<dyn DynStore>,
 		event_queue: Arc<EventQueue>, tx_metadata: TxMetadataStore, logger: Arc<Logger>,
 		runtime: Arc<Runtime>,
 	) -> Result<Self, InitFailure> {
@@ -837,7 +837,7 @@ impl Cashu {
 			event_queue
 				.add_event(Event::PaymentReceived {
 					payment_id: PaymentId::Trusted(payment_id),
-					payment_hash: PaymentHash(hash.to_byte_array()),
+					payment_hash: hash,
 					amount_msat: u64::from(mint_quote.amount.unwrap_or_default()) * 1_000, /* convert to msats */
 					custom_records: vec![],
 					lsp_fee_msats: None,
