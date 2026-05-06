@@ -87,7 +87,7 @@ impl SparkWalletConfig {
 			optimization_config: OptimizationConfig { auto_enabled: true, multiplicity: 1 },
 			stable_balance_config: None,
 			max_concurrent_claims: 4,
-			support_lnurl_verify: false,
+			spark_config: None,
 		})
 	}
 }
@@ -415,6 +415,12 @@ impl EventListener for SparkEventHandler {
 			},
 			SdkEvent::Optimization { optimization_event } => {
 				log_debug!(self.logger, "Spark optimization event: {optimization_event:?}");
+			},
+			SdkEvent::LightningAddressChanged { lightning_address } => {
+				log_debug!(self.logger, "Spark lightning address changed: {lightning_address:?}");
+			},
+			SdkEvent::NewDeposits { new_deposits } => {
+				log_info!(self.logger, "Spark wallet new deposits: {new_deposits:?}");
 			},
 		}
 	}
