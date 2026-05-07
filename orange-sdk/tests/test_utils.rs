@@ -175,7 +175,6 @@ fn create_lsp(uuid: Uuid, bitcoind: &Bitcoind) -> Arc<Node> {
 
 	let port = get_available_port().unwrap();
 	let addr = SocketAddress::TcpIpV4 { addr: [127, 0, 0, 1], port };
-	builder.set_listening_addresses(vec![addr.clone()]).unwrap();
 	builder.set_listening_addresses(vec![addr]).unwrap();
 
 	let ldk_node = Arc::new(builder.build(node_entropy).unwrap());
@@ -219,7 +218,6 @@ fn create_third_party(uuid: Uuid, bitcoind: &Bitcoind) -> Arc<Node> {
 
 	let port = get_available_port().unwrap();
 	let addr = SocketAddress::TcpIpV4 { addr: [127, 0, 0, 1], port };
-	builder.set_listening_addresses(vec![addr.clone()]).unwrap();
 	builder.set_listening_addresses(vec![addr]).unwrap();
 
 	let ldk_node = Arc::new(builder.build(node_entropy).unwrap());
