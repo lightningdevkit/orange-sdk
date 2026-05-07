@@ -243,11 +243,20 @@ fn create_third_party(uuid: Uuid, bitcoind: &Bitcoind) -> Arc<Node> {
 	ldk_node
 }
 
-async fn fund_node(node: &Node, bitcoind: &Bitcoind, electrsd: &ElectrsD) {
-	let addr = node.onchain_payment().new_address().unwrap();
-	let res =
-		bitcoind.client.send_to_address(&addr, bitcoin::Amount::from_btc(1.0).unwrap()).unwrap();
-	wait_for_tx(&electrsd.client, res.txid().unwrap()).await;
+/// Funds two nodes in one round so the 6-block confirmation only happens once.
+async fn fund_two_nodes(a: &Node, b: &Node, bitcoind: &Bitcoind, electrsd: &ElectrsD) {
+	let addr_a = a.onchain_payment().new_address().unwrap();
+	let addr_b = b.onchain_payment().new_address().unwrap();
+
+	let one_btc = bitcoin::Amount::from_btc(1.0).unwrap();
+	let tx_a = bitcoind.client.send_to_address(&addr_a, one_btc).unwrap();
+	let tx_b = bitcoind.client.send_to_address(&addr_b, one_btc).unwrap();
+
+	tokio::join!(
+		wait_for_tx(&electrsd.client, tx_a.txid().unwrap()),
+		wait_for_tx(&electrsd.client, tx_b.txid().unwrap()),
+	);
+
 	generate_blocks(bitcoind, electrsd, 6).await;
 }
 
@@ -301,10 +310,9 @@ async fn build_test_nodes() -> TestParams {
 	let (bitcoind, electrsd) = create_bitcoind(test_id).await;
 
 	let lsp = create_lsp(test_id, &bitcoind);
-	fund_node(&lsp, &bitcoind, &electrsd).await;
 	let third_party = create_third_party(test_id, &bitcoind);
 	let start_bal = third_party.list_balances().total_onchain_balance_sats;
-	fund_node(&third_party, &bitcoind, &electrsd).await;
+	fund_two_nodes(&lsp, &third_party, &bitcoind, &electrsd).await;
 
 	// wait for node to sync (needs blocking wait as we are not in async context here)
 	let third = Arc::clone(&third_party);
