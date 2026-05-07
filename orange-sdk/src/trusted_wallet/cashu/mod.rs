@@ -1,7 +1,7 @@
 //! An implementation of `TrustedWalletInterface` using the Cashu (CDK) SDK.
 
-use crate::bitcoin::hex::DisplayHex;
 use crate::logging::Logger;
+use crate::rebalancer::RebalanceEventHandlerHolder;
 use crate::runtime::Runtime;
 use crate::store::{PaymentId, TxMetadataStore, TxStatus};
 use crate::trusted_wallet::{Payment, TrustedError, TrustedWalletInterface};
@@ -28,8 +28,6 @@ use cdk::wallet::MintQuote;
 use cdk::wallet::Wallet;
 use cdk::wallet::types::{Transaction, TransactionDirection};
 use cdk::{Amount as CdkAmount, StreamExt};
-
-use graduated_rebalancer::ReceivedLightningPayment;
 
 use tokio::sync::{mpsc, watch};
 
@@ -62,8 +60,7 @@ pub struct Cashu {
 	cashu_wallet: Arc<Wallet>,
 	unit: CurrencyUnit,
 	shutdown_sender: watch::Sender<()>,
-	payment_success_sender: watch::Sender<()>,
-	payment_success_flag: watch::Receiver<()>,
+	rebalance_event_handler: RebalanceEventHandlerHolder,
 	logger: Arc<Logger>,
 	supports_bolt12: Arc<std::sync::atomic::AtomicBool>,
 	mint_quote_sender: mpsc::Sender<MintQuote>,
@@ -318,7 +315,8 @@ impl TrustedWalletInterface for Cashu {
 			let event_queue = Arc::clone(&self.event_queue);
 			let tx_metadata = self.tx_metadata.clone();
 			let quote_id = quote.id.clone();
-			let payment_success_sender = self.payment_success_sender.clone();
+			let rebalance_handler = Arc::clone(&self.rebalance_event_handler);
+			let unit = self.unit.clone();
 			self.runtime.spawn_background_task(async move {
 				let mut metadata = HashMap::new();
 				if let Some(hash) = &payment_hash {
@@ -337,15 +335,14 @@ impl TrustedWalletInterface for Cashu {
 								log_info!(logger, "Successfully sent for quote: {quote_id}");
 
 								let payment_id = PaymentId::Trusted(payment_id);
+								let fee_msat = convert_amount(res.fee_paid(), &unit)
+									.unwrap_or(Amount::ZERO)
+									.milli_sats();
+
 								let is_rebalance = {
 									let map = tx_metadata.read();
 									map.get(&payment_id).is_some_and(|m| m.ty.is_rebalance())
 								};
-								if is_rebalance {
-									// make sure we still send payment success
-									payment_success_sender.send(()).unwrap();
-									return;
-								}
 
 								let preimage: Option<PaymentPreimage> = match res.payment_proof() {
 									Some(str) => match FromHex::from_hex(str) {
@@ -394,6 +391,18 @@ impl TrustedWalletInterface for Cashu {
 								let payment_preimage =
 									preimage.unwrap_or(PaymentPreimage([0u8; 32]));
 
+								if is_rebalance {
+									log_info!(
+										logger,
+										"Notifying rebalancer of successful trusted payment: {payment_id:?}"
+									);
+									// Notify the rebalance event handler
+									rebalance_handler
+										.notify_trusted_payment_sent(hash.0, Some(fee_msat))
+										.await;
+									return;
+								}
+
 								if tx_metadata
 									.set_preimage(payment_id, payment_preimage.0)
 									.await
@@ -405,17 +414,14 @@ impl TrustedWalletInterface for Cashu {
 									);
 								}
 
-								let fee_paid_sat: u64 = res.fee_paid().into();
 								let _ = event_queue
 									.add_event(Event::PaymentSuccessful {
 										payment_id,
 										payment_hash: hash,
 										payment_preimage,
-										fee_paid_msat: Some(fee_paid_sat * 1_000), // convert to msats
+										fee_paid_msat: Some(fee_msat),
 									})
 									.await;
-
-								payment_success_sender.send(()).unwrap();
 							},
 							MeltQuoteState::Failed => {
 								log_error!(logger, "Melt failed for quote: {quote_id}");
@@ -425,7 +431,21 @@ impl TrustedWalletInterface for Cashu {
 									map.get(&payment_id).is_some_and(|m| m.ty.is_rebalance())
 								};
 
-								if !is_rebalance {
+								if is_rebalance {
+									log_info!(
+										logger,
+										"Notifying rebalancer of failed trusted payment: {payment_id:?}"
+									);
+									// Notify the rebalance event handler
+									if let Some(hash) = payment_hash {
+										rebalance_handler
+											.notify_trusted_payment_failed(
+												hash.0,
+												format!("Cashu melt failed for quote {quote_id}"),
+											)
+											.await;
+									}
+								} else {
 									let _ = event_queue
 										.add_event(Event::PaymentFailed {
 											payment_id,
@@ -452,7 +472,21 @@ impl TrustedWalletInterface for Cashu {
 							map.get(&payment_id).is_some_and(|m| m.ty.is_rebalance())
 						};
 
-						if !is_rebalance {
+						if is_rebalance {
+							log_info!(
+								logger,
+								"Notifying rebalancer of failed trusted payment: {payment_id:?}"
+							);
+							// Notify the rebalance event handler
+							if let Some(hash) = payment_hash {
+								rebalance_handler
+									.notify_trusted_payment_failed(
+										hash.0,
+										format!("Cashu melt error for quote {quote_id}: {e}"),
+									)
+									.await;
+							}
+						} else {
 							let _ = event_queue
 								.add_event(Event::PaymentFailed {
 									payment_id,
@@ -466,35 +500,6 @@ impl TrustedWalletInterface for Cashu {
 			});
 
 			Ok(payment_id)
-		})
-	}
-
-	fn await_payment_success(
-		&self, payment_hash: [u8; 32],
-	) -> Pin<Box<dyn Future<Output = Option<ReceivedLightningPayment>> + Send + '_>> {
-		Box::pin(async move {
-			loop {
-				let txs = self
-					.cashu_wallet
-					.list_transactions(Some(TransactionDirection::Outgoing))
-					.await
-					.ok()?;
-
-				let hex = payment_hash.to_lower_hex_string();
-				let tx = txs.iter().find(|tx| {
-					tx.metadata.get(PAYMENT_HASH_METADATA_KEY).is_some_and(|h| h == &hex)
-				});
-
-				if let Some(tx) = tx {
-					let payment_id = Self::id_to_32_byte_array(tx.quote_id.as_ref().expect("safe"));
-					return Some(ReceivedLightningPayment {
-						id: payment_id,
-						fee_paid_msat: Some(convert_amount(tx.fee, &self.unit).ok()?.milli_sats()),
-					});
-				}
-
-				self.await_payment_success().await;
-			}
 		})
 	}
 
@@ -533,14 +538,58 @@ impl TrustedWalletInterface for Cashu {
 			let _ = self.shutdown_sender.send(());
 		})
 	}
+
+	fn find_payment_by_hash(
+		&self, payment_hash: [u8; 32],
+	) -> Pin<Box<dyn Future<Output = Result<Option<[u8; 32]>, TrustedError>> + Send + '_>> {
+		Box::pin(async move {
+			// Check all active melt quotes (pending outbound payments)
+			let quotes = self.cashu_wallet.get_active_melt_quotes().await.map_err(|e| {
+				TrustedError::WalletOperationFailed(format!(
+					"Failed to get active melt quotes: {e}"
+				))
+			})?;
+
+			for quote in quotes {
+				if let Ok(invoice) = Bolt11Invoice::from_str(&quote.request) {
+					if invoice.payment_hash().to_byte_array() == payment_hash {
+						let payment_id = Self::id_to_32_byte_array(&quote.id);
+						return Ok(Some(payment_id));
+					}
+				}
+			}
+
+			// if not found, check completed transactions
+			let transactions = self.cashu_wallet.list_transactions(None).await.map_err(|e| {
+				TrustedError::WalletOperationFailed(format!("Failed to list transactions: {e}"))
+			})?;
+
+			for transaction in transactions {
+				if transaction.direction == TransactionDirection::Outgoing {
+					if let Some(quote_id) = &transaction.quote_id {
+						if let Ok(invoice) = Bolt11Invoice::from_str(quote_id) {
+							if invoice.payment_hash().to_byte_array() == payment_hash {
+								let payment_id = Self::id_to_32_byte_array(quote_id);
+								return Ok(Some(payment_id));
+							}
+						}
+					}
+				}
+			}
+
+			Ok(None)
+		})
+	}
 }
 
 const PAYMENT_HASH_METADATA_KEY: &str = "payment_hash";
 
 impl Cashu {
+	#[allow(clippy::too_many_arguments)]
 	pub(crate) async fn init(
 		config: &WalletConfig, cashu_config: CashuConfig, store: Arc<DynStore>,
-		event_queue: Arc<EventQueue>, tx_metadata: TxMetadataStore, logger: Arc<Logger>,
+		event_queue: Arc<EventQueue>, tx_metadata: TxMetadataStore,
+		rebalance_event_handler: RebalanceEventHandlerHolder, logger: Arc<Logger>,
 		runtime: Arc<Runtime>,
 	) -> Result<Self, InitFailure> {
 		match &cashu_config.unit {
@@ -599,7 +648,6 @@ impl Cashu {
 		}
 
 		let (shutdown_sender, mut shutdown_receiver) = watch::channel::<()>(());
-		let (payment_success_sender, payment_success_flag) = watch::channel(());
 
 		// Create channel for mint quote monitoring with bounded capacity
 		let (mint_quote_sender, mut mint_quote_receiver) = mpsc::channel::<MintQuote>(32);
@@ -738,8 +786,7 @@ impl Cashu {
 			cashu_wallet,
 			unit: cashu_config.unit,
 			shutdown_sender,
-			payment_success_sender,
-			payment_success_flag,
+			rebalance_event_handler,
 			logger,
 			supports_bolt12,
 			mint_quote_sender,
@@ -848,12 +895,6 @@ impl Cashu {
 			log_info!(logger, "Sent PaymentReceived event for mint quote: {}", mint_quote.id);
 		}
 		Ok(())
-	}
-
-	pub(crate) async fn await_payment_success(&self) {
-		let mut flag = self.payment_success_flag.clone();
-		flag.mark_unchanged();
-		let _ = flag.changed().await;
 	}
 }
 

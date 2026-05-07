@@ -7,7 +7,7 @@ use ldk_node::lightning_invoice::Bolt11Invoice;
 use bitcoin_payment_instructions::PaymentMethod;
 use bitcoin_payment_instructions::amount::Amount;
 
-use graduated_rebalancer::ReceivedLightningPayment;
+use graduated_rebalancer::PendingPaymentInfo;
 
 use std::future::Future;
 use std::pin::Pin;
@@ -44,7 +44,7 @@ pub struct Payment {
 pub(crate) type DynTrustedWalletInterface = dyn TrustedWalletInterface + Send + Sync;
 
 /// Represents a trait for a trusted wallet interface.
-pub trait TrustedWalletInterface: Send + Sync + private::Sealed {
+pub(crate) trait TrustedWalletInterface: Send + Sync + private::Sealed {
 	/// Returns the current balance of the wallet.
 	fn get_balance(
 		&self,
@@ -83,12 +83,6 @@ pub trait TrustedWalletInterface: Send + Sync + private::Sealed {
 		&self, method: PaymentMethod, amount: Amount,
 	) -> Pin<Box<dyn Future<Output = Result<[u8; 32], TrustedError>> + Send + '_>>;
 
-	/// Waits for a payment with the given payment hash to succeed.
-	/// Returns the `ReceivedLightningPayment` if successful, or `None` if it fails or times out.
-	fn await_payment_success(
-		&self, payment_hash: [u8; 32],
-	) -> Pin<Box<dyn Future<Output = Option<ReceivedLightningPayment>> + Send + '_>>;
-
 	/// Gets the lightning address for this wallet, if one is set.
 	fn get_lightning_address(
 		&self,
@@ -102,6 +96,15 @@ pub trait TrustedWalletInterface: Send + Sync + private::Sealed {
 	/// Stops the wallet, cleaning up any resources.
 	/// This is typically used to gracefully shut down the wallet.
 	fn stop(&self) -> Pin<Box<dyn Future<Output = ()> + Send + '_>>;
+
+	/// Find a pending outbound payment by its payment hash.
+	/// Returns `Some(payment_id)` if a pending payment with the given hash exists,
+	/// `None` otherwise. This is used during recovery to determine if a payment was
+	/// actually initiated before a crash.
+	#[allow(clippy::type_complexity)]
+	fn find_payment_by_hash(
+		&self, payment_hash: [u8; 32],
+	) -> Pin<Box<dyn Future<Output = Result<Option<[u8; 32]>, TrustedError>> + Send + '_>>;
 }
 
 pub(crate) struct WalletTrusted<T: TrustedWalletInterface + ?Sized>(pub(crate) Arc<Box<T>>);
@@ -127,10 +130,14 @@ impl<T: ?Sized + TrustedWalletInterface> graduated_rebalancer::TrustedWallet for
 		Box::pin(async move { self.0.pay(method, amount).await })
 	}
 
-	fn await_payment_success(
+	fn find_payment_by_hash(
 		&self, payment_hash: [u8; 32],
-	) -> Pin<Box<dyn Future<Output = Option<ReceivedLightningPayment>> + Send + '_>> {
-		Box::pin(async move { self.0.await_payment_success(payment_hash).await })
+	) -> Pin<Box<dyn Future<Output = Result<Option<PendingPaymentInfo>, Self::Error>> + Send + '_>>
+	{
+		Box::pin(async move {
+			let payment_id = self.0.find_payment_by_hash(payment_hash).await?;
+			Ok(payment_id.map(|id| PendingPaymentInfo { payment_id: id }))
+		})
 	}
 }
 
