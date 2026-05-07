@@ -147,7 +147,20 @@ impl LightningWallet {
 					},
 				}
 			},
-			ChainSource::Electrum(url) => builder.set_chain_source_electrum(url, None),
+			ChainSource::Electrum(url) => {
+				let sync_config = if config.network == Network::Regtest {
+					Some(ldk_node::config::ElectrumSyncConfig {
+						background_sync_config: Some(BackgroundSyncConfig {
+							onchain_wallet_sync_interval_secs: 2,
+							lightning_wallet_sync_interval_secs: 2,
+							fee_rate_cache_update_interval_secs: 30,
+						}),
+					})
+				} else {
+					None
+				};
+				builder.set_chain_source_electrum(url, sync_config)
+			},
 			ChainSource::BitcoindRPC { host, port, user, password } => {
 				builder.set_chain_source_bitcoind_rpc(host, port, user, password)
 			},
