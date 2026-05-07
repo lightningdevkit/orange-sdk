@@ -93,12 +93,9 @@ async fn create_bitcoind(uuid: Uuid) -> (Arc<Bitcoind>, Arc<ElectrsD>) {
 		ElectrsD::with_conf(electrsd::downloaded_exe_path().unwrap(), &bitcoind, &electrsd_conf)
 			.unwrap_or_else(|_| panic!("Failed to start electrsd for test {uuid}"));
 
-	// mine 101 blocks to get some spendable funds, split it up into batches
-	// to avoid potentially hitting RPC timeouts on slower CI systems
+	// mine 101 blocks to get some spendable funds
 	let address = bitcoind.client.new_address().unwrap();
-	for batch_size in [50, 51] {
-		let _block_hashes = bitcoind.client.generate_to_address(batch_size, &address).unwrap();
-	}
+	let _block_hashes = bitcoind.client.generate_to_address(101, &address).unwrap();
 
 	wait_for_block(&electrsd.client, 101).await;
 
