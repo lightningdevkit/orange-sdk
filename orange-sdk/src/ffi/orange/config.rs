@@ -53,12 +53,27 @@ impl TryInto<OrangeSeed> for Seed {
 	}
 }
 
-/// Represents the authentication method for a Versioned Storage Service (VSS).
+/// Authentication method used on every request to the [VSS] server.
+///
+/// **Caution**: VSS support is in **alpha** and is considered experimental.
+/// Using VSS (or any remote persistence) may cause LDK to panic if persistence
+/// failures are unrecoverable, i.e., if they remain unresolved after internal
+/// retries are exhausted.
+///
+/// [VSS]: https://github.com/lightningdevkit/vss-server/blob/main/README.md
 #[derive(Debug, Clone, uniffi::Enum)]
 pub enum VssAuth {
-	/// Authentication using an LNURL-auth server.
+	/// [LNURL-auth] based authentication scheme.
+	///
+	/// The LNURL challenge will be retrieved by making a request to the given
+	/// URL. The returned JWT token in response to the signed LNURL request
+	/// will be used for authentication/authorization of all the requests made
+	/// to VSS.
+	///
+	/// [LNURL-auth]: https://github.com/lnurl/luds/blob/luds/04.md
 	LNURLAuthServer(String),
-	/// Authentication using a fixed set of HTTP headers.
+	/// A fixed set of HTTP headers included as-is on every request made to
+	/// VSS.
 	FixedHeaders(HashMap<String, String>),
 }
 
@@ -80,14 +95,23 @@ impl From<OrangeVssAuth> for VssAuth {
 	}
 }
 
-/// Configuration for a Versioned Storage Service (VSS).
+/// Configuration for a [Versioned Storage Service (VSS)] backend.
+///
+/// **Caution**: VSS support is in **alpha** and is considered experimental.
+/// Using VSS (or any remote persistence) may cause LDK to panic if persistence
+/// failures are unrecoverable, i.e., if they remain unresolved after internal
+/// retries are exhausted.
+///
+/// [Versioned Storage Service (VSS)]: https://github.com/lightningdevkit/vss-server/blob/main/README.md
 #[derive(Debug, Clone, uniffi::Object)]
 pub struct VssConfig {
-	/// The URL of the VSS.
+	/// Base URL of the VSS server (e.g. `https://vss.example.com/vss`).
 	vss_url: String,
-	/// The store ID for the VSS.
+	/// Segments storage from other storage accessed under the same seed (as
+	/// storage keyed by different seeds is already segmented to prevent
+	/// wallets from reading data for unrelated wallets). Can be any value.
 	store_id: String,
-	/// Authentication method for the VSS.
+	/// Authentication method attached to every VSS request.
 	headers: VssAuth,
 }
 
@@ -124,14 +148,17 @@ impl From<OrangeVssConfig> for VssConfig {
 pub enum StorageConfig {
 	/// Local SQLite database configuration.
 	LocalSQLite(String),
-	// todo VSS(VssConfig),
+	/// Versioned Storage Service configuration.
+	Vss(Arc<VssConfig>),
 }
 
 impl From<StorageConfig> for OrangeStorageConfig {
 	fn from(config: StorageConfig) -> Self {
 		match config {
 			StorageConfig::LocalSQLite(path) => OrangeStorageConfig::LocalSQLite(path),
-			// todo VSS(vss_config) => OrangeStorageConfig::VSS(vss_config.into()),
+			StorageConfig::Vss(vss_config) => {
+				OrangeStorageConfig::Vss(vss_config.deref().clone().into())
+			},
 		}
 	}
 }
