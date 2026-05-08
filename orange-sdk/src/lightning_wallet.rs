@@ -1,5 +1,6 @@
 use crate::bitcoin::OutPoint;
 use crate::bitcoin::hashes::Hash;
+use crate::dyn_store::{DynStore, LdkNodeStore};
 use crate::event::{EventQueue, LdkEventHandler};
 use crate::logging::Logger;
 use crate::runtime::Runtime;
@@ -13,7 +14,8 @@ use ldk_node::bitcoin::base64::Engine;
 use ldk_node::bitcoin::base64::prelude::BASE64_STANDARD;
 use ldk_node::bitcoin::secp256k1::PublicKey;
 use ldk_node::bitcoin::{Address, Network};
-use ldk_node::config::{AsyncPaymentsRole, BackgroundSyncConfig};
+use ldk_node::config::{AsyncPaymentsRole, BackgroundSyncConfig, SyncTimeoutsConfig};
+use ldk_node::entropy::NodeEntropy;
 use ldk_node::lightning::ln::channelmanager::PaymentId;
 use ldk_node::lightning::ln::msgs::SocketAddress;
 use ldk_node::lightning::util::logger::Logger as _;
@@ -22,7 +24,7 @@ use ldk_node::lightning_invoice::{Bolt11Invoice, Bolt11InvoiceDescription, Descr
 use ldk_node::payment::{
 	ConfirmationStatus, PaymentDetails, PaymentDirection, PaymentKind, PaymentStatus,
 };
-use ldk_node::{DynStore, NodeError, UserChannelId};
+use ldk_node::{NodeError, UserChannelId};
 
 use graduated_rebalancer::{LightningBalance, ReceivedLightningPayment};
 
@@ -42,7 +44,7 @@ pub(crate) struct LightningWalletBalance {
 pub(crate) struct LightningWalletImpl {
 	pub(crate) ldk_node: Arc<ldk_node::Node>,
 	logger: Arc<Logger>,
-	store: Arc<DynStore>,
+	store: Arc<dyn DynStore>,
 	payment_receipt_flag: watch::Receiver<()>,
 	channel_pending_receipt_flag: watch::Receiver<u128>,
 	splice_pending_receipt_flag: watch::Receiver<u128>,
@@ -58,7 +60,7 @@ const DEFAULT_INVOICE_EXPIRY_SECS: u32 = 86_400; // 24 hours
 
 impl LightningWallet {
 	pub(super) async fn init(
-		runtime: Arc<Runtime>, config: WalletConfig, store: Arc<DynStore>,
+		runtime: Arc<Runtime>, config: WalletConfig, store: Arc<dyn DynStore>,
 		event_queue: Arc<EventQueue>, tx_metadata: TxMetadataStore, logger: Arc<Logger>,
 	) -> Result<Self, InitFailure> {
 		log_info!(logger, "Creating LDK node...");
@@ -72,14 +74,12 @@ impl LightningWallet {
 		};
 		let mut builder = ldk_node::Builder::from_config(ldk_node_config);
 		builder.set_network(config.network);
-		match config.seed {
-			Seed::Seed64(seed) => {
-				builder.set_entropy_seed_bytes(seed);
-			},
+		let node_entropy = match config.seed {
+			Seed::Seed64(seed) => NodeEntropy::from_seed_bytes(seed),
 			Seed::Mnemonic { mnemonic, passphrase } => {
-				builder.set_entropy_bip39_mnemonic(mnemonic, passphrase);
+				NodeEntropy::from_bip39_mnemonic(mnemonic, passphrase)
 			},
-		}
+		};
 
 		match config.rgs_url {
 			Some(url) => {
@@ -118,6 +118,7 @@ impl LightningWallet {
 							lightning_wallet_sync_interval_secs: 2,
 							fee_rate_cache_update_interval_secs: 30,
 						}),
+						timeouts_config: SyncTimeoutsConfig::default(),
 					}
 				} else {
 					ldk_node::config::EsploraSyncConfig::default()
@@ -150,6 +151,7 @@ impl LightningWallet {
 			ChainSource::Electrum(url) => {
 				let sync_config = if config.network == Network::Regtest {
 					Some(ldk_node::config::ElectrumSyncConfig {
+						timeouts_config: SyncTimeoutsConfig::default(),
 						background_sync_config: Some(BackgroundSyncConfig {
 							onchain_wallet_sync_interval_secs: 2,
 							lightning_wallet_sync_interval_secs: 2,
@@ -176,7 +178,8 @@ impl LightningWallet {
 			builder.set_pathfinding_scores_source(url);
 		}
 
-		let ldk_node = Arc::new(builder.build_with_store(Arc::clone(&store))?);
+		let ldk_node =
+			Arc::new(builder.build_with_store(node_entropy, LdkNodeStore(Arc::clone(&store)))?);
 		let (payment_receipt_sender, payment_receipt_flag) = watch::channel(());
 		let (channel_pending_sender, channel_pending_receipt_flag) = watch::channel(0);
 		let (splice_pending_sender, splice_pending_receipt_flag) = watch::channel(0);

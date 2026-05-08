@@ -137,7 +137,7 @@ async fn test_pay_from_trusted() {
 		match event {
 			Event::PaymentSuccessful { payment_hash, fee_paid_msat, .. } => {
 				assert!(fee_paid_msat.is_some());
-				assert_eq!(payment_hash.0, invoice.payment_hash().to_byte_array());
+				assert_eq!(payment_hash, invoice.payment_hash());
 			},
 			e => panic!("Expected PaymentSuccessful event, got {e:?}"),
 		}
@@ -1482,8 +1482,8 @@ async fn test_payment_with_expired_invoice() {
 		let invoice =
 			third_party.bolt11_payment().receive(payment_amount.milli_sats(), &desc, 1).unwrap(); // 1 second expiry
 
-		// Wait longer to ensure invoice expires
-		tokio::time::sleep(Duration::from_secs(5)).await;
+		// Wait long enough to ensure the 1s-expiry invoice has expired.
+		tokio::time::sleep(Duration::from_secs(2)).await;
 
 		// Try to parse and pay the expired invoice - it should either fail to parse or fail to pay
 		let parse_result = wallet.parse_payment_instructions(invoice.to_string().as_str()).await;

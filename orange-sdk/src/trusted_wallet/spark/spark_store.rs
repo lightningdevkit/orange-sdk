@@ -5,14 +5,14 @@ use std::sync::Arc;
 
 use crate::io;
 
+use crate::dyn_store::DynStore;
 use breez_sdk_spark::sync_storage::{
 	IncomingChange, OutgoingChange, Record, RecordChange, RecordId, UnversionedRecordChange,
 };
 use breez_sdk_spark::{
-	DepositInfo, Payment, PaymentDetails, PaymentMetadata, SetLnurlMetadataItem, StorageError,
-	StorageListPaymentsRequest, UpdateDepositPayload,
+	Contact, DepositInfo, ListContactsRequest, Payment, PaymentDetails, PaymentMetadata,
+	SetLnurlMetadataItem, StorageError, StorageListPaymentsRequest, UpdateDepositPayload,
 };
-use ldk_node::DynStore;
 use ldk_node::lightning::util::persist::KVSTORE_NAMESPACE_KEY_MAX_LEN;
 use ldk_node::lightning::util::persist::KVStore;
 
@@ -32,7 +32,7 @@ const REVISION_KEY: &str = "revision";
 const LOCAL_REVISION_KEY: &str = "local_revision";
 
 #[derive(Clone)]
-pub(crate) struct SparkStore(pub(crate) Arc<DynStore>);
+pub(crate) struct SparkStore(pub(crate) Arc<dyn DynStore>);
 
 /// The Spark sdk can produce keys that are too long, we just truncate them here
 fn sanitize_key(key: String) -> String {
@@ -298,6 +298,7 @@ impl breez_sdk_spark::Storage for SparkStore {
 				lnurl_withdraw_info: metadata.lnurl_withdraw_info.or(existing.lnurl_withdraw_info),
 				lnurl_description: metadata.lnurl_description.or(existing.lnurl_description),
 				conversion_info: metadata.conversion_info.or(existing.conversion_info),
+				conversion_status: metadata.conversion_status.or(existing.conversion_status),
 			}
 		} else {
 			metadata
@@ -407,13 +408,14 @@ impl breez_sdk_spark::Storage for SparkStore {
 	}
 
 	async fn add_deposit(
-		&self, txid: String, vout: u32, amount_sats: u64,
+		&self, txid: String, vout: u32, amount_sats: u64, is_mature: bool,
 	) -> Result<(), StorageError> {
 		let id = format!("{txid}:{vout}");
 		let info = DepositInfo {
 			txid,
 			vout,
 			amount_sats,
+			is_mature,
 			refund_tx: None,
 			refund_tx_id: None,
 			claim_error: None,
@@ -531,6 +533,28 @@ impl breez_sdk_spark::Storage for SparkStore {
 		&self, _metadata: Vec<SetLnurlMetadataItem>,
 	) -> Result<(), StorageError> {
 		// we don't use this
+		Ok(())
+	}
+
+	async fn list_contacts(
+		&self, _request: ListContactsRequest,
+	) -> Result<Vec<Contact>, StorageError> {
+		// Contacts are not used by orange-sdk
+		Ok(Vec::new())
+	}
+
+	async fn get_contact(&self, _id: String) -> Result<Contact, StorageError> {
+		// Contacts are not used by orange-sdk
+		Err(StorageError::Implementation("contacts are not supported".to_string()))
+	}
+
+	async fn insert_contact(&self, _contact: Contact) -> Result<(), StorageError> {
+		// Contacts are not used by orange-sdk
+		Ok(())
+	}
+
+	async fn delete_contact(&self, _id: String) -> Result<(), StorageError> {
+		// Contacts are not used by orange-sdk
 		Ok(())
 	}
 

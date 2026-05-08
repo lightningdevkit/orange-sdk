@@ -1,6 +1,7 @@
 use crate::bitcoin::Txid;
 use crate::bitcoin::hashes::Hash;
 use crate::bitcoin::hex::DisplayHex;
+use crate::dyn_store::DynStore;
 use crate::lightning_wallet::LightningWallet;
 use crate::logging::Logger;
 use crate::store::{PaymentId, TxMetadata, TxMetadataStore, TxType};
@@ -8,7 +9,6 @@ use crate::trusted_wallet::DynTrustedWalletInterface;
 use crate::{Event, EventQueue, PaymentType, Tunables, store};
 use bitcoin_payment_instructions::amount::Amount;
 use graduated_rebalancer::{RebalanceTrigger, RebalancerEvent, TriggerParams};
-use ldk_node::DynStore;
 use ldk_node::lightning::util::logger::Logger as _;
 use ldk_node::lightning::{log_error, log_info, log_trace, log_warn};
 use ldk_node::payment::{ConfirmationStatus, PaymentDirection, PaymentKind, PaymentStatus};
@@ -30,7 +30,7 @@ pub(crate) struct OrangeTrigger {
 	/// The event handler for processing wallet events.
 	event_queue: Arc<EventQueue>,
 	/// Key-value store for persistent storage.
-	store: Arc<DynStore>,
+	store: Arc<dyn DynStore>,
 	/// Time of the last on-chain sync, used to determine when to trigger rebalances.
 	onchain_sync_time: AtomicU64,
 	/// Logger for logging events and errors.
@@ -42,7 +42,7 @@ impl OrangeTrigger {
 	pub(crate) fn new(
 		ln_wallet: Arc<LightningWallet>, trusted: Arc<Box<DynTrustedWalletInterface>>,
 		tunables: Tunables, tx_metadata: TxMetadataStore, event_queue: Arc<EventQueue>,
-		store: Arc<DynStore>, logger: Arc<Logger>,
+		store: Arc<dyn DynStore>, logger: Arc<Logger>,
 	) -> Self {
 		let start =
 			ln_wallet.inner.ldk_node.status().latest_onchain_wallet_sync_timestamp.unwrap_or(0);

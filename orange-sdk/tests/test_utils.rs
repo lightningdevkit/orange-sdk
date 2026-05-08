@@ -93,12 +93,9 @@ async fn create_bitcoind(uuid: Uuid) -> (Arc<Bitcoind>, Arc<ElectrsD>) {
 		ElectrsD::with_conf(electrsd::downloaded_exe_path().unwrap(), &bitcoind, &electrsd_conf)
 			.unwrap_or_else(|_| panic!("Failed to start electrsd for test {uuid}"));
 
-	// mine 101 blocks to get some spendable funds, split it up into batches
-	// to avoid potentially hitting RPC timeouts on slower CI systems
+	// mine 101 blocks to get some spendable funds
 	let address = bitcoind.client.new_address().unwrap();
-	for batch_size in [50, 51] {
-		let _block_hashes = bitcoind.client.generate_to_address(batch_size, &address).unwrap();
-	}
+	let _block_hashes = bitcoind.client.generate_to_address(101, &address).unwrap();
 
 	wait_for_block(&electrsd.client, 101).await;
 
@@ -145,7 +142,7 @@ fn create_lsp(uuid: Uuid, bitcoind: &Bitcoind) -> Arc<Node> {
 	builder.set_network(Network::Regtest);
 	let mut seed: [u8; 64] = [0; 64];
 	rand::thread_rng().fill_bytes(&mut seed);
-	builder.set_entropy_seed_bytes(seed);
+	let node_entropy = ldk_node::entropy::NodeEntropy::from_seed_bytes(seed);
 	builder.set_gossip_source_p2p();
 
 	builder.set_node_alias("LSP".to_string()).unwrap();
@@ -172,15 +169,15 @@ fn create_lsp(uuid: Uuid, bitcoind: &Bitcoind) -> Arc<Node> {
 		min_channel_opening_fee_msat: 0,
 		max_client_to_self_delay: 1024,
 		client_trusts_lsp: true,
+		disable_client_reserve: false,
 	};
 	builder.set_liquidity_provider_lsps2(lsps2_service_config);
 
 	let port = get_available_port().unwrap();
 	let addr = SocketAddress::TcpIpV4 { addr: [127, 0, 0, 1], port };
-	builder.set_listening_addresses(vec![addr.clone()]).unwrap();
 	builder.set_listening_addresses(vec![addr]).unwrap();
 
-	let ldk_node = Arc::new(builder.build().unwrap());
+	let ldk_node = Arc::new(builder.build(node_entropy).unwrap());
 
 	ldk_node.start().unwrap();
 
@@ -203,7 +200,7 @@ fn create_third_party(uuid: Uuid, bitcoind: &Bitcoind) -> Arc<Node> {
 	builder.set_network(Network::Regtest);
 	let mut seed: [u8; 64] = [0; 64];
 	rand::thread_rng().fill_bytes(&mut seed);
-	builder.set_entropy_seed_bytes(seed);
+	let node_entropy = ldk_node::entropy::NodeEntropy::from_seed_bytes(seed);
 	builder.set_gossip_source_p2p();
 
 	builder.set_node_alias("third-party".to_string()).unwrap();
@@ -221,10 +218,9 @@ fn create_third_party(uuid: Uuid, bitcoind: &Bitcoind) -> Arc<Node> {
 
 	let port = get_available_port().unwrap();
 	let addr = SocketAddress::TcpIpV4 { addr: [127, 0, 0, 1], port };
-	builder.set_listening_addresses(vec![addr.clone()]).unwrap();
 	builder.set_listening_addresses(vec![addr]).unwrap();
 
-	let ldk_node = Arc::new(builder.build().unwrap());
+	let ldk_node = Arc::new(builder.build(node_entropy).unwrap());
 
 	ldk_node.start().unwrap();
 
@@ -242,11 +238,20 @@ fn create_third_party(uuid: Uuid, bitcoind: &Bitcoind) -> Arc<Node> {
 	ldk_node
 }
 
-async fn fund_node(node: &Node, bitcoind: &Bitcoind, electrsd: &ElectrsD) {
-	let addr = node.onchain_payment().new_address().unwrap();
-	let res =
-		bitcoind.client.send_to_address(&addr, bitcoin::Amount::from_btc(1.0).unwrap()).unwrap();
-	wait_for_tx(&electrsd.client, res.txid().unwrap()).await;
+/// Funds two nodes in one round so the 6-block confirmation only happens once.
+async fn fund_two_nodes(a: &Node, b: &Node, bitcoind: &Bitcoind, electrsd: &ElectrsD) {
+	let addr_a = a.onchain_payment().new_address().unwrap();
+	let addr_b = b.onchain_payment().new_address().unwrap();
+
+	let one_btc = bitcoin::Amount::from_btc(1.0).unwrap();
+	let tx_a = bitcoind.client.send_to_address(&addr_a, one_btc).unwrap();
+	let tx_b = bitcoind.client.send_to_address(&addr_b, one_btc).unwrap();
+
+	tokio::join!(
+		wait_for_tx(&electrsd.client, tx_a.txid().unwrap()),
+		wait_for_tx(&electrsd.client, tx_b.txid().unwrap()),
+	);
+
 	generate_blocks(bitcoind, electrsd, 6).await;
 }
 
@@ -300,10 +305,9 @@ async fn build_test_nodes() -> TestParams {
 	let (bitcoind, electrsd) = create_bitcoind(test_id).await;
 
 	let lsp = create_lsp(test_id, &bitcoind);
-	fund_node(&lsp, &bitcoind, &electrsd).await;
 	let third_party = create_third_party(test_id, &bitcoind);
 	let start_bal = third_party.list_balances().total_onchain_balance_sats;
-	fund_node(&third_party, &bitcoind, &electrsd).await;
+	fund_two_nodes(&lsp, &third_party, &bitcoind, &electrsd).await;
 
 	// wait for node to sync (needs blocking wait as we are not in async context here)
 	let third = Arc::clone(&third_party);
@@ -550,7 +554,7 @@ pub async fn open_channel_from_lsp(wallet: &orange_sdk::Wallet, payer: Arc<Node>
 		orange_sdk::Event::PaymentReceived { payment_hash, amount_msat, lsp_fee_msats, .. } => {
 			assert!(lsp_fee_msats.is_some()); // we expect a fee to be paid for opening a channel
 			assert_eq!(recv_amt.milli_sats(), amount_msat + lsp_fee_msats.unwrap_or(0)); // the fee will be deducted from the amount received
-			assert_eq!(payment_hash.0, uri.invoice.payment_hash().to_byte_array());
+			assert_eq!(payment_hash, uri.invoice.payment_hash());
 		},
 		_ => panic!("Expected PaymentReceived event"),
 	}

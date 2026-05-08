@@ -13,7 +13,7 @@
 
 use bitcoin_payment_instructions::amount::Amount;
 
-use ldk_node::DynStore;
+use crate::dyn_store::DynStore;
 use ldk_node::bitcoin::Txid;
 use ldk_node::bitcoin::hex::{DisplayHex, FromHex};
 use ldk_node::lightning::io;
@@ -295,11 +295,11 @@ impl_writeable_tlv_based!(TxMetadata, { (0, ty, required), (2, time, required) }
 #[derive(Clone)]
 pub(crate) struct TxMetadataStore {
 	tx_metadata: Arc<RwLock<HashMap<PaymentId, TxMetadata>>>,
-	store: Arc<DynStore>,
+	store: Arc<dyn DynStore>,
 }
 
 impl TxMetadataStore {
-	pub async fn new(store: Arc<DynStore>) -> TxMetadataStore {
+	pub async fn new(store: Arc<dyn DynStore>) -> TxMetadataStore {
 		let keys = KVStore::list(store.as_ref(), STORE_PRIMARY_KEY, STORE_SECONDARY_KEY)
 			.await
 			.expect("We do not allow reads to fail");
@@ -429,7 +429,7 @@ impl TxMetadataStore {
 
 const REBALANCE_ENABLED_KEY: &str = "rebalance_enabled";
 
-pub(crate) async fn get_rebalance_enabled(store: &DynStore) -> bool {
+pub(crate) async fn get_rebalance_enabled(store: &dyn DynStore) -> bool {
 	match KVStore::read(store, STORE_PRIMARY_KEY, "", REBALANCE_ENABLED_KEY).await {
 		Ok(bytes) => Readable::read(&mut &bytes[..]).expect("Invalid data in rebalance_enabled"),
 		Err(e) if e.kind() == io::ErrorKind::NotFound => {
@@ -445,14 +445,14 @@ pub(crate) async fn get_rebalance_enabled(store: &DynStore) -> bool {
 	}
 }
 
-pub(crate) async fn set_rebalance_enabled(store: &DynStore, enabled: bool) {
+pub(crate) async fn set_rebalance_enabled(store: &dyn DynStore, enabled: bool) {
 	let bytes = enabled.encode();
 	KVStore::write(store, STORE_PRIMARY_KEY, "", REBALANCE_ENABLED_KEY, bytes)
 		.await
 		.expect("Failed to write rebalance_enabled");
 }
 
-pub(crate) async fn write_splice_out(store: &DynStore, details: &PaymentDetails) {
+pub(crate) async fn write_splice_out(store: &dyn DynStore, details: &PaymentDetails) {
 	KVStore::write(
 		store,
 		STORE_PRIMARY_KEY,
@@ -464,7 +464,7 @@ pub(crate) async fn write_splice_out(store: &DynStore, details: &PaymentDetails)
 	.expect("Failed to write splice out txid");
 }
 
-pub(crate) async fn read_splice_outs(store: &DynStore) -> Vec<PaymentDetails> {
+pub(crate) async fn read_splice_outs(store: &dyn DynStore) -> Vec<PaymentDetails> {
 	let keys = KVStore::list(store, STORE_PRIMARY_KEY, SPLICE_OUT_SECONDARY_KEY)
 		.await
 		.expect("We do not allow reads to fail");

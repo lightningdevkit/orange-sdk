@@ -3,10 +3,10 @@ use std::fmt::Debug;
 use std::str::FromStr;
 use std::sync::{Arc, RwLock};
 
+use crate::dyn_store::DynStore;
 use async_trait::async_trait;
 use cdk::cdk_database::WalletDatabase;
 use cdk::wallet::types::WalletSaga;
-use ldk_node::DynStore;
 use ldk_node::lightning::io;
 use ldk_node::lightning::util::persist::KVStore;
 
@@ -113,7 +113,7 @@ impl From<DatabaseError> for cdk::cdk_database::Error {
 
 /// A KV store-based implementation of the Cashu WalletDatabase trait
 pub struct CashuKvDatabase {
-	store: Arc<DynStore>,
+	store: Arc<dyn DynStore>,
 	// In-memory caches for frequently accessed data
 	mints_cache: Arc<RwLock<HashMap<MintUrl, Option<MintInfo>>>>,
 	proofs_cache: Arc<RwLock<Vec<ProofInfo>>>,
@@ -143,7 +143,7 @@ impl CashuKvDatabase {
 	///
 	/// Returns a `Result` containing the initialized database or a `DatabaseError` if
 	/// initialization fails.
-	pub async fn new(store: Arc<DynStore>) -> Result<Self, DatabaseError> {
+	pub(crate) async fn new(store: Arc<dyn DynStore>) -> Result<Self, DatabaseError> {
 		let database = Self {
 			store,
 			mints_cache: Arc::new(RwLock::new(HashMap::new())),
@@ -1201,9 +1201,41 @@ impl WalletDatabase<cdk::cdk_database::Error> for CashuKvDatabase {
 			.await
 			.map_err(|e| DatabaseError::Io(e).into())
 	}
+
+	// P2PK signing keys are not used by orange-sdk. The stubs below trip a debug assert if
+	// anything (orange-sdk or cdk internals) ever exercises them, so we notice before silently
+	// losing key material; release builds keep the safe defaults.
+	async fn add_p2pk_key(
+		&self, _pubkey: &PublicKey, _derivation_path: ldk_node::bitcoin::bip32::DerivationPath,
+		_derivation_index: u32,
+	) -> Result<(), cdk::cdk_database::Error> {
+		debug_assert!(false, "orange-sdk does not support P2PK keys: add_p2pk_key called");
+		Ok(())
+	}
+
+	async fn get_p2pk_key(
+		&self, _pubkey: &PublicKey,
+	) -> Result<Option<cdk::wallet::types::P2PKSigningKey>, cdk::cdk_database::Error> {
+		debug_assert!(false, "orange-sdk does not support P2PK keys: get_p2pk_key called");
+		Ok(None)
+	}
+
+	async fn list_p2pk_keys(
+		&self,
+	) -> Result<Vec<cdk::wallet::types::P2PKSigningKey>, cdk::cdk_database::Error> {
+		debug_assert!(false, "orange-sdk does not support P2PK keys: list_p2pk_keys called");
+		Ok(Vec::new())
+	}
+
+	async fn latest_p2pk(
+		&self,
+	) -> Result<Option<cdk::wallet::types::P2PKSigningKey>, cdk::cdk_database::Error> {
+		debug_assert!(false, "orange-sdk does not support P2PK keys: latest_p2pk called");
+		Ok(None)
+	}
 }
 
-pub(super) async fn read_has_recovered(store: &Arc<DynStore>) -> Result<bool, TrustedError> {
+pub(super) async fn read_has_recovered(store: &Arc<dyn DynStore>) -> Result<bool, TrustedError> {
 	match KVStore::read(store.as_ref(), CASHU_PRIMARY_KEY, "", HAS_RECOVERED_KEY).await {
 		Ok(data) => {
 			if data.is_empty() {
@@ -1217,7 +1249,7 @@ pub(super) async fn read_has_recovered(store: &Arc<DynStore>) -> Result<bool, Tr
 }
 
 pub(super) async fn write_has_recovered(
-	store: &Arc<DynStore>, has_recovered: bool,
+	store: &Arc<dyn DynStore>, has_recovered: bool,
 ) -> Result<(), TrustedError> {
 	let data = vec![if has_recovered { 1 } else { 0 }];
 

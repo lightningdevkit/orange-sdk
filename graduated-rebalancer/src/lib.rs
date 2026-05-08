@@ -9,7 +9,6 @@
 
 use bitcoin_payment_instructions::amount::Amount;
 use bitcoin_payment_instructions::PaymentMethod;
-use lightning::bitcoin::hashes::Hash;
 use lightning::bitcoin::hex::DisplayHex;
 use lightning::bitcoin::OutPoint;
 use lightning::util::logger::Logger;
@@ -278,7 +277,7 @@ where
 				self.logger,
 				"Attempting to pay invoice {inv} to rebalance for {transfer_amt:?}",
 			);
-			let expected_hash = *inv.payment_hash();
+			let expected_hash = inv.payment_hash();
 			match self.trusted.pay(PaymentMethod::LightningBolt11(inv), transfer_amt).await {
 				Ok(rebalance_id) => {
 					log_debug!(
@@ -295,29 +294,23 @@ where
 						})
 						.await;
 
-					let ln_payment = match self
-						.ln_wallet
-						.await_payment_receipt(expected_hash.to_byte_array())
-						.await
-					{
-						Some(receipt) => receipt,
-						None => {
-							log_error!(self.logger, "Failed to receive rebalance payment!");
-							return;
-						},
-					};
+					let ln_payment =
+						match self.ln_wallet.await_payment_receipt(expected_hash.0).await {
+							Some(receipt) => receipt,
+							None => {
+								log_error!(self.logger, "Failed to receive rebalance payment!");
+								return;
+							},
+						};
 
-					let trusted_payment = match self
-						.trusted
-						.await_payment_success(expected_hash.to_byte_array())
-						.await
-					{
-						Some(success) => success,
-						None => {
-							log_error!(self.logger, "Failed to send rebalance payment!");
-							return;
-						},
-					};
+					let trusted_payment =
+						match self.trusted.await_payment_success(expected_hash.0).await {
+							Some(success) => success,
+							None => {
+								log_error!(self.logger, "Failed to send rebalance payment!");
+								return;
+							},
+						};
 
 					log_info!(
 						self.logger,

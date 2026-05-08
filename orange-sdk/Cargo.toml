@@ -5,7 +5,7 @@ edition = "2024"
 authors = ["benthecarman <benthecarman@live.com>"]
 documentation = "https://docs.rs/orange-sdk/"
 license = "MIT OR Apache-2.0"
-keywords = [ "lightning", "bitcoin", "spark", "cashu" ]
+keywords = ["lightning", "bitcoin", "spark", "cashu"]
 readme = "../README.md"
 
 [lib]
@@ -23,24 +23,24 @@ _cashu-tests = ["_test-utils", "cdk-ldk-node", "cdk/mint", "cdk-sqlite", "cdk-ax
 [dependencies]
 graduated-rebalancer = { path = "../graduated-rebalancer", version = "0.1.0" }
 
-ldk-node = { version = "0.7.0" }
+ldk-node = { git = "https://github.com/lightningdevkit/ldk-node", rev = "109978de1f57fc3b3f23f241f238b97d9deaa56a" }
 lightning-macros = "0.2.0"
 bitcoin-payment-instructions = { workspace = true, features = ["http"] }
 chrono = { version = "0.4", default-features = false }
 rand = { version = "0.8.5", optional = true }
-breez-sdk-spark = { git = "https://github.com/breez/spark-sdk.git", rev = "1000f276d2f16592b5f6eb8fce29228f34ff88bf", default-features = false, optional = true }
+breez-sdk-spark = { git = "https://github.com/breez/spark-sdk.git", rev = "0d8db793618a4f9eaf8098d759baefe58ea2da49", default-features = false, optional = true }
 tokio = { version = "1.0", default-features = false, features = ["rt-multi-thread", "sync", "macros"] }
 uuid = { version = "1.0", default-features = false, optional = true }
-cdk = { version = "0.15.1", default-features = false, features = ["wallet"], optional = true }
+cdk = { version = "0.16.0", default-features = false, features = ["wallet"], optional = true }
 serde_json = { version = "1.0", optional = true }
 async-trait = "0.1"
 log = "0.4.28"
 
 corepc-node = { version = "0.10.1", features = ["29_0", "download"], optional = true }
 electrsd = { version = "0.36.1", default-features = false, features = ["esplora_a33e97e1", "corepc-node_29_0"], optional = true }
-cdk-ldk-node = { version = "0.15.1", optional = true }
-cdk-sqlite = { version = "0.15.1", optional = true }
-cdk-axum = { version = "0.15.1", optional = true }
+cdk-ldk-node = { version = "0.16.0", optional = true }
+cdk-sqlite = { version = "0.16.0", optional = true }
+cdk-axum = { version = "0.16.0", optional = true }
 axum = { version = "0.8.1", optional = true }
 
 uniffi = { version = "0.29", default-features = false, features = ["cli"], optional = true }

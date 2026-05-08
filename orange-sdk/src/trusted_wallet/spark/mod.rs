@@ -9,7 +9,7 @@ use crate::store::{PaymentId, TxMetadataStore, TxStatus};
 use crate::trusted_wallet::{Payment, TrustedError, TrustedWalletInterface};
 use crate::{Event, EventQueue, InitFailure, Seed, WalletConfig};
 
-use ldk_node::DynStore;
+use crate::dyn_store::DynStore;
 use ldk_node::lightning::util::logger::Logger as _;
 use ldk_node::lightning::{log_debug, log_error, log_info, log_warn};
 use ldk_node::lightning_invoice::Bolt11Invoice;
@@ -87,7 +87,7 @@ impl SparkWalletConfig {
 			optimization_config: OptimizationConfig { auto_enabled: true, multiplicity: 1 },
 			stable_balance_config: None,
 			max_concurrent_claims: 4,
-			support_lnurl_verify: false,
+			spark_config: None,
 		})
 	}
 }
@@ -318,7 +318,7 @@ impl TrustedWalletInterface for Spark {
 impl Spark {
 	/// Initialize a new Spark wallet instance with the given configuration.
 	pub(crate) async fn init(
-		config: &WalletConfig, spark_config: SparkWalletConfig, store: Arc<DynStore>,
+		config: &WalletConfig, spark_config: SparkWalletConfig, store: Arc<dyn DynStore>,
 		event_queue: Arc<EventQueue>, tx_metadata: TxMetadataStore, logger: Arc<Logger>,
 		runtime: Arc<Runtime>,
 	) -> Result<Self, InitFailure> {
@@ -415,6 +415,12 @@ impl EventListener for SparkEventHandler {
 			},
 			SdkEvent::Optimization { optimization_event } => {
 				log_debug!(self.logger, "Spark optimization event: {optimization_event:?}");
+			},
+			SdkEvent::LightningAddressChanged { lightning_address } => {
+				log_debug!(self.logger, "Spark lightning address changed: {lightning_address:?}");
+			},
+			SdkEvent::NewDeposits { new_deposits } => {
+				log_info!(self.logger, "Spark wallet new deposits: {new_deposits:?}");
 			},
 		}
 	}
