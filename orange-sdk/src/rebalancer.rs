@@ -361,17 +361,18 @@ impl graduated_rebalancer::EventHandler for OrangeRebalanceEventHandler {
 					let chan_txid = channel_outpoint.txid;
 					let triggering_txid = Txid::from_byte_array(trigger_id);
 					let trigger_id = PaymentId::SelfCustodial(triggering_txid.to_byte_array());
-					self.tx_metadata
-						.set_tx_caused_rebalance(&trigger_id)
-						.await
-						.expect("Failed to write metadata for onchain rebalance transaction");
 					let metadata = TxMetadata {
 						ty: TxType::OnchainToLightning { channel_txid: chan_txid, triggering_txid },
 						time: SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap(),
 					};
 					self.tx_metadata
-						.insert(PaymentId::SelfCustodial(chan_txid.to_byte_array()), metadata)
-						.await;
+						.set_tx_caused_rebalance_with_splice(
+							&trigger_id,
+							PaymentId::SelfCustodial(chan_txid.to_byte_array()),
+							metadata,
+						)
+						.await
+						.expect("Failed to write metadata for onchain rebalance transaction");
 				},
 			}
 		})

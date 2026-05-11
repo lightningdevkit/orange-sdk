@@ -30,9 +30,9 @@ use graduated_rebalancer::{LightningBalance, ReceivedLightningPayment};
 use std::collections::HashMap;
 use std::fmt::Debug;
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
-use tokio::sync::watch;
+use tokio::sync::{Notify, watch};
 
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct LightningWalletBalance {
@@ -46,9 +46,25 @@ pub(crate) struct LightningWalletImpl {
 	store: Arc<dyn DynStore>,
 	payment_receipt_flag: watch::Receiver<()>,
 	channel_pending_receipt_flag: watch::Receiver<u128>,
-	splice_pending_receipt_flag: watch::Receiver<u128>,
+	splice_pending_inbox: Arc<SplicePendingInbox>,
 	lsp_node_id: PublicKey,
 	lsp_socket_addr: SocketAddress,
+}
+
+/// One pending `SplicePending` event per `user_channel_id`, consumed by
+/// `await_splice_pending`. A queue rather than a `watch` so each consumer takes its own event:
+/// `watch` would let a second splice on the same channel observe the previous splice's stale
+/// outpoint instead of waiting for the new `SplicePending`.
+pub(crate) struct SplicePendingInbox {
+	pub(crate) pending: Mutex<HashMap<u128, OutPoint>>,
+	pub(crate) notify: Notify,
+}
+
+impl SplicePendingInbox {
+	pub(crate) fn deliver(&self, channel_id: u128, funding_txo: OutPoint) {
+		self.pending.lock().unwrap().insert(channel_id, funding_txo);
+		self.notify.notify_waiters();
+	}
 }
 
 pub(crate) struct LightningWallet {
@@ -176,14 +192,17 @@ impl LightningWallet {
 			Arc::new(builder.build_with_store(node_entropy, LdkNodeStore(Arc::clone(&store)))?);
 		let (payment_receipt_sender, payment_receipt_flag) = watch::channel(());
 		let (channel_pending_sender, channel_pending_receipt_flag) = watch::channel(0);
-		let (splice_pending_sender, splice_pending_receipt_flag) = watch::channel(0);
+		let splice_pending_inbox = Arc::new(SplicePendingInbox {
+			pending: Mutex::new(HashMap::new()),
+			notify: Notify::new(),
+		});
 		let ev_handler = Arc::new(LdkEventHandler {
 			event_queue,
 			ldk_node: Arc::clone(&ldk_node),
 			tx_metadata,
 			payment_receipt_sender,
 			channel_pending_sender,
-			splice_pending_sender,
+			splice_pending_inbox: Arc::clone(&splice_pending_inbox),
 			logger: Arc::clone(&logger),
 		});
 		let inner = Arc::new(LightningWalletImpl {
@@ -192,7 +211,7 @@ impl LightningWallet {
 			store,
 			payment_receipt_flag,
 			channel_pending_receipt_flag,
-			splice_pending_receipt_flag,
+			splice_pending_inbox,
 			lsp_node_id,
 			lsp_socket_addr,
 		});
@@ -222,10 +241,19 @@ impl LightningWallet {
 		flag.wait_for(|t| t == &channel_id).await.expect("channel pending not received");
 	}
 
-	pub(crate) async fn await_splice_pending(&self, channel_id: u128) {
-		let mut flag = self.inner.splice_pending_receipt_flag.clone();
-		flag.mark_unchanged();
-		flag.wait_for(|t| t == &channel_id).await.expect("splice pending not received");
+	pub(crate) async fn await_splice_pending(&self, channel_id: u128) -> OutPoint {
+		let inbox = &self.inner.splice_pending_inbox;
+		loop {
+			// Register interest BEFORE checking the queue so a `notify_waiters` racing with the
+			// check still wakes us up.
+			let notified = inbox.notify.notified();
+			tokio::pin!(notified);
+			notified.as_mut().enable();
+			if let Some(txo) = inbox.pending.lock().unwrap().remove(&channel_id) {
+				return txo;
+			}
+			notified.await;
+		}
 	}
 
 	pub(crate) fn get_on_chain_address(&self) -> Result<Address, NodeError> {
@@ -343,53 +371,28 @@ impl LightningWallet {
 								amount_sats,
 							)?;
 
-							loop {
+							let funding_txo =
 								self.await_splice_pending(chan.user_channel_id.0).await;
-								let channels = self.inner.ldk_node.list_channels();
-								let new_chan = channels
-									.iter()
-									.find(|c| c.user_channel_id == chan.user_channel_id);
-								match new_chan {
-									Some(c) => {
-										if c.funding_txo
-											.is_some_and(|f| f != chan.funding_txo.unwrap())
-										{
-											let funding_txo = c.funding_txo.unwrap();
 
-											let id = PaymentId(funding_txo.txid.to_byte_array());
-											let details = PaymentDetails {
-												id,
-												kind: PaymentKind::Onchain {
-													txid: funding_txo.txid,
-													status: ConfirmationStatus::Unconfirmed, // todo how do we update this?
-												},
-												amount_msat: Some(amount_sats * 1_000),
-												fee_paid_msat: Some(69), // todo get real fee
-												direction: PaymentDirection::Outbound,
-												status: PaymentStatus::Succeeded,
-												latest_update_timestamp: SystemTime::now()
-													.duration_since(SystemTime::UNIX_EPOCH)
-													.unwrap()
-													.as_secs(),
-											};
+							let id = PaymentId(funding_txo.txid.to_byte_array());
+							let details = PaymentDetails {
+								id,
+								kind: PaymentKind::Onchain {
+									txid: funding_txo.txid,
+									status: ConfirmationStatus::Unconfirmed, // todo how do we update this?
+								},
+								amount_msat: Some(amount_sats * 1_000),
+								fee_paid_msat: Some(69), // todo get real fee
+								direction: PaymentDirection::Outbound,
+								status: PaymentStatus::Succeeded,
+								latest_update_timestamp: SystemTime::now()
+									.duration_since(SystemTime::UNIX_EPOCH)
+									.unwrap()
+									.as_secs(),
+							};
 
-											store::write_splice_out(
-												self.inner.store.as_ref(),
-												&details,
-											)
-											.await;
-											return Ok(id);
-										}
-									},
-									None => {
-										log_error!(
-											self.inner.logger,
-											"Channel disappeared while awaiting splice out"
-										);
-										return Err(NodeError::WalletOperationFailed);
-									},
-								}
-							}
+							store::write_splice_out(self.inner.store.as_ref(), &details).await;
+							Ok(id)
 						},
 					}
 				}
@@ -587,26 +590,10 @@ impl graduated_rebalancer::LightningWallet for LightningWallet {
 	fn await_splice_pending(
 		&self, channel_id: u128,
 	) -> Pin<Box<dyn Future<Output = OutPoint> + Send + '_>> {
-		Box::pin(async move {
-			// todo since we can't see if we have any active splices, we just await the next splice pending event
-			// this is kinda race-y hopefully we can fix
-			self.await_splice_pending(channel_id).await;
-			loop {
-				let channels = self.inner.ldk_node.list_channels();
-				let chan = channels
-					.into_iter()
-					.find(|c| c.user_channel_id.0 == channel_id && c.funding_txo.is_some());
-				match chan {
-					Some(c) => {
-						return c.funding_txo.expect("channel has no funding txo");
-					},
-					None => {
-						self.await_splice_pending(channel_id).await;
-						// Wait for the next channel pending event
-					},
-				}
-			}
-		})
+		// `ChannelDetails.funding_txo` from `list_channels` still reports the old funding
+		// outpoint between `SplicePending` and `SpliceLocked`, so we return the new outpoint
+		// from the event itself rather than reading it back from the channel.
+		Box::pin(async move { self.await_splice_pending(channel_id).await })
 	}
 }
 
