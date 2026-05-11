@@ -5,7 +5,7 @@ use crate::event::{EventQueue, LdkEventHandler};
 use crate::logging::Logger;
 use crate::runtime::Runtime;
 use crate::store::{TxMetadataStore, TxStatus};
-use crate::{ChainSource, InitFailure, PaymentType, Seed, WalletConfig, store};
+use crate::{ChainSource, InitFailure, PaymentType, WalletConfig, store};
 
 use bitcoin_payment_instructions::PaymentMethod;
 use bitcoin_payment_instructions::amount::Amount;
@@ -15,7 +15,6 @@ use ldk_node::bitcoin::base64::prelude::BASE64_STANDARD;
 use ldk_node::bitcoin::secp256k1::PublicKey;
 use ldk_node::bitcoin::{Address, Network};
 use ldk_node::config::{AsyncPaymentsRole, BackgroundSyncConfig, SyncTimeoutsConfig};
-use ldk_node::entropy::NodeEntropy;
 use ldk_node::lightning::ln::channelmanager::PaymentId;
 use ldk_node::lightning::ln::msgs::SocketAddress;
 use ldk_node::lightning::util::logger::Logger as _;
@@ -74,12 +73,7 @@ impl LightningWallet {
 		};
 		let mut builder = ldk_node::Builder::from_config(ldk_node_config);
 		builder.set_network(config.network);
-		let node_entropy = match config.seed {
-			Seed::Seed64(seed) => NodeEntropy::from_seed_bytes(seed),
-			Seed::Mnemonic { mnemonic, passphrase } => {
-				NodeEntropy::from_bip39_mnemonic(mnemonic, passphrase)
-			},
-		};
+		let node_entropy = config.seed.to_node_entropy();
 
 		match config.rgs_url {
 			Some(url) => {

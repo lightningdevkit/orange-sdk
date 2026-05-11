@@ -37,6 +37,8 @@ pub enum InitFailure {
 	LdkNodeStartFailure(String),
 	/// Failure in the trusted wallet implementation.
 	TrustedFailure(String),
+	/// Failure to build the VSS-backed store.
+	VssStoreBuildFailure(String),
 }
 
 impl Display for InitFailure {
@@ -47,6 +49,7 @@ impl Display for InitFailure {
 			InitFailure::LdkNodeBuildFailure(e) => write!(f, "Failed to build the LDK node: {e}"),
 			InitFailure::LdkNodeStartFailure(e) => write!(f, "Failed to start the LDK node: {e}"),
 			InitFailure::TrustedFailure(e) => write!(f, "Failed to create the trusted wallet: {e}"),
+			InitFailure::VssStoreBuildFailure(e) => write!(f, "Failed to build the VSS store: {e}"),
 		}
 	}
 }
@@ -68,6 +71,9 @@ impl From<OrangeInitFailure> for InitFailure {
 				InitFailure::LdkNodeStartFailure(e.to_string())
 			},
 			OrangeInitFailure::TrustedFailure(e) => InitFailure::TrustedFailure(e.to_string()),
+			OrangeInitFailure::VssStoreBuildFailure(e) => {
+				InitFailure::VssStoreBuildFailure(e.to_string())
+			},
 		}
 	}
 }

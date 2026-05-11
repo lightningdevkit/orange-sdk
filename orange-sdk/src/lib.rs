@@ -21,6 +21,7 @@ use ldk_node::bitcoin::Network;
 use ldk_node::bitcoin::hashes::Hash;
 use ldk_node::bitcoin::io;
 use ldk_node::bitcoin::secp256k1::PublicKey;
+use ldk_node::entropy::NodeEntropy;
 use ldk_node::io::sqlite_store::SqliteStore;
 use ldk_node::lightning::ln::msgs::SocketAddress;
 use ldk_node::lightning::util::logger::Logger as _;
@@ -63,6 +64,7 @@ pub use cdk::nuts::nut00::CurrencyUnit;
 pub use event::{Event, EventQueue};
 pub use ldk_node::bip39::Mnemonic;
 pub use ldk_node::bitcoin;
+use ldk_node::io::vss_store::VssStore;
 pub use ldk_node::payment::ConfirmationStatus;
 pub use store::{PaymentId, PaymentType, Transaction, TxStatus};
 pub use trusted_wallet::ExtraConfig;
@@ -154,24 +156,58 @@ pub enum Seed {
 	Seed64([u8; 64]),
 }
 
-/// Represents the authentication method for a Versioned Storage Service (VSS).
+impl Seed {
+	pub(crate) fn to_node_entropy(&self) -> NodeEntropy {
+		match self {
+			Seed::Seed64(s) => NodeEntropy::from_seed_bytes(*s),
+			Seed::Mnemonic { mnemonic, passphrase } => {
+				NodeEntropy::from_bip39_mnemonic(mnemonic.clone(), passphrase.clone())
+			},
+		}
+	}
+}
+
+/// Authentication method used on every request to the [VSS] server.
+///
+/// **Caution**: VSS support is in **alpha** and is considered experimental.
+/// Using VSS (or any remote persistence) may cause LDK to panic if persistence
+/// failures are unrecoverable, i.e., if they remain unresolved after internal
+/// retries are exhausted.
+///
+/// [VSS]: https://github.com/lightningdevkit/vss-server/blob/main/README.md
 #[derive(Debug, Clone)]
 pub enum VssAuth {
-	/// Authentication using an LNURL-auth server.
+	/// [LNURL-auth] based authentication scheme.
+	///
+	/// The LNURL challenge will be retrieved by making a request to the given
+	/// URL. The returned JWT token in response to the signed LNURL request
+	/// will be used for authentication/authorization of all the requests made
+	/// to VSS.
+	///
+	/// [LNURL-auth]: https://github.com/lnurl/luds/blob/luds/04.md
 	LNURLAuthServer(String),
-	/// Authentication using a fixed set of HTTP headers.
+	/// A fixed set of HTTP headers included as-is on every request made to
+	/// VSS.
 	FixedHeaders(HashMap<String, String>),
 }
 
-/// Configuration for a Versioned Storage Service (VSS).
+/// Configuration for a [Versioned Storage Service (VSS)] backend.
+///
+/// **Caution**: VSS support is in **alpha** and is considered experimental.
+/// Using VSS (or any remote persistence) may cause LDK to panic if persistence
+/// failures are unrecoverable, i.e., if they remain unresolved after internal
+/// retries are exhausted.
+///
+/// [Versioned Storage Service (VSS)]: https://github.com/lightningdevkit/vss-server/blob/main/README.md
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
 pub struct VssConfig {
-	/// The URL of the VSS.
+	/// Base URL of the VSS server (e.g. `https://vss.example.com/vss`).
 	pub vss_url: String,
-	/// The store ID for the VSS.
+	/// Segments storage from other storage accessed under the same seed (as
+	/// storage keyed by different seeds is already segmented to prevent
+	/// wallets from reading data for unrelated wallets). Can be any value.
 	pub store_id: String,
-	/// Authentication method for the VSS.
+	/// Authentication method attached to every VSS request.
 	pub headers: VssAuth,
 }
 
@@ -180,7 +216,10 @@ pub struct VssConfig {
 pub enum StorageConfig {
 	/// Local SQLite database configuration.
 	LocalSQLite(String),
-	// todo VSS(VssConfig),
+	/// Versioned Storage Service configuration. The same store backs LDK
+	/// channel state and orange-sdk metadata, so a seed-based recovery against
+	/// the configured VSS endpoint restores both.
+	Vss(VssConfig),
 }
 
 /// Configuration for the blockchain data source.
@@ -411,6 +450,8 @@ pub enum InitFailure {
 	LdkNodeStartFailure(NodeError),
 	/// Failure in the trusted wallet implementation.
 	TrustedFailure(TrustedError),
+	/// Failure to build the VSS-backed store.
+	VssStoreBuildFailure(ldk_node::io::vss_store::VssStoreBuildError),
 }
 
 impl From<io::Error> for InitFailure {
@@ -434,6 +475,12 @@ impl From<NodeError> for InitFailure {
 impl From<TrustedError> for InitFailure {
 	fn from(e: TrustedError) -> InitFailure {
 		InitFailure::TrustedFailure(e)
+	}
+}
+
+impl From<ldk_node::io::vss_store::VssStoreBuildError> for InitFailure {
+	fn from(e: ldk_node::io::vss_store::VssStoreBuildError) -> InitFailure {
+		InitFailure::VssStoreBuildFailure(e)
 	}
 }
 
@@ -525,6 +572,21 @@ impl Wallet {
 		let store: Arc<dyn DynStore> = match &config.storage_config {
 			StorageConfig::LocalSQLite(path) => {
 				Arc::new(SqliteStore::new(path.into(), Some("orange.sqlite".to_owned()), None)?)
+			},
+			StorageConfig::Vss(vss_config) => {
+				let builder = VssStore::builder(
+					config.seed.to_node_entropy(),
+					vss_config.vss_url.clone(),
+					vss_config.store_id.clone(),
+					config.network,
+				);
+				let vss_store = match &vss_config.headers {
+					VssAuth::FixedHeaders(h) => builder.build_with_fixed_headers(h.clone())?,
+					VssAuth::LNURLAuthServer(url) => {
+						builder.build_with_lnurl(url.clone(), HashMap::new())?
+					},
+				};
+				Arc::new(vss_store)
 			},
 		};
 

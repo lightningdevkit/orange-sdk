@@ -7,9 +7,11 @@ use rustyline::error::ReadlineError;
 use orange_sdk::bitcoin_payment_instructions::amount::Amount;
 use orange_sdk::{
 	CashuConfig, ChainSource, CurrencyUnit, Event, ExtraConfig, LoggerType, Mnemonic, PaymentInfo,
-	Seed, SparkWalletConfig, StorageConfig, Tunables, Wallet, WalletConfig, bitcoin::Network,
+	Seed, SparkWalletConfig, StorageConfig, Tunables, VssAuth, VssConfig, Wallet, WalletConfig,
+	bitcoin::Network,
 };
 use rand::RngCore;
+use std::collections::HashMap;
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
@@ -32,8 +34,43 @@ struct Cli {
 	/// npub.cash URL for lightning address support (requires --cashu)
 	#[arg(long, requires = "cashu")]
 	npubcash_url: Option<String>,
+	/// VSS server URL (e.g. http://127.0.0.1:8080/vss). When set, VSS replaces
+	/// local SQLite for all wallet persistence.
+	#[arg(long)]
+	vss_url: Option<String>,
+	/// LNURL-auth server URL for VSS authentication. When omitted, fixed
+	/// headers (possibly empty) are used instead.
+	#[arg(long, requires = "vss_url")]
+	vss_lnurl_auth_url: Option<String>,
+	/// Fixed HTTP header to attach to every VSS request, in `Key:Value` form.
+	/// Repeat for multiple headers. Ignored when --vss-lnurl-auth-url is set.
+	#[arg(long = "vss-header", value_parser = parse_kv_header, requires = "vss_url")]
+	vss_headers: Vec<(String, String)>,
 	#[command(subcommand)]
 	command: Option<Commands>,
+}
+
+fn parse_kv_header(s: &str) -> Result<(String, String), String> {
+	let (k, v) = s.split_once(':').ok_or_else(|| format!("expected `Key:Value`, got `{s}`"))?;
+	Ok((k.trim().to_string(), v.trim().to_string()))
+}
+
+fn build_storage_config(cli: &Cli, storage_path: &str) -> StorageConfig {
+	let Some(vss_url) = cli.vss_url.clone() else {
+		return StorageConfig::LocalSQLite(storage_path.to_string());
+	};
+	let store_id = "orange-cli".to_string();
+	let headers = match cli.vss_lnurl_auth_url.clone() {
+		Some(url) => VssAuth::LNURLAuthServer(url),
+		None => VssAuth::FixedHeaders(cli.vss_headers.iter().cloned().collect::<HashMap<_, _>>()),
+	};
+	println!(
+		"{} VSS storage: {} (store_id={})",
+		"💾".bright_green(),
+		vss_url.bright_cyan(),
+		store_id.bright_cyan()
+	);
+	StorageConfig::Vss(VssConfig { vss_url, store_id, headers })
 }
 
 #[derive(Subcommand)]
@@ -89,6 +126,8 @@ fn get_config(network: Network, cli: &Cli) -> Result<WalletConfig> {
 	// Generate or load seed
 	let seed = generate_or_load_seed(&storage_path)?;
 
+	let storage_config = build_storage_config(cli, &storage_path);
+
 	let extra_config = if cli.cashu {
 		let mint_url = cli
 			.mint_url
@@ -113,7 +152,7 @@ fn get_config(network: Network, cli: &Cli) -> Result<WalletConfig> {
 				.context("Failed to parse LSP public key")?;
 
 			Ok(WalletConfig {
-				storage_config: StorageConfig::LocalSQLite(storage_path.to_string()),
+				storage_config,
 				logger_type: LoggerType::File {
 					path: PathBuf::from(format!("{storage_path}/wallet.log")),
 				},
@@ -140,7 +179,7 @@ fn get_config(network: Network, cli: &Cli) -> Result<WalletConfig> {
 			let lsp_token = Some("DeveloperTestingOnly".to_string());
 
 			Ok(WalletConfig {
-				storage_config: StorageConfig::LocalSQLite(storage_path.to_string()),
+				storage_config,
 				logger_type: LoggerType::File {
 					path: PathBuf::from(format!("{storage_path}/wallet.log")),
 				},

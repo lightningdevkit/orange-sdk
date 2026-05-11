@@ -22,6 +22,10 @@ cli-cashu *args:
 cli-logs:
     tail -n 50 -f examples/cli/wallet_data/bitcoin/wallet.log
 
+# Run the CLI against a local VSS server on http://127.0.0.1:8080/vss.
+cli-vss:
+    cd examples/cli && cargo run -- --vss-url http://127.0.0.1:8080/vss
+
 build-android:
     ./scripts/uniffi_bindgen_generate_kotlin_android.sh
     cd bindings/kotlin/orange-sdk-android/ && ./gradlew build
