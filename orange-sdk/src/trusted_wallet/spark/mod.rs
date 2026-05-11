@@ -1,4 +1,18 @@
-//! An implementation of `TrustedWalletInterface` using the Spark SDK.
+//! Spark trusted wallet backend.
+//!
+//! This module implements [`TrustedWalletInterface`] using the
+//! [Breez Spark SDK](https://breez.technology). Spark provides custodial Lightning payments
+//! with instant settlement and low fees.
+//!
+//! # Configuration
+//!
+//! Use [`SparkWalletConfig`] to control sync frequency, payment preferences, and Lightning
+//! address domain. The default configuration syncs every 60 seconds and prefers Lightning
+//! over Spark-native payments.
+//!
+//! # Feature flag
+//!
+//! This module is only available when the `spark` feature is enabled (enabled by default).
 
 pub(crate) mod spark_store;
 
@@ -37,17 +51,39 @@ use std::sync::Arc;
 use std::time::Duration;
 use uuid::Uuid;
 
-/// Configuration options for the Spark wallet.
+/// Configuration for the Spark trusted wallet backend.
+///
+/// All fields have reasonable defaults via the [`Default`] implementation.
+///
+/// # Example
+///
+/// ```rust,no_run
+/// use orange_sdk::trusted_wallet::spark::SparkWalletConfig;
+///
+/// // Use defaults (60s sync, Lightning-preferred, breez.tips domain)
+/// let config = SparkWalletConfig::default();
+///
+/// // Or customize
+/// let config = SparkWalletConfig {
+///     sync_interval_secs: 30,
+///     prefer_spark_over_lightning: true,
+///     lnurl_domain: Some("mydomain.com".to_string()),
+/// };
+/// ```
 #[derive(Debug, Clone)]
 pub struct SparkWalletConfig {
-	/// How often to sync the wallet with the blockchain, in seconds.
-	/// Default is 60 seconds.
+	/// How often to sync the wallet with the Spark backend, in seconds.
+	///
+	/// Default: `60`.
 	pub sync_interval_secs: u32,
-	/// When this is set to `true` we will prefer to use spark payments over
-	/// lightning when sending and receiving. This has the benefit of lower fees
-	/// but is at the cost of privacy.
+	/// When `true`, prefer Spark-native payments over standard Lightning.
+	///
+	/// Spark payments have lower fees but less privacy than Lightning.
+	/// Default: `false`.
 	pub prefer_spark_over_lightning: bool,
-	/// The domain used for receiving through lnurl-pay and lightning address.
+	/// The domain used for LNURL-pay and Lightning address receiving.
+	///
+	/// Default: `Some("breez.tips")`.
 	pub lnurl_domain: Option<String>,
 }
 

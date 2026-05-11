@@ -138,20 +138,49 @@ The wallet's behavior is controlled by `Tunables`:
 ## Supported Backends
 
 ### Trusted Wallet Backends
-- **Spark** - Custodial Lightning wallet (default)
-- **Cashu** - Ecash-based wallet
+
+#### Spark (default)
+
+Spark uses the [Breez Spark SDK](https://breez.technology) for custodial Lightning payments with instant settlement and low fees. This is the default backend and is enabled via the `spark` feature flag.
+
+```rust,no_run
+use orange_sdk::trusted_wallet::spark::SparkWalletConfig;
+use orange_sdk::ExtraConfig;
+
+let extra = ExtraConfig::Spark(SparkWalletConfig::default());
+```
+
+#### Cashu
+
+Cashu uses the [Cashu Development Kit (CDK)](https://docs.rs/cdk) for ecash-based custody via a Cashu mint. Enable it with the `cashu` feature flag:
+
+```toml
+[dependencies]
+orange-sdk = { version = "0.1", features = ["cashu"] }
+```
+
+```rust,ignore
+use orange_sdk::trusted_wallet::cashu::CashuConfig;
+use orange_sdk::{CurrencyUnit, ExtraConfig};
+
+let extra = ExtraConfig::Cashu(CashuConfig {
+    mint_url: "https://mint.example.com".to_string(),
+    unit: CurrencyUnit::Sat,
+    npubcash_url: Some("https://npub.cash".to_string()), // optional: enables Lightning address
+});
+```
 
 ### Chain Sources
-- Electrum servers
-- Esplora servers (with optional Basic auth)
-- Bitcoin Core RPC
+- **Electrum** servers (use `ssl://` prefix for TLS)
+- **Esplora** HTTP API servers (with optional Basic auth)
+- **Bitcoin Core RPC** (direct JSON-RPC connection)
 
 ## Documentation
 
 For detailed API documentation, run:
 
 ```bash
-cargo doc --open
+cargo doc --all-features --open
 ```
 
 ## Contributing
