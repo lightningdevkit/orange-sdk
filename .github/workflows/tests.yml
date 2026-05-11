@@ -42,5 +42,21 @@ jobs:
       - name: Run tests
         run: cargo test --features _test-utils -- --test-threads=2
 
+  cashu_tests:
+    name: Cashu Tests
+    runs-on: self-hosted
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Install Protoc
+        uses: arduino/setup-protoc@v3
+        with:
+          version: "30.2"
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: Swatinem/rust-cache@v2.7.8
+
       - name: Run cashu tests
         run: cargo test --features _cashu-tests -- --test-threads=2
