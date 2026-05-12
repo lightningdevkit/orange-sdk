@@ -16,6 +16,7 @@ use std::time::Duration;
 mod test_utils;
 
 #[tokio::test(flavor = "multi_thread")]
+#[test_log::test]
 async fn test_node_start() {
 	test_utils::run_test(|params| async move {
 		let bal = params.wallet.get_balance().await.unwrap();
@@ -84,6 +85,7 @@ async fn test_receive_to_trusted() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+#[test_log::test]
 async fn test_pay_from_trusted() {
 	test_utils::run_test(|params| async move {
 		let wallet = Arc::clone(&params.wallet);
@@ -168,6 +170,7 @@ async fn test_pay_from_trusted() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+#[test_log::test]
 async fn test_sweep_to_ln() {
 	test_utils::run_test(|params| async move {
 		let wallet = Arc::clone(&params.wallet);
@@ -327,6 +330,7 @@ async fn test_sweep_to_ln() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+#[test_log::test]
 async fn test_receive_to_ln() {
 	test_utils::run_test(|params| async move {
 		let wallet = Arc::clone(&params.wallet);
@@ -694,6 +698,7 @@ async fn run_test_pay_lightning_from_self_custody(amountless: bool) {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+#[test_log::test]
 async fn test_pay_lightning_from_self_custody() {
 	run_test_pay_lightning_from_self_custody(false).await;
 	run_test_pay_lightning_from_self_custody(true).await;
@@ -788,12 +793,14 @@ async fn run_test_pay_bolt12_from_self_custody(amountless: bool) {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+#[test_log::test]
 async fn test_pay_bolt12_from_self_custody() {
 	run_test_pay_bolt12_from_self_custody(false).await;
 	run_test_pay_bolt12_from_self_custody(true).await;
 }
 
 #[tokio::test(flavor = "multi_thread")]
+#[test_log::test]
 async fn test_pay_onchain_from_self_custody() {
 	test_utils::run_test(|params| async move {
 		let wallet = Arc::clone(&params.wallet);
@@ -1009,6 +1016,7 @@ async fn test_pay_onchain_from_channel() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+#[test_log::test]
 async fn test_force_close_handling() {
 	test_utils::run_test(|params| async move {
 		let wallet = Arc::clone(&params.wallet);
@@ -1058,6 +1066,7 @@ async fn test_force_close_handling() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+#[test_log::test]
 async fn test_close_all_channels() {
 	test_utils::run_test(|params| async move {
 		let wallet = Arc::clone(&params.wallet);
@@ -1099,6 +1108,7 @@ async fn test_close_all_channels() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+#[test_log::test]
 async fn test_threshold_boundary_trusted_balance_limit() {
 	test_utils::run_test(|params| async move {
 		let wallet = Arc::clone(&params.wallet);
@@ -1182,6 +1192,7 @@ async fn test_threshold_boundary_trusted_balance_limit() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+#[test_log::test]
 async fn test_threshold_boundary_rebalance_min() {
 	test_utils::run_test(|params| async move {
 		let wallet = Arc::clone(&params.wallet);
@@ -1260,6 +1271,7 @@ async fn test_threshold_boundary_rebalance_min() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+#[test_log::test]
 async fn test_threshold_boundary_onchain_receive_threshold() {
 	test_utils::run_test(|params| async move {
 		let wallet = Arc::clone(&params.wallet);
@@ -1329,6 +1341,7 @@ async fn test_threshold_boundary_onchain_receive_threshold() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+#[test_log::test]
 async fn test_threshold_combinations_and_edge_cases() {
 	test_utils::run_test(|params| async move {
 		let wallet = Arc::clone(&params.wallet);
@@ -1393,6 +1406,7 @@ async fn test_threshold_combinations_and_edge_cases() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+#[test_log::test]
 async fn test_invalid_payment_instructions() {
 	test_utils::run_test(|params| async move {
 		let wallet = Arc::clone(&params.wallet);
@@ -1459,6 +1473,7 @@ async fn test_invalid_payment_instructions() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+#[test_log::test]
 async fn test_payment_with_expired_invoice() {
 	test_utils::run_test(|params| async move {
 		let wallet = Arc::clone(&params.wallet);
@@ -1492,6 +1507,7 @@ async fn test_payment_with_expired_invoice() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+#[test_log::test]
 async fn test_payment_network_mismatch() {
 	test_utils::run_test(|params| async move {
 		let wallet = Arc::clone(&params.wallet);
@@ -1554,6 +1570,7 @@ async fn test_payment_network_mismatch() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+#[test_log::test]
 async fn test_concurrent_payments() {
 	test_utils::run_test(|params| async move {
 		let wallet = Arc::clone(&params.wallet);
@@ -1750,6 +1767,7 @@ async fn test_concurrent_payments() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+#[test_log::test]
 async fn test_concurrent_receive_operations() {
 	test_utils::run_test(|params| async move {
 		let wallet = Arc::clone(&params.wallet);
@@ -1809,6 +1827,7 @@ async fn test_concurrent_receive_operations() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+#[test_log::test]
 async fn test_balance_consistency_under_load() {
 	test_utils::run_test(|params| async move {
 		let wallet = Arc::clone(&params.wallet);
@@ -1864,6 +1883,7 @@ async fn test_balance_consistency_under_load() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+#[test_log::test]
 async fn test_invalid_tunables_relationships() {
 	test_utils::run_test(|params| async move {
 		let wallet = Arc::clone(&params.wallet);
@@ -1956,6 +1976,7 @@ async fn test_invalid_tunables_relationships() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+#[test_log::test]
 async fn test_extreme_amount_handling() {
 	test_utils::run_test(|params| async move {
 		let wallet = Arc::clone(&params.wallet);
@@ -2027,6 +2048,7 @@ async fn test_extreme_amount_handling() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+#[test_log::test]
 async fn test_wallet_configuration_validation() {
 	test_utils::run_test(|params| async move {
 		let wallet = Arc::clone(&params.wallet);
@@ -2093,6 +2115,7 @@ async fn test_wallet_configuration_validation() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+#[test_log::test]
 async fn test_edge_case_payment_instruction_parsing() {
 	test_utils::run_test(|params| async move {
 		let wallet = Arc::clone(&params.wallet);
@@ -2149,6 +2172,7 @@ async fn test_edge_case_payment_instruction_parsing() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+#[test_log::test]
 async fn test_lsp_connectivity_fallback() {
 	test_utils::run_test(|params| async move {
 		let wallet = Arc::clone(&params.wallet);

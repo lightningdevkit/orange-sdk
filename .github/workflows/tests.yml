@@ -11,6 +11,10 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
+env:
+  RUST_BACKTRACE: 1
+  RUST_LOG: orange_sdk=debug,graduated_rebalancer=debug,ldk_node=info,integration_tests=info,test_utils=info
+
 jobs:
   rust_tests:
     name: Rust Checks
@@ -40,7 +44,7 @@ jobs:
         run: cargo check -p orange-cli
 
       - name: Run tests
-        run: cargo test --features _test-utils -- --test-threads=2
+        run: cargo test --features _test-utils -- --test-threads=2 --nocapture
 
   cashu_tests:
     name: Cashu Tests
@@ -59,4 +63,4 @@ jobs:
       - uses: Swatinem/rust-cache@v2.7.8
 
       - name: Run cashu tests
-        run: cargo test --features _cashu-tests -- --test-threads=2
+        run: cargo test --features _cashu-tests -- --test-threads=2 --nocapture
