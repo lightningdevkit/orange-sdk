@@ -1459,8 +1459,14 @@ impl Wallet {
 	/// Stops the wallet, which will stop the underlying LDK node and any background tasks.
 	/// This will ensure that any critical tasks have completed before stopping.
 	pub async fn stop(&self) {
-		// wait for the balance mutex to ensure no other tasks are running
 		log_info!(self.inner.logger, "Stopping...");
+		// Abort the background rebalance loop first. If a rebalance is parked in
+		// `await_splice_pending` waiting for an event that's never going to arrive
+		// (e.g. the LSP went away mid-splice), it's still holding the rebalancer's
+		// `balance_mutex` — `rebalancer.stop().await` would deadlock waiting for it.
+		// Dropping the task releases the mutex.
+		self.inner.runtime.abort_cancellable_background_tasks();
+
 		log_info!(self.inner.logger, "Stopping rebalancer...");
 		let _ = self.inner.rebalancer.stop().await;
 
@@ -1469,9 +1475,6 @@ impl Wallet {
 
 		log_debug!(self.inner.logger, "Stopping ln wallet...");
 		self.inner.ln_wallet.stop();
-
-		// Cancel cancellable background tasks
-		self.inner.runtime.abort_cancellable_background_tasks();
 
 		// Wait until non-cancellable background tasks (mod LDK's background processor) are done.
 		self.inner.runtime.wait_on_background_tasks();

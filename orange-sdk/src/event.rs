@@ -2,6 +2,7 @@ use crate::logging::Logger;
 use crate::store::{self, PaymentId};
 
 use crate::dyn_store::DynStore;
+use ldk_node::bitcoin::hashes::Hash;
 use ldk_node::bitcoin::secp256k1::PublicKey;
 use ldk_node::bitcoin::{OutPoint, Txid};
 use ldk_node::lightning::events::{ClosureReason, PaymentFailureReason};
@@ -17,6 +18,7 @@ use ldk_node::{CustomTlvRecord, UserChannelId};
 use std::collections::VecDeque;
 use std::sync::Arc;
 use std::task::{Poll, Waker};
+use std::time::SystemTime;
 use tokio::sync::{Mutex, watch};
 
 /// The event queue will be persisted under this key.
@@ -324,7 +326,7 @@ pub(crate) struct LdkEventHandler {
 	pub(crate) tx_metadata: store::TxMetadataStore,
 	pub(crate) payment_receipt_sender: watch::Sender<()>,
 	pub(crate) channel_pending_sender: watch::Sender<u128>,
-	pub(crate) splice_pending_sender: watch::Sender<u128>,
+	pub(crate) splice_pending_inbox: Arc<crate::lightning_wallet::SplicePendingInbox>,
 	pub(crate) logger: Arc<Logger>,
 }
 
@@ -410,8 +412,12 @@ impl LdkEventHandler {
 					"Unexpected PaymentClaimable event received. This is likely due to a bug in the LDK Node implementation."
 				);
 			},
-			ldk_node::Event::ChannelPending { .. } => {
+			ldk_node::Event::ChannelPending { funding_txo, .. } => {
 				log_debug!(self.logger, "Received ChannelPending event");
+				// The funding tx is already in `ldk_node.list_payments()`; populate our
+				// metadata before any concurrent `list_transactions` call observes the
+				// outbound payment.
+				self.reserve_rebalance_slot_for_funding_tx(funding_txo.txid).await;
 			},
 			ldk_node::Event::ChannelReady {
 				channel_id,
@@ -467,7 +473,11 @@ impl LdkEventHandler {
 				new_funding_txo,
 			} => {
 				log_debug!(self.logger, "Received SplicePending event {event:?}");
-				let _ = self.splice_pending_sender.send(user_channel_id.0);
+				// Reserve the metadata slot before delivering so any task waking on the
+				// inbox (the rebalancer's `OnChainRebalanceInitiated` for splice-in,
+				// `pay_lightning` for splice-out) sees an entry to upsert.
+				self.reserve_rebalance_slot_for_funding_tx(new_funding_txo.txid).await;
+				self.splice_pending_inbox.deliver(user_channel_id.0, new_funding_txo);
 
 				if let Err(e) = self
 					.event_queue
@@ -491,5 +501,28 @@ impl LdkEventHandler {
 		if let Err(e) = self.ldk_node.event_handled() {
 			log_error!(self.logger, "Failed to handle event: {e:?}");
 		}
+	}
+
+	/// Reserve a `PendingRebalance` metadata slot for a freshly broadcast channel or splice
+	/// funding tx. The matching outbound on-chain payment is already visible in
+	/// `ldk_node.list_payments()` by the time we're called, so without this entry
+	/// `list_transactions` would trip its `debug_assert_ne!`. `PendingRebalance` is used as the
+	/// placeholder because `list_transactions` already skips it.
+	async fn reserve_rebalance_slot_for_funding_tx(&self, txid: Txid) {
+		let payment_id = PaymentId::SelfCustodial(txid.to_byte_array());
+		if self.tx_metadata.read().get(&payment_id).is_some() {
+			return;
+		}
+		self.tx_metadata
+			.upsert(
+				payment_id,
+				store::TxMetadata {
+					ty: store::TxType::PendingRebalance {},
+					time: SystemTime::now()
+						.duration_since(SystemTime::UNIX_EPOCH)
+						.unwrap_or_default(),
+				},
+			)
+			.await;
 	}
 }

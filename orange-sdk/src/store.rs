@@ -368,6 +368,58 @@ impl TxMetadataStore {
 		Ok(())
 	}
 
+	/// Atomically marks `trigger_id` as a rebalance trigger and writes `splice_metadata` for
+	/// `splice_id`. The in-memory updates happen under a single write lock so that a concurrent
+	/// `list_transactions` either sees both changes or neither — without this, the rebalancer
+	/// briefly exposes a state where the trigger has been promoted to
+	/// `PaymentTriggeringTransferLightning` but the matching `OnchainToLightning` splice entry
+	/// hasn't landed yet, which makes the `InternalTransfer` validation in `list_transactions`
+	/// trip on a missing `send_fee`.
+	pub async fn set_tx_caused_rebalance_with_splice(
+		&self, trigger_id: &PaymentId, splice_id: PaymentId, splice_metadata: TxMetadata,
+	) -> Result<(), ()> {
+		let (trigger_entry, splice_entry) = {
+			let mut tx_metadata = self.tx_metadata.write().unwrap();
+			let trigger = match tx_metadata.get_mut(trigger_id) {
+				Some(metadata) => {
+					if let TxType::Payment { ty } = &mut metadata.ty {
+						metadata.ty = TxType::PaymentTriggeringTransferLightning { ty: *ty };
+						(trigger_id.to_string(), metadata.encode())
+					} else {
+						eprintln!("payment_id {trigger_id} is not a payment, cannot set rebalance");
+						return Err(());
+					}
+				},
+				None => {
+					eprintln!("doesn't exist in metadata store: {trigger_id}");
+					return Err(());
+				},
+			};
+			tx_metadata.insert(splice_id, splice_metadata);
+			let splice = (splice_id.to_string(), splice_metadata.encode());
+			(trigger, splice)
+		};
+		let (trigger_res, splice_res) = tokio::join!(
+			KVStore::write(
+				self.store.as_ref(),
+				STORE_PRIMARY_KEY,
+				STORE_SECONDARY_KEY,
+				&trigger_entry.0,
+				trigger_entry.1,
+			),
+			KVStore::write(
+				self.store.as_ref(),
+				STORE_PRIMARY_KEY,
+				STORE_SECONDARY_KEY,
+				&splice_entry.0,
+				splice_entry.1,
+			),
+		);
+		trigger_res.expect("We do not allow writes to fail");
+		splice_res.expect("We do not allow writes to fail");
+		Ok(())
+	}
+
 	/// Sets the preimage for an outgoing lightning payment. If the payment already has a preimage,
 	/// this is a no-op and returns Ok(()). If the payment_id does not exist in the store, or if the payment
 	/// is not an outgoing lightning payment, returns Err(()).
