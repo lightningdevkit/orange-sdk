@@ -267,7 +267,7 @@ pub struct TestParams {
 
 impl TestParams {
 	async fn stop(&self) {
-		self.wallet.stop().await;
+		stop_wallet("wallet", Arc::clone(&self.wallet)).await;
 
 		#[cfg(feature = "_cashu-tests")]
 		let _ = self._mint.stop().await;
@@ -279,7 +279,25 @@ impl TestParams {
 	}
 }
 
-async fn stop_ldk_node(name: &'static str, node: Arc<Node>) {
+async fn stop_wallet(name: &'static str, wallet: Arc<orange_sdk::Wallet>) {
+	let (sender, receiver) = tokio::sync::oneshot::channel();
+	std::thread::spawn(move || {
+		let res = tokio::runtime::Builder::new_multi_thread()
+			.enable_all()
+			.build()
+			.map(|runtime| runtime.block_on(async move { wallet.stop().await }));
+		if let Err(e) = res {
+			eprintln!("Warning: failed to create runtime for {name} stop: {e}");
+		}
+		let _ = sender.send(());
+	});
+
+	if tokio::time::timeout(Duration::from_secs(20), receiver).await.is_err() {
+		eprintln!("Warning: {name} stop timed out");
+	}
+}
+
+pub(crate) async fn stop_ldk_node(name: &'static str, node: Arc<Node>) {
 	let (sender, receiver) = tokio::sync::oneshot::channel();
 	std::thread::spawn(move || {
 		let _ = node.stop();
@@ -317,13 +335,13 @@ where
 		res = &mut test_task => Ok(res),
 		_ = tokio::time::sleep(test_timeout) => {
 			test_task.abort();
-			let _ = test_task.await;
+			let _ = tokio::time::timeout(Duration::from_secs(5), &mut test_task).await;
 			Err(())
 		},
 	};
 
 	// Always clean up
-	let timeout = Duration::from_secs(30);
+	let timeout = Duration::from_secs(45);
 	if tokio::time::timeout(timeout, params.stop()).await.is_err() {
 		eprintln!("Warning: params stop timed out after {timeout:?}");
 	}

@@ -2208,7 +2208,7 @@ async fn test_lsp_connectivity_fallback() {
 		assert!(!uri_with_lsp.from_trusted);
 
 		// Now simulate LSP being offline by stopping it
-		let _ = lsp.stop();
+		test_utils::stop_ldk_node("lsp", Arc::clone(&lsp)).await;
 
 		// Wait a moment for the stop to take effect
 		tokio::time::sleep(Duration::from_secs(2)).await;
