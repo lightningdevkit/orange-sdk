@@ -110,9 +110,10 @@ pub trait LightningWallet: Send + Sync {
 	/// Check if we already have a channel with the LSP
 	fn has_channel_with_lsp(&self) -> bool;
 
-	/// Open a channel with the LSP using on-chain funds
+	/// Open a channel with the LSP using all available on-chain funds
+	/// (minus fees and anchor reserves).
 	fn open_channel_with_lsp(
-		&self, amt: Amount,
+		&self,
 	) -> Pin<Box<dyn Future<Output = Result<u128, Self::Error>> + Send + '_>>;
 
 	/// Wait for a channel pending notification, returns the new channel's outpoint
@@ -120,9 +121,10 @@ pub trait LightningWallet: Send + Sync {
 		&self, channel_id: u128,
 	) -> Pin<Box<dyn Future<Output = OutPoint> + Send + '_>>;
 
-	/// Splice funds from on-chain to an existing channel with the LSP
+	/// Splice all available on-chain funds (minus fees and anchor reserves) into
+	/// an existing channel with the LSP.
 	fn splice_to_lsp_channel(
-		&self, amt: Amount,
+		&self,
 	) -> Pin<Box<dyn Future<Output = Result<u128, Self::Error>> + Send + '_>>;
 
 	/// Wait for a splice pending notification, returns the splice outpoint
@@ -344,7 +346,7 @@ where
 		let (channel_outpoint, user_channel_id) = if self.ln_wallet.has_channel_with_lsp() {
 			log_info!(self.logger, "Splicing into channel with LSP with on-chain funds");
 
-			let user_chan_id = match self.ln_wallet.splice_to_lsp_channel(params.amount).await {
+			let user_chan_id = match self.ln_wallet.splice_to_lsp_channel().await {
 				Ok(chan_id) => chan_id,
 				Err(e) => {
 					log_error!(self.logger, "Failed to open channel with LSP: {e:?}");
@@ -362,7 +364,7 @@ where
 		} else {
 			log_info!(self.logger, "Opening channel with LSP with on-chain funds");
 
-			let user_chan_id = match self.ln_wallet.open_channel_with_lsp(params.amount).await {
+			let user_chan_id = match self.ln_wallet.open_channel_with_lsp().await {
 				Ok(chan_id) => chan_id,
 				Err(e) => {
 					log_error!(self.logger, "Failed to open channel with LSP: {e:?}");

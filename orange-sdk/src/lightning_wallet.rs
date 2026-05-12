@@ -400,20 +400,16 @@ impl LightningWallet {
 		}
 	}
 
-	pub(crate) async fn splice_balance_into_channel(
-		&self, amount: Amount,
-	) -> Result<UserChannelId, NodeError> {
+	pub(crate) async fn splice_all_into_channel(&self) -> Result<UserChannelId, NodeError> {
 		// find existing channel to splice into
 		let channels = self.inner.ldk_node.list_channels();
 		let channel = channels.iter().find(|c| c.counterparty_node_id == self.inner.lsp_node_id);
 
 		match channel {
 			Some(chan) => {
-				self.inner.ldk_node.splice_in(
-					&chan.user_channel_id,
-					chan.counterparty_node_id,
-					amount.sats_rounding_up(),
-				)?;
+				self.inner
+					.ldk_node
+					.splice_in_with_all(&chan.user_channel_id, chan.counterparty_node_id)?;
 				Ok(chan.user_channel_id)
 			},
 			None => {
@@ -424,23 +420,9 @@ impl LightningWallet {
 	}
 
 	pub(crate) async fn open_channel_with_lsp(&self) -> Result<UserChannelId, NodeError> {
-		let bal = self.inner.ldk_node.list_balances().spendable_onchain_balance_sats;
-
-		// need a dummy p2wsh address to estimate the fee, p2wsh is used for LN channels
-		// let fake_addr = Address::p2wsh(Script::new(), self.inner.ldk_node.config().network);
-		//
-		// let fee = self
-		// 	.inner
-		// 	.ldk_node
-		// 	.onchain_payment()
-		// 	.estimate_send_all_to_address(&fake_addr, true, None)?;
-		// todo get real fee
-		let fee = 1000;
-
-		let id = self.inner.ldk_node.open_channel(
+		let id = self.inner.ldk_node.open_channel_with_all(
 			self.inner.lsp_node_id,
 			self.inner.lsp_socket_addr.clone(),
-			bal - fee,
 			None,
 			None,
 		)?;
@@ -541,12 +523,9 @@ impl graduated_rebalancer::LightningWallet for LightningWallet {
 	}
 
 	fn open_channel_with_lsp(
-		&self, _amt: Amount,
+		&self,
 	) -> Pin<Box<dyn Future<Output = Result<u128, Self::Error>> + Send + '_>> {
-		Box::pin(async move {
-			// we don't use the amount and just use our full spendable balance in open_channel_with_lsp
-			self.open_channel_with_lsp().await.map(|c| c.0)
-		})
+		Box::pin(async move { self.open_channel_with_lsp().await.map(|c| c.0) })
 	}
 
 	fn await_channel_pending(
@@ -570,21 +549,9 @@ impl graduated_rebalancer::LightningWallet for LightningWallet {
 	}
 
 	fn splice_to_lsp_channel(
-		&self, amt: Amount,
+		&self,
 	) -> Pin<Box<dyn Future<Output = Result<u128, Self::Error>> + Send + '_>> {
-		let bal = self.inner.ldk_node.list_balances();
-		// if we don't have enough onchain balance, return error
-		// if we are within 1,000 sats of the amount, reduce the amount to account for fees
-		if bal.spendable_onchain_balance_sats < amt.sats_rounding_up() {
-			return Box::pin(async move { Err(NodeError::InsufficientFunds) });
-		} else if bal.spendable_onchain_balance_sats < amt.sats_rounding_up() + 1_000 {
-			let reduced_amt = amt.saturating_sub(Amount::from_sats(1_000).expect("valid amount"));
-			return Box::pin(async move {
-				self.splice_balance_into_channel(reduced_amt).await.map(|c| c.0)
-			});
-		}
-
-		Box::pin(async move { self.splice_balance_into_channel(amt).await.map(|c| c.0) })
+		Box::pin(async move { self.splice_all_into_channel().await.map(|c| c.0) })
 	}
 
 	fn await_splice_pending(

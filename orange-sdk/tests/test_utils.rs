@@ -45,11 +45,14 @@ where
 	};
 	let start = tokio::time::Instant::now();
 	let mut delay = Duration::from_millis(50);
+	log::info!("waiting for condition: {condition_name}");
 	loop {
 		if condition().await {
+			log::info!("condition met: {condition_name} after {:?}", start.elapsed());
 			return;
 		}
 		if start.elapsed() >= timeout {
+			log::warn!("condition timed out: {condition_name} after {:?}", start.elapsed());
 			panic!("Timeout waiting for condition: {condition_name}");
 		}
 		tokio::time::sleep(delay).await;
@@ -267,7 +270,7 @@ pub struct TestParams {
 
 impl TestParams {
 	async fn stop(&self) {
-		self.wallet.stop().await;
+		stop_wallet("wallet", Arc::clone(&self.wallet)).await;
 
 		#[cfg(feature = "_cashu-tests")]
 		let _ = self._mint.stop().await;
@@ -279,7 +282,25 @@ impl TestParams {
 	}
 }
 
-async fn stop_ldk_node(name: &'static str, node: Arc<Node>) {
+async fn stop_wallet(name: &'static str, wallet: Arc<orange_sdk::Wallet>) {
+	let (sender, receiver) = tokio::sync::oneshot::channel();
+	std::thread::spawn(move || {
+		let res = tokio::runtime::Builder::new_multi_thread()
+			.enable_all()
+			.build()
+			.map(|runtime| runtime.block_on(async move { wallet.stop().await }));
+		if let Err(e) = res {
+			eprintln!("Warning: failed to create runtime for {name} stop: {e}");
+		}
+		let _ = sender.send(());
+	});
+
+	if tokio::time::timeout(Duration::from_secs(20), receiver).await.is_err() {
+		eprintln!("Warning: {name} stop timed out");
+	}
+}
+
+pub(crate) async fn stop_ldk_node(name: &'static str, node: Arc<Node>) {
 	let (sender, receiver) = tokio::sync::oneshot::channel();
 	std::thread::spawn(move || {
 		let _ = node.stop();
@@ -294,14 +315,63 @@ async fn stop_ldk_node(name: &'static str, node: Arc<Node>) {
 /// Runs a test with automatically managed TestParams lifecycle.
 /// The test closure receives TestParams and must return it when done.
 /// Cleanup happens automatically after the test completes.
-pub async fn run_test<F, Fut>(test: F)
+#[track_caller]
+pub fn run_test<F, Fut>(test: F) -> impl Future<Output = ()>
 where
 	F: FnOnce(TestParams) -> Fut + Send + 'static,
 	Fut: Future<Output = ()> + Send + 'static,
 {
+	let caller = std::panic::Location::caller();
+	let test_name = format!("{}:{}", caller.file(), caller.line());
+
+	async move { run_test_with_name(test_name, test).await }
+}
+
+async fn run_test_with_name<F, Fut>(test_name: String, test: F)
+where
+	F: FnOnce(TestParams) -> Fut + Send + 'static,
+	Fut: Future<Output = ()> + Send + 'static,
+{
+	let lifecycle_timeout = if std::env::var("CI").is_ok() {
+		Duration::from_secs(20 * 60)
+	} else {
+		Duration::from_secs(10 * 60)
+	};
+
+	log::info!("spawning test lifecycle for {test_name}");
+
+	let (sender, receiver) = tokio::sync::oneshot::channel();
+	let lifecycle_name = test_name.clone();
+	std::thread::spawn(move || {
+		let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+			let runtime = tokio::runtime::Builder::new_multi_thread()
+				.enable_all()
+				.build()
+				.expect("failed to create test runtime");
+			runtime.block_on(run_test_inner(lifecycle_name, test));
+		}));
+		let _ = sender.send(result);
+	});
+
+	match tokio::time::timeout(lifecycle_timeout, receiver).await {
+		Ok(Ok(Ok(()))) => {},
+		Ok(Ok(Err(panic))) => std::panic::resume_unwind(panic),
+		Ok(Err(_)) => panic!("test lifecycle thread exited without a result"),
+		Err(_) => panic!("test lifecycle timed out after {lifecycle_timeout:?} for {test_name}"),
+	}
+}
+
+async fn run_test_inner<F, Fut>(test_name: String, test: F)
+where
+	F: FnOnce(TestParams) -> Fut + Send + 'static,
+	Fut: Future<Output = ()> + Send + 'static,
+{
+	log::info!("test lifecycle started for {test_name}");
+	log::info!("building test nodes for {test_name}");
 	let params = build_test_nodes().await;
 
-	println!("=== test start ===");
+	log::info!("test body starting for {test_name}");
+	println!("=== test start: {test_name} ===");
 
 	let test_timeout = if std::env::var("CI").is_ok() {
 		Duration::from_secs(15 * 60)
@@ -316,17 +386,21 @@ where
 	let test_result = tokio::select! {
 		res = &mut test_task => Ok(res),
 		_ = tokio::time::sleep(test_timeout) => {
+			log::warn!("test body timed out for {test_name} after {test_timeout:?}");
 			test_task.abort();
-			let _ = test_task.await;
+			let _ = tokio::time::timeout(Duration::from_secs(5), &mut test_task).await;
 			Err(())
 		},
 	};
 
 	// Always clean up
-	let timeout = Duration::from_secs(30);
+	let timeout = Duration::from_secs(45);
+	log::info!("test cleanup starting for {test_name}");
 	if tokio::time::timeout(timeout, params.stop()).await.is_err() {
+		log::warn!("test cleanup timed out for {test_name} after {timeout:?}");
 		eprintln!("Warning: params stop timed out after {timeout:?}");
 	}
+	log::info!("test cleanup finished for {test_name}");
 
 	match test_result {
 		Ok(Ok(())) => {},
@@ -338,11 +412,14 @@ where
 
 async fn build_test_nodes() -> TestParams {
 	let test_id = Uuid::now_v7();
+	log::info!("creating bitcoind and electrsd for {test_id}");
 	let (bitcoind, electrsd) = create_bitcoind(test_id).await;
 
+	log::info!("creating LSP and third-party nodes for {test_id}");
 	let lsp = create_lsp(test_id, &bitcoind);
 	let third_party = create_third_party(test_id, &bitcoind);
 	let start_bal = third_party.list_balances().total_onchain_balance_sats;
+	log::info!("funding LSP and third-party nodes for {test_id}");
 	fund_two_nodes(&lsp, &third_party, &bitcoind, &electrsd).await;
 
 	// wait for node to sync (needs blocking wait as we are not in async context here)
@@ -356,6 +433,7 @@ async fn build_test_nodes() -> TestParams {
 	let lsp_listen = lsp.listening_addresses().unwrap().first().unwrap().clone();
 
 	// open a channel from payer to LSP
+	log::info!("opening third-party channel to LSP for {test_id}");
 	third_party.open_channel(lsp.node_id(), lsp_listen.clone(), 10_000_000, None, None).unwrap();
 	wait_for_tx_broadcast(&bitcoind).await;
 	generate_blocks(&bitcoind, &electrsd, 6).await;
@@ -377,6 +455,7 @@ async fn build_test_nodes() -> TestParams {
 
 	#[cfg(not(feature = "_cashu-tests"))]
 	let wallet = {
+		log::info!("creating dummy trusted wallet for {test_id}");
 		let dummy_wallet_config = DummyTrustedWalletExtraConfig {
 			uuid: test_id,
 			lsp: Arc::clone(&lsp),
@@ -409,6 +488,7 @@ async fn build_test_nodes() -> TestParams {
 	#[cfg(feature = "_cashu-tests")]
 	{
 		let tmp = temp_dir().join(format!("orange-test-{test_id}/cashu-ldk-node"));
+		log::info!("creating Cashu trusted wallet fixtures for {test_id}");
 		let cookie = bitcoind.params.get_cookie_values().unwrap().unwrap();
 		let bitcoind_port = bitcoind.params.rpc_socket.port();
 		let cdk_port = {
@@ -551,11 +631,15 @@ async fn build_test_nodes() -> TestParams {
 		};
 		let wallet = Arc::new(Wallet::new(wallet_config).await.unwrap());
 
+		log::info!("finished building test nodes for {test_id}");
 		return TestParams { wallet, lsp, third_party, bitcoind, electrsd, _mint: mint };
 	};
 
 	#[cfg(not(feature = "_cashu-tests"))]
-	TestParams { wallet, lsp, third_party, bitcoind, electrsd }
+	{
+		log::info!("finished building test nodes for {test_id}");
+		TestParams { wallet, lsp, third_party, bitcoind, electrsd }
+	}
 }
 
 pub async fn open_channel_from_lsp(wallet: &orange_sdk::Wallet, payer: Arc<Node>) -> Amount {
@@ -608,12 +692,15 @@ async fn wait_for_tx_broadcast(bitcoind: &Bitcoind) {
 	};
 	let start = tokio::time::Instant::now();
 	let mut delay = Duration::from_millis(50);
+	log::info!("waiting for tx broadcast");
 	loop {
 		let num_txs = bitcoind.client.get_mempool_info().unwrap().size;
 		if num_txs > 0 {
+			log::info!("tx broadcast observed after {:?}", start.elapsed());
 			break;
 		}
 		if start.elapsed() >= timeout {
+			log::warn!("tx broadcast timed out after {:?}", start.elapsed());
 			panic!("Timeout waiting for tx broadcast");
 		}
 		tokio::time::sleep(delay).await;

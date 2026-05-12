@@ -166,6 +166,8 @@ impl DummyTrustedWallet {
 								.await
 								.unwrap();
 						}
+
+						let _ = payment_success_sender.send(());
 					},
 					Event::PaymentReceived { payment_id, amount_msat, payment_hash, .. } => {
 						// convert id
@@ -258,10 +260,8 @@ impl DummyTrustedWallet {
 		DummyTrustedWallet { current_bal_msats, payments, ldk_node, payment_success_flag }
 	}
 
-	pub(crate) async fn await_payment_success(&self) {
-		let mut flag = self.payment_success_flag.clone();
-		flag.mark_unchanged();
-		let _ = flag.changed().await;
+	fn payment_wait_timeout() -> Duration {
+		if std::env::var("CI").is_ok() { Duration::from_secs(120) } else { Duration::from_secs(20) }
 	}
 }
 
@@ -384,6 +384,8 @@ impl TrustedWalletInterface for DummyTrustedWallet {
 	) -> Pin<Box<dyn Future<Output = Option<ReceivedLightningPayment>> + Send + '_>> {
 		Box::pin(async move {
 			let id = channelmanager::PaymentId(payment_hash);
+			let mut flag = self.payment_success_flag.clone();
+			flag.mark_unchanged();
 			loop {
 				if let Some(payment) = self.ldk_node.payment(&id) {
 					let counterparty_skimmed_fee_msat = match payment.kind {
@@ -408,7 +410,12 @@ impl TrustedWalletInterface for DummyTrustedWallet {
 						PaymentStatus::Failed => return None,
 					}
 				}
-				self.await_payment_success().await;
+				if !matches!(
+					tokio::time::timeout(Self::payment_wait_timeout(), flag.changed()).await,
+					Ok(Ok(()))
+				) {
+					return None;
+				}
 			}
 		})
 	}
