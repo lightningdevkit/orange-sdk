@@ -9,7 +9,6 @@ use ldk_node::bitcoin::Network;
 use ldk_node::lightning_invoice::{Bolt11InvoiceDescription, Description};
 use ldk_node::payment::{ConfirmationStatus, PaymentDirection, PaymentStatus};
 use log::info;
-use orange_sdk::bitcoin::hashes::Hash;
 use orange_sdk::{Event, PaymentInfo, PaymentType, TxStatus, WalletError};
 use std::sync::Arc;
 use std::time::Duration;
@@ -597,7 +596,7 @@ async fn test_receive_to_onchain_with_channel() {
 }
 
 async fn run_test_pay_lightning_from_self_custody(amountless: bool) {
-	test_utils::run_test(|params| async move {
+	test_utils::run_test(move |params| async move {
 		let wallet = Arc::clone(&params.wallet);
 		let bitcoind = Arc::clone(&params.bitcoind);
 		let third_party = Arc::clone(&params.third_party);
@@ -701,7 +700,7 @@ async fn test_pay_lightning_from_self_custody() {
 }
 
 async fn run_test_pay_bolt12_from_self_custody(amountless: bool) {
-	test_utils::run_test(|params| async move {
+	test_utils::run_test(move |params| async move {
 		let wallet = Arc::clone(&params.wallet);
 		let bitcoind = Arc::clone(&params.bitcoind);
 		let third_party = Arc::clone(&params.third_party);

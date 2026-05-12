@@ -11,7 +11,6 @@ use corepc_node::client::bitcoin::Network;
 use corepc_node::{Conf, Node as Bitcoind, get_available_port};
 use electrsd::ElectrsD;
 use electrsd::electrum_client::ElectrumApi;
-use ldk_node::bitcoin::hashes::Hash;
 use ldk_node::lightning::ln::msgs::SocketAddress;
 use ldk_node::liquidity::LSPS2ServiceConfig;
 use ldk_node::payment::PaymentStatus;
@@ -273,8 +272,22 @@ impl TestParams {
 		#[cfg(feature = "_cashu-tests")]
 		let _ = self._mint.stop().await;
 
-		let _ = self.lsp.stop();
-		let _ = self.third_party.stop();
+		tokio::join!(
+			stop_ldk_node("lsp", Arc::clone(&self.lsp)),
+			stop_ldk_node("third_party", Arc::clone(&self.third_party)),
+		);
+	}
+}
+
+async fn stop_ldk_node(name: &'static str, node: Arc<Node>) {
+	let (sender, receiver) = tokio::sync::oneshot::channel();
+	std::thread::spawn(move || {
+		let _ = node.stop();
+		let _ = sender.send(());
+	});
+
+	if tokio::time::timeout(Duration::from_secs(10), receiver).await.is_err() {
+		eprintln!("Warning: {name} LDK node stop timed out");
 	}
 }
 
@@ -283,20 +296,43 @@ impl TestParams {
 /// Cleanup happens automatically after the test completes.
 pub async fn run_test<F, Fut>(test: F)
 where
-	F: FnOnce(TestParams) -> Fut,
-	Fut: Future<Output = ()>,
+	F: FnOnce(TestParams) -> Fut + Send + 'static,
+	Fut: Future<Output = ()> + Send + 'static,
 {
 	let params = build_test_nodes().await;
 
 	println!("=== test start ===");
 
-	// Run the test and get params back
-	test(params.clone()).await;
+	let test_timeout = if std::env::var("CI").is_ok() {
+		Duration::from_secs(15 * 60)
+	} else {
+		Duration::from_secs(5 * 60)
+	};
+
+	let mut test_task = tokio::spawn({
+		let params = params.clone();
+		async move { test(params).await }
+	});
+	let test_result = tokio::select! {
+		res = &mut test_task => Ok(res),
+		_ = tokio::time::sleep(test_timeout) => {
+			test_task.abort();
+			let _ = test_task.await;
+			Err(())
+		},
+	};
 
 	// Always clean up
-	let timeout = Duration::from_secs(10);
+	let timeout = Duration::from_secs(30);
 	if tokio::time::timeout(timeout, params.stop()).await.is_err() {
-		eprintln!("Warning: parms stop timed out after {timeout:?}");
+		eprintln!("Warning: params stop timed out after {timeout:?}");
+	}
+
+	match test_result {
+		Ok(Ok(())) => {},
+		Ok(Err(e)) if e.is_panic() => std::panic::resume_unwind(e.into_panic()),
+		Ok(Err(e)) => panic!("test task failed: {e}"),
+		Err(_) => panic!("test timed out after {test_timeout:?}"),
 	}
 }
 

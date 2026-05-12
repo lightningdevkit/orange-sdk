@@ -431,7 +431,16 @@ impl TrustedWalletInterface for DummyTrustedWallet {
 
 	fn stop(&self) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
 		Box::pin(async move {
-			let _ = self.ldk_node.stop();
+			let ldk_node = Arc::clone(&self.ldk_node);
+			let (sender, receiver) = tokio::sync::oneshot::channel();
+			std::thread::spawn(move || {
+				let _ = ldk_node.stop();
+				let _ = sender.send(());
+			});
+
+			if tokio::time::timeout(Duration::from_secs(10), receiver).await.is_err() {
+				eprintln!("Warning: dummy trusted LDK node stop timed out");
+			}
 		})
 	}
 }
