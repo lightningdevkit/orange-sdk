@@ -341,7 +341,7 @@ where
 
 	/// Perform on-chain to lightning rebalance by opening a channel or splicing into an existing one
 	async fn do_onchain_rebalance(&self, params: TriggerParams) {
-		let _ = self.balance_mutex.lock().await;
+		let _lock = self.balance_mutex.lock().await;
 
 		let (channel_outpoint, user_channel_id) = if self.ln_wallet.has_channel_with_lsp() {
 			log_info!(self.logger, "Splicing into channel with LSP with on-chain funds");
