@@ -599,6 +599,122 @@ async fn test_receive_to_onchain_with_channel() {
 	.await;
 }
 
+#[tokio::test(flavor = "multi_thread")]
+#[test_log::test]
+async fn test_concurrent_splice_in_and_out_preserve_pending_events() {
+	test_utils::run_test(|params| async move {
+		let wallet = Arc::clone(&params.wallet);
+		let lsp = Arc::clone(&params.lsp);
+		let bitcoind = Arc::clone(&params.bitcoind);
+		let third_party = Arc::clone(&params.third_party);
+		let electrsd = Arc::clone(&params.electrsd);
+
+		open_channel_from_lsp(&wallet, Arc::clone(&third_party)).await;
+
+		generate_blocks(&bitcoind, &electrsd, 6).await;
+		test_utils::wait_for_condition("wallet sync after channel open", || async {
+			wallet.channels().iter().any(|a| a.confirmations.is_some_and(|c| c > 0) && a.is_usable)
+		})
+		.await;
+
+		let recv_amt = Amount::from_sats(300_000).unwrap();
+		let uri = wallet.get_single_use_receive_uri(Some(recv_amt)).await.unwrap();
+		let sent_txid = third_party
+			.onchain_payment()
+			.send_to_address(&uri.address.unwrap(), recv_amt.sats().unwrap(), None)
+			.unwrap();
+
+		wait_for_tx(&electrsd.client, sent_txid).await;
+		generate_blocks(&bitcoind, &electrsd, 6).await;
+		wallet.sync_ln_wallet().unwrap();
+
+		test_utils::wait_for_condition("pending balance to update", || async {
+			wallet.get_balance().await.unwrap().pending_balance == recv_amt
+		})
+		.await;
+
+		let event = wait_next_event(&wallet).await;
+		match event {
+			Event::OnchainPaymentReceived { txid, amount_sat, status, .. } => {
+				assert_eq!(txid, sent_txid);
+				assert_eq!(amount_sat, recv_amt.sats().unwrap());
+				assert!(matches!(status, ConfirmationStatus::Confirmed { .. }));
+			},
+			ev => panic!("Expected OnchainPaymentReceived event, got {ev:?}"),
+		}
+
+		let first_splice = tokio::time::timeout(Duration::from_secs(60), wallet.next_event_async())
+			.await
+			.expect("timed out waiting for splice-in event");
+		wallet.event_handled().unwrap();
+		let first_splice = match first_splice {
+			Event::SplicePending {
+				user_channel_id, counterparty_node_id, new_funding_txo, ..
+			} => {
+				assert_eq!(counterparty_node_id, lsp.node_id());
+				(user_channel_id, new_funding_txo)
+			},
+			ev => panic!("Expected first SplicePending event, got {ev:?}"),
+		};
+
+		generate_blocks(&bitcoind, &electrsd, 6).await;
+		wallet.sync_ln_wallet().unwrap();
+
+		let addr = third_party.onchain_payment().new_address().unwrap();
+		let send_amount = Amount::from_sats(10_000).unwrap();
+		let pay_wallet = Arc::clone(&wallet);
+		let pay_task = tokio::spawn(async move {
+			let instr =
+				pay_wallet.parse_payment_instructions(addr.to_string().as_str()).await.unwrap();
+			let info = PaymentInfo::build(instr, Some(send_amount)).unwrap();
+			pay_wallet.pay(&info).await
+		});
+
+		let second_splice = tokio::time::timeout(Duration::from_secs(60), async {
+			loop {
+				let event = wallet.next_event_async().await;
+				wallet.event_handled().unwrap();
+				if let Event::SplicePending {
+					user_channel_id,
+					counterparty_node_id,
+					new_funding_txo,
+					..
+				} = event
+				{
+					assert_eq!(counterparty_node_id, lsp.node_id());
+					break (user_channel_id, new_funding_txo);
+				}
+			}
+		})
+		.await
+		.expect("timed out waiting for splice-out event");
+
+		assert_eq!(
+			first_splice.0, second_splice.0,
+			"both splices should target the same LSP channel"
+		);
+		assert_ne!(
+			first_splice.1, second_splice.1,
+			"splices should have distinct funding outpoints"
+		);
+
+		tokio::time::timeout(Duration::from_secs(60), pay_task)
+			.await
+			.expect("splice-out payment hung waiting for its SplicePending")
+			.expect("payment task panicked")
+			.expect("splice-out payment failed");
+
+		test_utils::wait_for_condition("splice-in rebalance metadata", || async {
+			wallet.list_transactions().await.unwrap().iter().any(|tx| {
+				tx.payment_type == PaymentType::IncomingOnChain { txid: Some(sent_txid) }
+					&& tx.fee.is_some_and(|fee| fee > Amount::ZERO)
+			})
+		})
+		.await;
+	})
+	.await;
+}
+
 async fn run_test_pay_lightning_from_self_custody(amountless: bool) {
 	test_utils::run_test(move |params| async move {
 		let wallet = Arc::clone(&params.wallet);

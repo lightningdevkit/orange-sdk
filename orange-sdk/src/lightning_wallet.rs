@@ -27,7 +27,7 @@ use ldk_node::{NodeError, UserChannelId};
 
 use graduated_rebalancer::{LightningBalance, ReceivedLightningPayment};
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::fmt::Debug;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
@@ -49,22 +49,6 @@ pub(crate) struct LightningWalletImpl {
 	splice_pending_inbox: Arc<SplicePendingInbox>,
 	lsp_node_id: PublicKey,
 	lsp_socket_addr: SocketAddress,
-}
-
-/// One pending `SplicePending` event per `user_channel_id`, consumed by
-/// `await_splice_pending`. A queue rather than a `watch` so each consumer takes its own event:
-/// `watch` would let a second splice on the same channel observe the previous splice's stale
-/// outpoint instead of waiting for the new `SplicePending`.
-pub(crate) struct SplicePendingInbox {
-	pub(crate) pending: Mutex<HashMap<u128, OutPoint>>,
-	pub(crate) notify: Notify,
-}
-
-impl SplicePendingInbox {
-	pub(crate) fn deliver(&self, channel_id: u128, funding_txo: OutPoint) {
-		self.pending.lock().unwrap().insert(channel_id, funding_txo);
-		self.notify.notify_waiters();
-	}
 }
 
 pub(crate) struct LightningWallet {
@@ -242,18 +226,7 @@ impl LightningWallet {
 	}
 
 	pub(crate) async fn await_splice_pending(&self, channel_id: u128) -> OutPoint {
-		let inbox = &self.inner.splice_pending_inbox;
-		loop {
-			// Register interest BEFORE checking the queue so a `notify_waiters` racing with the
-			// check still wakes us up.
-			let notified = inbox.notify.notified();
-			tokio::pin!(notified);
-			notified.as_mut().enable();
-			if let Some(txo) = inbox.pending.lock().unwrap().remove(&channel_id) {
-				return txo;
-			}
-			notified.await;
-		}
+		self.inner.splice_pending_inbox.wait_for(channel_id).await
 	}
 
 	pub(crate) fn get_on_chain_address(&self) -> Result<Address, NodeError> {
@@ -605,5 +578,76 @@ impl From<&PaymentDetails> for PaymentType {
 			},
 			(_, false) => PaymentType::IncomingLightning {},
 		}
+	}
+}
+
+/// Pending `SplicePending` events keyed by `user_channel_id`, consumed by
+/// `await_splice_pending`. A per-channel queue rather than a `watch` so each consumer takes its own
+/// event: `watch` would let a second splice on the same channel observe the previous splice's stale
+/// outpoint instead of waiting for the new `SplicePending`.
+pub(crate) struct SplicePendingInbox {
+	pub(crate) pending: Mutex<HashMap<u128, VecDeque<OutPoint>>>,
+	pub(crate) notify: Notify,
+}
+
+impl SplicePendingInbox {
+	pub(crate) fn deliver(&self, channel_id: u128, funding_txo: OutPoint) {
+		self.pending.lock().unwrap().entry(channel_id).or_default().push_back(funding_txo);
+		self.notify.notify_waiters();
+	}
+
+	pub(crate) async fn wait_for(&self, channel_id: u128) -> OutPoint {
+		loop {
+			// Register interest BEFORE checking the queue so a `notify_waiters` racing with the
+			// check still wakes us up.
+			let notified = self.notify.notified();
+			tokio::pin!(notified);
+			notified.as_mut().enable();
+			if let Some(txo) = {
+				let mut pending = self.pending.lock().unwrap();
+				if let Some(queue) = pending.get_mut(&channel_id) {
+					let txo = queue.pop_front();
+					if queue.is_empty() {
+						pending.remove(&channel_id);
+					}
+					txo
+				} else {
+					None
+				}
+			} {
+				return txo;
+			}
+			notified.await;
+		}
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+	use ldk_node::bitcoin::Txid;
+
+	fn dummy_outpoint(seed: u8) -> OutPoint {
+		let bytes = [seed; 32];
+		OutPoint { txid: Txid::from_byte_array(bytes), vout: seed as u32 }
+	}
+
+	#[test]
+	fn splice_pending_inbox_preserves_distinct_events_for_same_channel() {
+		let inbox =
+			SplicePendingInbox { pending: Mutex::new(HashMap::new()), notify: Notify::new() };
+		let channel_id = 7;
+		let first = dummy_outpoint(0xaa);
+		let second = dummy_outpoint(0xbb);
+
+		inbox.deliver(channel_id, first);
+		inbox.deliver(channel_id, second);
+
+		let mut pending = inbox.pending.lock().unwrap();
+		let queue = pending.get_mut(&channel_id).expect("channel should have pending events");
+
+		assert_eq!(queue.pop_front(), Some(first));
+		assert_eq!(queue.pop_front(), Some(second));
+		assert!(queue.is_empty());
 	}
 }
