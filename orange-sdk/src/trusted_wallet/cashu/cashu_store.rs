@@ -23,6 +23,7 @@ use cdk::wallet::{
 };
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
+use tokio::sync::Mutex;
 
 // Constants for organizing data in the KV store
 const CASHU_PRIMARY_KEY: &str = "cashu_wallet";
@@ -114,6 +115,7 @@ impl From<DatabaseError> for cdk::cdk_database::Error {
 /// A KV store-based implementation of the Cashu WalletDatabase trait
 pub struct CashuKvDatabase {
 	store: Arc<dyn DynStore>,
+	keyset_counter_lock: Mutex<()>,
 	// In-memory caches for frequently accessed data
 	mints_cache: Arc<RwLock<HashMap<MintUrl, Option<MintInfo>>>>,
 	proofs_cache: Arc<RwLock<Vec<ProofInfo>>>,
@@ -123,6 +125,7 @@ impl Debug for CashuKvDatabase {
 	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
 		f.debug_struct("CashuKvDatabase")
 			.field("store", &"<KVStore>")
+			.field("keyset_counter_lock", &self.keyset_counter_lock)
 			.field("mints_cache", &self.mints_cache)
 			.field("proofs_cache", &self.proofs_cache)
 			.finish()
@@ -146,6 +149,7 @@ impl CashuKvDatabase {
 	pub(crate) async fn new(store: Arc<dyn DynStore>) -> Result<Self, DatabaseError> {
 		let database = Self {
 			store,
+			keyset_counter_lock: Mutex::new(()),
 			mints_cache: Arc::new(RwLock::new(HashMap::new())),
 			proofs_cache: Arc::new(RwLock::new(Vec::new())),
 		};
@@ -833,6 +837,7 @@ impl WalletDatabase<cdk::cdk_database::Error> for CashuKvDatabase {
 	async fn increment_keyset_counter(
 		&self, keyset_id: &Id, count: u32,
 	) -> Result<u32, cdk::cdk_database::Error> {
+		let _lock = self.keyset_counter_lock.lock().await;
 		let key = keyset_id.to_string();
 
 		// Read current counter
