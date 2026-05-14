@@ -13,6 +13,9 @@ use breez_sdk_spark::{
 	Contact, DepositInfo, ListContactsRequest, Payment, PaymentDetails, PaymentMetadata,
 	SetLnurlMetadataItem, StorageError, StorageListPaymentsRequest, UpdateDepositPayload,
 };
+use ldk_node::bitcoin::hashes::Hash;
+use ldk_node::bitcoin::hashes::sha256::Hash as Sha256;
+use ldk_node::bitcoin::hex::DisplayHex;
 use ldk_node::lightning::util::persist::KVSTORE_NAMESPACE_KEY_MAX_LEN;
 use ldk_node::lightning::util::persist::KVStore;
 
@@ -43,9 +46,28 @@ fn sanitize_key(key: String) -> String {
 	}
 }
 
+fn sync_record_key(parts: &[&str]) -> String {
+	let key = parts.iter().fold(String::new(), |mut key, part| {
+		key.push_str(&part.len().to_string());
+		key.push('_');
+		key.push_str(part);
+		key
+	});
+
+	if key.len() > KVSTORE_NAMESPACE_KEY_MAX_LEN {
+		format!("h_{}", Sha256::hash(key.as_bytes()).to_byte_array().as_hex())
+	} else {
+		key
+	}
+}
+
 /// Create a KV key from a RecordId.
 fn record_id_key(id: &RecordId) -> String {
-	sanitize_key(format!("{}_{}", id.r#type, id.data_id))
+	sync_record_key(&[&id.r#type, &id.data_id])
+}
+
+fn incoming_record_key(record: &Record) -> String {
+	sync_record_key(&[&record.id.r#type, &record.id.data_id, &record.revision.to_string()])
 }
 
 /// Serialize a Record to JSON bytes.
@@ -664,10 +686,7 @@ impl breez_sdk_spark::Storage for SparkStore {
 
 	async fn insert_incoming_records(&self, records: Vec<Record>) -> Result<(), StorageError> {
 		for record in records {
-			let key = sanitize_key(format!(
-				"{}_{}_{}",
-				record.id.r#type, record.id.data_id, record.revision
-			));
+			let key = incoming_record_key(&record);
 			let data = record_to_bytes(&record)?;
 
 			KVStore::write(
@@ -684,8 +703,7 @@ impl breez_sdk_spark::Storage for SparkStore {
 	}
 
 	async fn delete_incoming_record(&self, record: Record) -> Result<(), StorageError> {
-		let key =
-			sanitize_key(format!("{}_{}_{}", record.id.r#type, record.id.data_id, record.revision));
+		let key = incoming_record_key(&record);
 		let _ = KVStore::remove(
 			self.0.as_ref(),
 			SPARK_PRIMARY_NAMESPACE,
@@ -777,5 +795,44 @@ impl breez_sdk_spark::Storage for SparkStore {
 		self.update_server_revision(record.revision).await?;
 
 		Ok(())
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	fn record(record_type: &str, data_id: &str, revision: u64) -> Record {
+		Record {
+			id: RecordId::new(record_type.to_string(), data_id.to_string()),
+			schema_version: "1".to_string(),
+			data: HashMap::new(),
+			revision,
+		}
+	}
+
+	#[test]
+	fn record_id_key_distinguishes_underscore_in_type_vs_data_id() {
+		let a = RecordId::new("foo".to_string(), "bar_baz".to_string());
+		let b = RecordId::new("foo_bar".to_string(), "baz".to_string());
+
+		assert_ne!(record_id_key(&a), record_id_key(&b));
+	}
+
+	#[test]
+	fn incoming_record_key_distinguishes_underscore_in_type_vs_data_id() {
+		let a = record("foo", "bar_baz", 7);
+		let b = record("foo_bar", "baz", 7);
+
+		assert_ne!(incoming_record_key(&a), incoming_record_key(&b));
+	}
+
+	#[test]
+	fn oversized_keys_use_bounded_hash_key() {
+		let id = RecordId::new("a".repeat(KVSTORE_NAMESPACE_KEY_MAX_LEN), "b".to_string());
+		let key = record_id_key(&id);
+
+		assert!(key.len() <= KVSTORE_NAMESPACE_KEY_MAX_LEN);
+		assert!(key.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-'));
 	}
 }
