@@ -637,8 +637,8 @@ impl Wallet {
 					ExtraConfig::Dummy(cfg) => Arc::new(Box::new(
 						DummyTrustedWallet::new(
 							cfg.uuid,
-							&cfg.lsp,
-							&cfg.bitcoind,
+							Arc::clone(&cfg.lsp),
+							Arc::clone(&cfg.bitcoind),
 							tx_metadata.clone(),
 							Arc::clone(&event_queue),
 							Arc::clone(&runtime),

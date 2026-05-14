@@ -49,7 +49,7 @@ pub struct DummyTrustedWalletExtraConfig {
 impl DummyTrustedWallet {
 	/// Creates a new `DummyTrustedWallet` instance.
 	pub(crate) async fn new(
-		uuid: Uuid, lsp: &Node, bitcoind: &Bitcoind, tx_metadata: TxMetadataStore,
+		uuid: Uuid, lsp: Arc<Node>, bitcoind: Arc<Bitcoind>, tx_metadata: TxMetadataStore,
 		event_queue: Arc<EventQueue>, rt: Arc<Runtime>,
 	) -> Self {
 		let mut builder = ldk_node::Builder::new();
@@ -230,30 +230,57 @@ impl DummyTrustedWallet {
 		}
 
 		// have LSP open channel to node
-		lsp.open_channel(ldk_node.node_id(), socket_addr, 1_000_000, Some(500_000_000), None)
-			.unwrap();
+		let lsp_clone = Arc::clone(&lsp);
+		let ldk_node_id = ldk_node.node_id();
+		blocking_with_timeout("dummy LSP channel open", Duration::from_secs(30), move || {
+			lsp_clone.open_channel(ldk_node_id, socket_addr, 1_000_000, Some(500_000_000), None)
+		})
+		.await
+		.unwrap();
+
 		// wait for channel to be broadcast
 		for _ in 0..iterations {
-			let num_txs = bitcoind.client.get_mempool_info().unwrap().size;
+			let bitcoind_clone = Arc::clone(&bitcoind);
+			let num_txs =
+				blocking_with_timeout("dummy mempool check", Duration::from_secs(5), move || {
+					bitcoind_clone.client.get_mempool_info().unwrap().size
+				})
+				.await;
 			if num_txs > 0 {
 				break;
 			}
 			tokio::time::sleep(Duration::from_millis(250)).await;
 		}
+
 		// confirm channel
-		let addr = bitcoind.client.new_address().unwrap();
-		bitcoind.client.generate_to_address(6, &addr).unwrap();
+		let bitcoind_clone = Arc::clone(&bitcoind);
+		blocking_with_timeout("dummy channel confirmation", Duration::from_secs(30), move || {
+			let addr = bitcoind_clone.client.new_address().unwrap();
+			bitcoind_clone.client.generate_to_address(6, &addr).unwrap();
+		})
+		.await;
 
 		// wait for sync/channel ready
 		for _ in 0..iterations {
-			if ldk_node.list_channels().first().is_some_and(|c| c.is_usable) {
+			let ldk_node_clone = Arc::clone(&ldk_node);
+			let is_usable =
+				blocking_with_timeout("dummy channel list", Duration::from_secs(5), move || {
+					ldk_node_clone.list_channels().first().is_some_and(|c| c.is_usable)
+				})
+				.await;
+			if is_usable {
 				break;
 			}
 			tokio::time::sleep(Duration::from_secs(1)).await;
 		}
 
-		let channels = ldk_node.list_channels();
-		if !ldk_node.list_channels().first().is_some_and(|c| c.is_usable) {
+		let ldk_node_clone = Arc::clone(&ldk_node);
+		let channels =
+			blocking_with_timeout("dummy final channel list", Duration::from_secs(5), move || {
+				ldk_node_clone.list_channels()
+			})
+			.await;
+		if !channels.first().is_some_and(|c| c.is_usable) {
 			panic!("No usable channels found {channels:?}");
 		}
 
@@ -262,6 +289,18 @@ impl DummyTrustedWallet {
 
 	fn payment_wait_timeout() -> Duration {
 		if std::env::var("CI").is_ok() { Duration::from_secs(120) } else { Duration::from_secs(20) }
+	}
+}
+
+async fn blocking_with_timeout<F, T>(operation: &'static str, timeout: Duration, f: F) -> T
+where
+	F: FnOnce() -> T + Send + 'static,
+	T: Send + 'static,
+{
+	match tokio::time::timeout(timeout, tokio::task::spawn_blocking(f)).await {
+		Ok(Ok(result)) => result,
+		Ok(Err(e)) => panic!("{operation} blocking task failed: {e}"),
+		Err(_) => panic!("{operation} timed out after {timeout:?}"),
 	}
 }
 
