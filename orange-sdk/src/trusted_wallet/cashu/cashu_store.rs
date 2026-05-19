@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt::Debug;
 use std::str::FromStr;
 use std::sync::{Arc, RwLock};
@@ -255,6 +255,29 @@ impl CashuKvDatabase {
 	fn generate_proof_key(proof: &ProofInfo) -> String {
 		// Generate a unique key for the proof based on the Y coordinate
 		format!("proof_{}", hex::encode(proof.y.serialize()))
+	}
+
+	fn update_proofs_cache(
+		cache: &mut Vec<ProofInfo>, added: Vec<ProofInfo>, removed_ys: Vec<PublicKey>,
+	) {
+		let mut added_ys = HashSet::new();
+		let mut added_deduped = Vec::with_capacity(added.len());
+		for proof in added.into_iter().rev() {
+			if added_ys.insert(proof.y) {
+				added_deduped.push(proof);
+			}
+		}
+		added_deduped.reverse();
+
+		let removed_ys: HashSet<_> = removed_ys.into_iter().collect();
+
+		// Match the KV store's proof_<Y> uniqueness by replacing cached entries with
+		// the same Y before appending the updated proof data.
+		cache.retain(|proof| !added_ys.contains(&proof.y));
+		cache.extend(added_deduped);
+
+		// Remove proofs with matching Y values
+		cache.retain(|proof| !removed_ys.contains(&proof.y));
 	}
 
 	fn generate_mint_key(mint_url: &MintUrl) -> String {
@@ -736,12 +759,7 @@ impl WalletDatabase<cdk::cdk_database::Error> for CashuKvDatabase {
 		// Update cache
 		{
 			let mut cache = self.proofs_cache.write().unwrap();
-
-			// Add new proofs
-			cache.extend(added);
-
-			// Remove proofs with matching Y values
-			cache.retain(|proof| !removed_ys.contains(&proof.y));
+			Self::update_proofs_cache(&mut cache, added, removed_ys);
 		}
 
 		Ok(())
@@ -1261,4 +1279,70 @@ pub(super) async fn write_has_recovered(
 	KVStore::write(store.as_ref(), CASHU_PRIMARY_KEY, "", HAS_RECOVERED_KEY, data)
 		.await
 		.map_err(TrustedError::IOError)
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+	use cdk::Amount;
+	use cdk::nuts::Proof;
+	use cdk::secret::Secret;
+
+	fn proof_info(secret: &str, amount: u64) -> ProofInfo {
+		let proof = Proof::new(
+			Amount::from(amount),
+			Id::from_str("009a1f293253e41e").unwrap(),
+			Secret::new(secret),
+			PublicKey::from_str(
+				"024369d2d22a80ecf78f3937da9d5f30c1b9f74f0c32684d583cca0fa6a61cdcfc",
+			)
+			.unwrap(),
+		);
+
+		ProofInfo::new(
+			proof,
+			MintUrl::from_str("https://mint.example.com").unwrap(),
+			State::Unspent,
+			CurrencyUnit::Sat,
+		)
+		.unwrap()
+	}
+
+	#[test]
+	fn update_proofs_cache_replaces_existing_proof_with_same_y() {
+		let original = proof_info("same cached proof", 1);
+		let replacement = proof_info("same cached proof", 2);
+		let mut cache = vec![original.clone()];
+
+		CashuKvDatabase::update_proofs_cache(&mut cache, vec![replacement.clone()], vec![]);
+
+		assert_eq!(cache, vec![replacement]);
+		assert_eq!(cache.iter().filter(|proof| proof.y == original.y).count(), 1);
+	}
+
+	#[test]
+	fn update_proofs_cache_deduplicates_added_proofs_by_y() {
+		let original = proof_info("duplicate added proof", 1);
+		let replacement = proof_info("duplicate added proof", 2);
+		let mut cache = Vec::new();
+
+		CashuKvDatabase::update_proofs_cache(
+			&mut cache,
+			vec![original.clone(), replacement.clone()],
+			vec![],
+		);
+
+		assert_eq!(cache, vec![replacement]);
+		assert_eq!(cache.iter().filter(|proof| proof.y == original.y).count(), 1);
+	}
+
+	#[test]
+	fn update_proofs_cache_removal_wins_over_added_proof() {
+		let proof = proof_info("removed cached proof", 1);
+		let mut cache = vec![proof.clone()];
+
+		CashuKvDatabase::update_proofs_cache(&mut cache, vec![proof.clone()], vec![proof.y]);
+
+		assert!(cache.is_empty());
+	}
 }
