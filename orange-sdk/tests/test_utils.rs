@@ -650,6 +650,7 @@ pub async fn open_channel_from_lsp(wallet: &orange_sdk::Wallet, payer: Arc<Node>
 	let recv_amt = limit.trusted_balance_limit.saturating_add(limit.trusted_balance_limit);
 
 	let uri = wallet.get_single_use_receive_uri(Some(recv_amt)).await.unwrap();
+	assert!(!uri.from_trusted);
 	let payment_id = payer.bolt11_payment().send(&uri.invoice, None).unwrap();
 
 	// wait for payment success from payer side

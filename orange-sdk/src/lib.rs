@@ -1101,7 +1101,7 @@ impl Wallet {
 			(
 				self.inner.tunables.enable_amountless_receive_on_chain,
 				self.inner.trusted.get_bolt11_invoice(amount).await?,
-				false,
+				true,
 			)
 		};
 		if enable_onchain {

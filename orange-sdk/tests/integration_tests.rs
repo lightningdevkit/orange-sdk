@@ -43,6 +43,7 @@ async fn test_receive_to_trusted() {
 		assert!(recv_amt < limit.trusted_balance_limit);
 
 		let uri = wallet.get_single_use_receive_uri(Some(recv_amt)).await.unwrap();
+		assert!(uri.from_trusted);
 		let payment_id = third_party.bolt11_payment().send(&uri.invoice, None).unwrap();
 
 		// wait for payment success from payer side
@@ -189,6 +190,7 @@ async fn test_sweep_to_ln() {
 			Amount::from_milli_sats(limit.trusted_balance_limit.milli_sats() / 2).unwrap();
 
 		let uri = wallet.get_single_use_receive_uri(Some(recv_amt)).await.unwrap();
+		assert!(uri.from_trusted);
 		third_party.bolt11_payment().send(&uri.invoice, None).unwrap();
 
 		// wait for balance update on wallet side
@@ -1451,6 +1453,7 @@ async fn test_threshold_boundary_onchain_receive_threshold() {
 				uri.invoice.amount_milli_satoshis().is_none(),
 				"Amountless invoice should have no fixed amount"
 			);
+			assert!(uri.from_trusted, "Amountless receive should use a trusted-wallet invoice");
 		}
 	})
 	.await;
