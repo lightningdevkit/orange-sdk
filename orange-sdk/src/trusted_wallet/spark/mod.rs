@@ -333,7 +333,7 @@ impl Spark {
 			},
 		};
 
-		let spark_store = Arc::new(spark_store::SparkStore(store));
+		let spark_store = Arc::new(spark_store::SparkStore::new(store));
 		let builder = SdkBuilder::new(spark_config, seed).with_storage(spark_store);
 
 		let spark_wallet = Arc::new(builder.build().await.map_err(|e| {
