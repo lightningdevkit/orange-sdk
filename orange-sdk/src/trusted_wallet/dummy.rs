@@ -284,6 +284,40 @@ impl DummyTrustedWallet {
 			panic!("No usable channels found {channels:?}");
 		}
 
+		for _ in 0..iterations {
+			let lsp_clone = Arc::clone(&lsp);
+			let ldk_node_id = ldk_node.node_id();
+			let is_usable = blocking_with_timeout(
+				"dummy LSP channel list",
+				Duration::from_secs(5),
+				move || {
+					lsp_clone
+						.list_channels()
+						.iter()
+						.any(|c| c.counterparty_node_id == ldk_node_id && c.is_usable)
+				},
+			)
+			.await;
+			if is_usable {
+				break;
+			}
+			tokio::time::sleep(Duration::from_secs(1)).await;
+		}
+
+		let lsp_clone = Arc::clone(&lsp);
+		let ldk_node_id = ldk_node.node_id();
+		let lsp_channels = blocking_with_timeout(
+			"dummy final LSP channel list",
+			Duration::from_secs(5),
+			move || lsp_clone.list_channels(),
+		)
+		.await;
+		if !lsp_channels.iter().any(|c| c.counterparty_node_id == ldk_node_id && c.is_usable) {
+			panic!(
+				"No usable LSP-side channel found for dummy node {ldk_node_id}: {lsp_channels:?}"
+			);
+		}
+
 		DummyTrustedWallet { current_bal_msats, payments, ldk_node, payment_success_flag }
 	}
 
