@@ -5296,6 +5296,7 @@ public enum VssAuth {
      */
     case fixedHeaders([String: String]
     )
+    case sigsAuth
 }
 
 
@@ -5319,6 +5320,8 @@ public struct FfiConverterTypeVssAuth: FfiConverterRustBuffer {
         case 2: return .fixedHeaders(try FfiConverterDictionaryStringString.read(from: &buf)
         )
         
+        case 3: return .sigsAuth
+
         default: throw UniffiInternalError.unexpectedEnumCase
         }
     }
@@ -5336,6 +5339,10 @@ public struct FfiConverterTypeVssAuth: FfiConverterRustBuffer {
             writeInt(&buf, Int32(2))
             FfiConverterDictionaryStringString.write(v1, into: &buf)
             
+
+        case .sigsAuth:
+            writeInt(&buf, Int32(3))
+
         }
     }
 }

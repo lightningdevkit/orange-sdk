@@ -38,8 +38,9 @@ struct Cli {
 	/// local SQLite for all wallet persistence.
 	#[arg(long)]
 	vss_url: Option<String>,
-	/// LNURL-auth server URL for VSS authentication. When omitted, fixed
-	/// headers (possibly empty) are used instead.
+	/// LNURL-auth server URL for VSS authentication. When omitted, VSS uses
+	/// sigs auth unless fixed headers are provided. Sigs auth requires no
+	/// setup on VSS server; it works out of the box.
 	#[arg(long, requires = "vss_url")]
 	vss_lnurl_auth_url: Option<String>,
 	/// Fixed HTTP header to attach to every VSS request, in `Key:Value` form.
@@ -62,6 +63,7 @@ fn build_storage_config(cli: &Cli, storage_path: &str) -> StorageConfig {
 	let store_id = "orange-cli".to_string();
 	let headers = match cli.vss_lnurl_auth_url.clone() {
 		Some(url) => VssAuth::LNURLAuthServer(url),
+		None if cli.vss_headers.is_empty() => VssAuth::SigsAuth,
 		None => VssAuth::FixedHeaders(cli.vss_headers.iter().cloned().collect::<HashMap<_, _>>()),
 	};
 	println!(

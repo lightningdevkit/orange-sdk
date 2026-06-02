@@ -75,6 +75,13 @@ pub enum VssAuth {
 	/// A fixed set of HTTP headers included as-is on every request made to
 	/// VSS.
 	FixedHeaders(HashMap<String, String>),
+	/// Simple authentication scheme where access is granted by the knowledge of a private key.
+	///
+	/// There is no specific restriction of who is allowed to store data in VSS using this
+	/// authentication scheme, only that each user is only allowed to store and access data for
+	/// which they have a corresponding private key. Thus, you must ensure new user accounts are
+	/// appropriately rate-limited or access to the VSS server is somehow limited.
+	SigsAuth,
 }
 
 impl From<VssAuth> for OrangeVssAuth {
@@ -82,6 +89,7 @@ impl From<VssAuth> for OrangeVssAuth {
 		match auth {
 			VssAuth::LNURLAuthServer(url) => OrangeVssAuth::LNURLAuthServer(url),
 			VssAuth::FixedHeaders(headers) => OrangeVssAuth::FixedHeaders(headers),
+			VssAuth::SigsAuth => OrangeVssAuth::SigsAuth,
 		}
 	}
 }
@@ -91,6 +99,7 @@ impl From<OrangeVssAuth> for VssAuth {
 		match auth {
 			OrangeVssAuth::LNURLAuthServer(url) => VssAuth::LNURLAuthServer(url),
 			OrangeVssAuth::FixedHeaders(headers) => VssAuth::FixedHeaders(headers),
+			OrangeVssAuth::SigsAuth => VssAuth::SigsAuth,
 		}
 	}
 }
