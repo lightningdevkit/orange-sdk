@@ -256,22 +256,23 @@ where
 
 	/// Does a trusted to lightning rebalance if needed
 	pub async fn do_trusted_rebalance_if_needed(&self) {
+		let _lock = self.balance_mutex.lock().await;
 		if let Some(params) = self.trigger.needs_trusted_rebalance().await {
-			self.do_trusted_rebalance(params).await;
+			self.do_trusted_rebalance_locked(params).await;
 		}
 	}
 
 	/// Does an on-chain to lightning rebalance if needed
 	pub async fn do_onchain_rebalance_if_needed(&self) {
+		let _lock = self.balance_mutex.lock().await;
 		if let Some(params) = self.trigger.needs_onchain_rebalance().await {
-			self.do_onchain_rebalance(params).await;
+			self.do_onchain_rebalance_locked(params).await;
 		}
 	}
 
 	/// Perform a rebalance from trusted to lightning wallet
-	async fn do_trusted_rebalance(&self, params: TriggerParams) {
+	async fn do_trusted_rebalance_locked(&self, params: TriggerParams) {
 		let transfer_amt = params.amount;
-		let _lock = self.balance_mutex.lock().await;
 		log_info!(self.logger, "Initiating rebalance");
 
 		if let Ok(inv) = self.ln_wallet.get_bolt11_invoice(Some(transfer_amt)).await {
@@ -340,9 +341,7 @@ where
 	}
 
 	/// Perform on-chain to lightning rebalance by opening a channel or splicing into an existing one
-	async fn do_onchain_rebalance(&self, params: TriggerParams) {
-		let _lock = self.balance_mutex.lock().await;
-
+	async fn do_onchain_rebalance_locked(&self, params: TriggerParams) {
 		let (channel_outpoint, user_channel_id) = if self.ln_wallet.has_channel_with_lsp() {
 			log_info!(self.logger, "Splicing into channel with LSP with on-chain funds");
 
