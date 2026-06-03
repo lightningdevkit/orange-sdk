@@ -189,6 +189,13 @@ pub enum VssAuth {
 	/// A fixed set of HTTP headers included as-is on every request made to
 	/// VSS.
 	FixedHeaders(HashMap<String, String>),
+	/// Simple authentication scheme where access is granted by the knowledge of a private key.
+	///
+	/// There is no specific restriction of who is allowed to store data in VSS using this
+	/// authentication scheme, only that each user is only allowed to store and access data for
+	/// which they have a corresponding private key. Thus, you must ensure new user accounts are
+	/// appropriately rate-limited or access to the VSS server is somehow limited.
+	SigsAuth,
 }
 
 /// Configuration for a [Versioned Storage Service (VSS)] backend.
@@ -581,10 +588,11 @@ impl Wallet {
 					config.network,
 				);
 				let vss_store = match &vss_config.headers {
-					VssAuth::FixedHeaders(h) => builder.build_with_fixed_headers(h.clone())?,
 					VssAuth::LNURLAuthServer(url) => {
 						builder.build_with_lnurl(url.clone(), HashMap::new())?
 					},
+					VssAuth::FixedHeaders(h) => builder.build_with_fixed_headers(h.clone())?,
+					VssAuth::SigsAuth => builder.build_with_sigs_auth(HashMap::new())?,
 				};
 				Arc::new(vss_store)
 			},
