@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::fmt;
 use std::ops::Deref;
 use std::path::PathBuf;
 use std::str::FromStr;
@@ -22,7 +23,7 @@ use crate::logging::LoggerType;
 use crate::trusted_wallet::ExtraConfig as OrangeExtraConfig;
 use crate::{impl_from_core_type, impl_into_core_type};
 
-#[derive(Debug, Clone, uniffi::Enum)]
+#[derive(Clone, uniffi::Enum)]
 pub enum Seed {
 	/// A BIP 39 mnemonic seed.
 	MnemonicSeed {
@@ -33,6 +34,19 @@ pub enum Seed {
 	},
 	/// A 64-byte seed for the wallet.
 	Seed64(Vec<u8>),
+}
+
+impl fmt::Debug for Seed {
+	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+		match self {
+			Seed::MnemonicSeed { .. } => f
+				.debug_struct("MnemonicSeed")
+				.field("mnemonic", &"<redacted>")
+				.field("passphrase", &"<redacted>")
+				.finish(),
+			Seed::Seed64(_) => f.debug_tuple("Seed64").field(&"<redacted>").finish(),
+		}
+	}
 }
 
 impl TryInto<OrangeSeed> for Seed {
@@ -299,5 +313,31 @@ impl TryFrom<WalletConfig> for OrangeWalletConfig {
 			tunables: config.tunables.deref().clone().into(),
 			extra_config: config.extra_config.into(),
 		})
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+	use crate::ffi::ldk_node::Mnemonic;
+
+	#[test]
+	fn ffi_seed_debug_redacts_seed64_bytes() {
+		let seed = Seed::Seed64(vec![42; 64]);
+
+		assert_eq!(format!("{seed:?}"), "Seed64(\"<redacted>\")");
+	}
+
+	#[test]
+	fn ffi_seed_debug_redacts_mnemonic_and_passphrase() {
+		let mnemonic = Arc::new(
+			Mnemonic::from_entropy(vec![0; 16]).expect("static test entropy should be valid"),
+		);
+		let seed = Seed::MnemonicSeed { mnemonic, passphrase: Some("test passphrase".to_owned()) };
+		let debug = format!("{seed:?}");
+
+		assert_eq!(debug, "MnemonicSeed { mnemonic: \"<redacted>\", passphrase: \"<redacted>\" }");
+		assert!(!debug.contains("abandon"));
+		assert!(!debug.contains("test passphrase"));
 	}
 }
