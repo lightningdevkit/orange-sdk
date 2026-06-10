@@ -143,7 +143,7 @@ pub struct Wallet {
 }
 
 /// Represents the seed used for wallet generation.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub enum Seed {
 	/// A BIP 39 mnemonic seed.
 	Mnemonic {
@@ -154,6 +154,19 @@ pub enum Seed {
 	},
 	/// A 64-byte seed for the wallet.
 	Seed64([u8; 64]),
+}
+
+impl Debug for Seed {
+	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+		match self {
+			Seed::Mnemonic { .. } => f
+				.debug_struct("Mnemonic")
+				.field("mnemonic", &"<redacted>")
+				.field("passphrase", &"<redacted>")
+				.finish(),
+			Seed::Seed64(_) => f.debug_tuple("Seed64").field(&"<redacted>").finish(),
+		}
+	}
 }
 
 impl Seed {
@@ -1495,5 +1508,30 @@ impl Wallet {
 	pub fn sync_ln_wallet(&self) -> Result<(), WalletError> {
 		self.inner.ln_wallet.inner.ldk_node.sync_wallets()?;
 		Ok(())
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+	use ldk_node::bip39::Mnemonic;
+
+	#[test]
+	fn seed_debug_redacts_seed64_bytes() {
+		let seed = Seed::Seed64([42; 64]);
+
+		assert_eq!(format!("{seed:?}"), "Seed64(\"<redacted>\")");
+	}
+
+	#[test]
+	fn seed_debug_redacts_mnemonic_and_passphrase() {
+		let mnemonic =
+			Mnemonic::from_entropy(&[0; 16]).expect("static test entropy should be valid");
+		let seed = Seed::Mnemonic { mnemonic, passphrase: Some("test passphrase".to_owned()) };
+		let debug = format!("{seed:?}");
+
+		assert_eq!(debug, "Mnemonic { mnemonic: \"<redacted>\", passphrase: \"<redacted>\" }");
+		assert!(!debug.contains("abandon"));
+		assert!(!debug.contains("test passphrase"));
 	}
 }
