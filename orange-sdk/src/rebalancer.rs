@@ -204,47 +204,52 @@ impl RebalanceTrigger for OrangeTrigger {
 					let txs = self.ln_wallet.list_payments();
 					let new = txs
 						.into_iter()
-						.filter(|t| {
-							t.status == PaymentStatus::Succeeded
-								&& t.direction == PaymentDirection::Inbound
-								&& matches!(t.kind, PaymentKind::Onchain { .. })
-								&& t.latest_update_timestamp >= onchain_sync_time
-						})
-						.max_by_key(|t| t.amount_msat);
-					match new {
-						Some(new) => {
-							if let PaymentKind::Onchain { txid, .. } = new.kind {
-								// make sure we have a metadata entry for the triggering transaction
-								let trigger = PaymentId::SelfCustodial(txid.to_byte_array());
-								if self.tx_metadata.read().get(&trigger).is_none() {
-									self.tx_metadata
-										.insert(
-											trigger,
-											TxMetadata {
-												ty: TxType::Payment {
-													ty: PaymentType::IncomingOnChain {
-														txid: Some(txid),
-													},
-												},
-												time: SystemTime::now()
-													.duration_since(SystemTime::UNIX_EPOCH)
-													.unwrap(),
-											},
-										)
-										.await;
-								}
-
-								Some(TriggerParams {
-									amount: Amount::from_sats(spendable).expect("valid amount"),
-									id: txid.to_byte_array(),
-								})
-							} else {
-								debug_assert!(
-									false,
-									"PaymentKind::Onchain should always be present for onchain payments"
-								);
-								None
+						.filter_map(|t| {
+							if t.status != PaymentStatus::Succeeded
+								|| t.direction != PaymentDirection::Inbound
+								|| t.latest_update_timestamp <= onchain_sync_time
+							{
+								return None;
 							}
+							let PaymentKind::Onchain { txid, .. } = t.kind else {
+								return None;
+							};
+							let trigger = PaymentId::SelfCustodial(txid.to_byte_array());
+							// Only payments can be promoted into rebalance triggers. If this
+							// metadata was already promoted by a previous rebalance, selecting it
+							// again would make the event handler reject the duplicate promotion.
+							let can_mark_as_trigger =
+								self.tx_metadata.read().get(&trigger).is_none_or(|metadata| {
+									matches!(metadata.ty, TxType::Payment { .. })
+								});
+							if can_mark_as_trigger { Some((t, txid, trigger)) } else { None }
+						})
+						.max_by_key(|(t, _, _)| t.amount_msat);
+					match new {
+						Some((_, txid, trigger)) => {
+							// make sure we have a metadata entry for the triggering transaction
+							if self.tx_metadata.read().get(&trigger).is_none() {
+								self.tx_metadata
+									.insert(
+										trigger,
+										TxMetadata {
+											ty: TxType::Payment {
+												ty: PaymentType::IncomingOnChain {
+													txid: Some(txid),
+												},
+											},
+											time: SystemTime::now()
+												.duration_since(SystemTime::UNIX_EPOCH)
+												.unwrap(),
+										},
+									)
+									.await;
+							}
+
+							Some(TriggerParams {
+								amount: Amount::from_sats(spendable).expect("valid amount"),
+								id: txid.to_byte_array(),
+							})
 						},
 						None => {
 							log_warn!(
