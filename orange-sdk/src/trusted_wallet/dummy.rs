@@ -210,8 +210,8 @@ impl DummyTrustedWallet {
 					Event::ChannelPending { .. } => {},
 					Event::ChannelReady { .. } => {},
 					Event::ChannelClosed { .. } => {},
-					Event::SplicePending { .. } => {},
-					Event::SpliceFailed { .. } => {},
+					Event::SpliceNegotiated { .. } => {},
+					Event::SpliceNegotiationFailed { .. } => {},
 				}
 				println!("dummy: {event:?}");
 				if let Err(e) = events_ref.event_handled() {
@@ -294,7 +294,7 @@ impl DummyTrustedWallet {
 					lsp_clone
 						.list_channels()
 						.iter()
-						.any(|c| c.counterparty_node_id == ldk_node_id && c.is_usable)
+						.any(|c| c.counterparty.node_id == ldk_node_id && c.is_usable)
 				},
 			)
 			.await;
@@ -312,7 +312,7 @@ impl DummyTrustedWallet {
 			move || lsp_clone.list_channels(),
 		)
 		.await;
-		if !lsp_channels.iter().any(|c| c.counterparty_node_id == ldk_node_id && c.is_usable) {
+		if !lsp_channels.iter().any(|c| c.counterparty.node_id == ldk_node_id && c.is_usable) {
 			panic!(
 				"No usable LSP-side channel found for dummy node {ldk_node_id}: {lsp_channels:?}"
 			);
@@ -462,11 +462,7 @@ impl TrustedWalletInterface for DummyTrustedWallet {
 			loop {
 				if let Some(payment) = self.ldk_node.payment(&id) {
 					let counterparty_skimmed_fee_msat = match payment.kind {
-						PaymentKind::Bolt11 { hash, .. } => {
-							debug_assert!(hash.0 == payment_hash, "Payment Hash mismatch");
-							None
-						},
-						PaymentKind::Bolt11Jit { hash, counterparty_skimmed_fee_msat, .. } => {
+						PaymentKind::Bolt11 { hash, counterparty_skimmed_fee_msat, .. } => {
 							debug_assert!(hash.0 == payment_hash, "Payment Hash mismatch");
 							counterparty_skimmed_fee_msat
 						},

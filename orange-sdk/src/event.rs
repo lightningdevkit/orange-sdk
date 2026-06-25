@@ -383,7 +383,7 @@ impl LdkEventHandler {
 			} => {
 				let payment_id = payment_id.expect("this is safe");
 				let lsp_fee_msats = self.ldk_node.payment(&payment_id).and_then(|p| {
-					if let PaymentKind::Bolt11Jit { counterparty_skimmed_fee_msat, .. } = p.kind {
+					if let PaymentKind::Bolt11 { counterparty_skimmed_fee_msat, .. } = p.kind {
 						counterparty_skimmed_fee_msat
 					} else {
 						None
@@ -466,13 +466,13 @@ impl LdkEventHandler {
 					return;
 				}
 			},
-			ldk_node::Event::SplicePending {
+			ldk_node::Event::SpliceNegotiated {
 				channel_id,
 				user_channel_id,
 				counterparty_node_id,
 				new_funding_txo,
 			} => {
-				log_debug!(self.logger, "Received SplicePending event {event:?}");
+				log_debug!(self.logger, "Received SpliceNegotiated event {event:?}");
 				// Reserve the metadata slot before delivering so any task waking on the
 				// inbox (the rebalancer's `OnChainRebalanceInitiated` for splice-in,
 				// `pay_lightning` for splice-out) sees an entry to upsert.
@@ -493,8 +493,8 @@ impl LdkEventHandler {
 					return;
 				}
 			},
-			ldk_node::Event::SpliceFailed { .. } => {
-				log_warn!(self.logger, "Received SpliceFailed event: {event:?}");
+			ldk_node::Event::SpliceNegotiationFailed { .. } => {
+				log_warn!(self.logger, "Received SpliceNegotiationFailed event: {event:?}");
 			},
 		}
 

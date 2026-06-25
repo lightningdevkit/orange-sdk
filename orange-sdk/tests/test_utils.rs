@@ -173,7 +173,7 @@ fn create_lsp(uuid: Uuid, bitcoind: &Bitcoind) -> Arc<Node> {
 		client_trusts_lsp: true,
 		disable_client_reserve: false,
 	};
-	builder.set_liquidity_provider_lsps2(lsps2_service_config);
+	builder.enable_liquidity_provider(lsps2_service_config);
 
 	let port = get_available_port().unwrap();
 	let addr = SocketAddress::TcpIpV4 { addr: [127, 0, 0, 1], port };

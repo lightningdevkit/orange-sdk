@@ -102,7 +102,7 @@ impl LightningWallet {
 		}
 
 		let (lsp_socket_addr, lsp_node_id, lsp_token) = config.lsp;
-		builder.set_liquidity_source_lsps2(lsp_node_id, lsp_socket_addr.clone(), lsp_token);
+		builder.add_liquidity_source(lsp_node_id, lsp_socket_addr.clone(), lsp_token, true);
 		match config.chain_source {
 			ChainSource::Esplora { url, username, password } => {
 				let sync_config = if config.network == Network::Regtest {
@@ -329,7 +329,7 @@ impl LightningWallet {
 					// find existing channel to splice out of
 					let channels = self.inner.ldk_node.list_channels();
 					let channel =
-						channels.iter().find(|c| c.counterparty_node_id == self.inner.lsp_node_id);
+						channels.iter().find(|c| c.counterparty.node_id == self.inner.lsp_node_id);
 
 					match channel {
 						None => {
@@ -339,7 +339,7 @@ impl LightningWallet {
 						Some(chan) => {
 							self.inner.ldk_node.splice_out(
 								&chan.user_channel_id,
-								chan.counterparty_node_id,
+								chan.counterparty.node_id,
 								address,
 								amount_sats,
 							)?;
@@ -376,13 +376,13 @@ impl LightningWallet {
 	pub(crate) async fn splice_all_into_channel(&self) -> Result<UserChannelId, NodeError> {
 		// find existing channel to splice into
 		let channels = self.inner.ldk_node.list_channels();
-		let channel = channels.iter().find(|c| c.counterparty_node_id == self.inner.lsp_node_id);
+		let channel = channels.iter().find(|c| c.counterparty.node_id == self.inner.lsp_node_id);
 
 		match channel {
 			Some(chan) => {
 				self.inner
 					.ldk_node
-					.splice_in_with_all(&chan.user_channel_id, chan.counterparty_node_id)?;
+					.splice_in_with_all(&chan.user_channel_id, chan.counterparty.node_id)?;
 				Ok(chan.user_channel_id)
 			},
 			None => {
@@ -409,11 +409,11 @@ impl LightningWallet {
 			if chan.is_usable {
 				self.inner
 					.ldk_node
-					.close_channel(&chan.user_channel_id, chan.counterparty_node_id)?;
+					.close_channel(&chan.user_channel_id, chan.counterparty.node_id)?;
 			} else {
 				self.inner.ldk_node.force_close_channel(
 					&chan.user_channel_id,
-					chan.counterparty_node_id,
+					chan.counterparty.node_id,
 					None,
 				)?;
 			}
@@ -464,11 +464,7 @@ impl graduated_rebalancer::LightningWallet for LightningWallet {
 			loop {
 				if let Some(payment) = self.inner.ldk_node.payment(&id) {
 					let counterparty_skimmed_fee_msat = match payment.kind {
-						PaymentKind::Bolt11 { hash, .. } => {
-							debug_assert!(hash.0 == payment_hash, "Payment Hash mismatch");
-							None
-						},
-						PaymentKind::Bolt11Jit { hash, counterparty_skimmed_fee_msat, .. } => {
+						PaymentKind::Bolt11 { hash, counterparty_skimmed_fee_msat, .. } => {
 							debug_assert!(hash.0 == payment_hash, "Payment Hash mismatch");
 							counterparty_skimmed_fee_msat
 						},
@@ -492,7 +488,7 @@ impl graduated_rebalancer::LightningWallet for LightningWallet {
 
 	fn has_channel_with_lsp(&self) -> bool {
 		let channels = self.inner.ldk_node.list_channels();
-		channels.iter().any(|c| c.counterparty_node_id == self.inner.lsp_node_id)
+		channels.iter().any(|c| c.counterparty.node_id == self.inner.lsp_node_id)
 	}
 
 	fn open_channel_with_lsp(
@@ -550,10 +546,7 @@ impl From<PaymentStatus> for TxStatus {
 impl From<&PaymentDetails> for PaymentType {
 	fn from(d: &PaymentDetails) -> PaymentType {
 		match (&d.kind, d.direction == PaymentDirection::Outbound) {
-			(
-				PaymentKind::Bolt11 { preimage, .. } | PaymentKind::Bolt11Jit { preimage, .. },
-				true,
-			) => {
+			(PaymentKind::Bolt11 { preimage, .. }, true) => {
 				if d.status == PaymentStatus::Succeeded {
 					debug_assert!(preimage.is_some());
 				}

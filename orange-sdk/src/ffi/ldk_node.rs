@@ -69,7 +69,7 @@ impl ChannelDetails {
 
 	/// The node ID of the counterparty.
 	pub fn counterparty_node_id(&self) -> String {
-		self.0.counterparty_node_id.to_string()
+		self.0.counterparty.node_id.to_string()
 	}
 
 	/// The funding transaction output.
