@@ -844,7 +844,17 @@ impl Wallet {
 							amount: Some(payment.amount),
 							fee: Some(payment.fee),
 							payment_type: *ty,
-							time_since_epoch: tx_metadata.time,
+							// Inbound receives use the backend's settle time. The rebalancer
+							// stamps `tx_metadata.time` with `now()` when it first observes a
+							// payment, so a receive that settled while we were offline would
+							// otherwise be dated to the next launch and float to the top of
+							// the time-sorted history. Outbound sends, which we observe as
+							// they happen, keep the metadata time.
+							time_since_epoch: if payment.outbound {
+								tx_metadata.time
+							} else {
+								payment.time_since_epoch
+							},
 						});
 					},
 					TxType::PendingRebalance { .. } => {
