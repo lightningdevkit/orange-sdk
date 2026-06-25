@@ -11,7 +11,7 @@ use ldk_node::payment::{ConfirmationStatus, PaymentDirection, PaymentStatus};
 use log::info;
 use orange_sdk::{Event, PaymentInfo, PaymentType, TxStatus, WalletError};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 mod test_utils;
 
@@ -81,6 +81,67 @@ async fn test_receive_to_trusted() {
 		);
 
 		info!("test passed");
+	})
+	.await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[test_log::test]
+async fn test_trusted_receive_keeps_backend_settle_time() {
+	test_utils::run_test(|params| async move {
+		let wallet = Arc::clone(&params.wallet);
+		let third_party = Arc::clone(&params.third_party);
+
+		// Disable rebalancing before the payment exists so the rebalancer does not
+		// stamp a discovery time when it first observes the receive.
+		wallet.set_rebalance_enabled(false).await;
+
+		let recv_amt = Amount::from_sats(100).unwrap();
+		assert!(recv_amt < wallet.get_tunables().trusted_balance_limit);
+
+		let uri = wallet.get_single_use_receive_uri(Some(recv_amt)).await.unwrap();
+		assert!(uri.from_trusted);
+		let payment_id = third_party.bolt11_payment().send(&uri.invoice, None).unwrap();
+
+		let p = Arc::clone(&third_party);
+		test_utils::wait_for_condition("payer payment success", || {
+			let res = p.payment(&payment_id).is_some_and(|p| p.status == PaymentStatus::Succeeded);
+			async move { res }
+		})
+		.await;
+
+		test_utils::wait_for_condition("wallet balance update after receive", || async {
+			wallet.get_balance().await.unwrap().available_balance() > Amount::ZERO
+		})
+		.await;
+
+		// The backend has recorded the settle time ~now. Sleep so any later
+		// discovery stamp lands a clearly later wall-clock time, then mark that
+		// boundary just before we let the rebalancer run.
+		tokio::time::sleep(Duration::from_secs(3)).await;
+		let enabled_at = SystemTime::now().duration_since(UNIX_EPOCH).unwrap();
+
+		// Re-enable rebalancing and drain the PaymentReceived event. Handling the
+		// event triggers the rebalancer, which observes the payment for the first
+		// time and stamps its discovery time (>= enabled_at). Give the spawned
+		// rebalance check a moment to record it.
+		wallet.set_rebalance_enabled(true).await;
+		let event = test_utils::wait_next_event(&wallet).await;
+		assert!(matches!(event, Event::PaymentReceived { .. }));
+		tokio::time::sleep(Duration::from_secs(3)).await;
+
+		let txs = wallet.list_transactions().await.unwrap();
+		assert_eq!(txs.len(), 1);
+		let tx = txs.into_iter().next().unwrap();
+
+		// Must be the backend settle time (recorded ~3s before we re-enabled),
+		// strictly earlier than the discovery stamp written at/after `enabled_at`.
+		assert!(
+			tx.time_since_epoch < enabled_at,
+			"expected backend settle time, got discovery stamp: {:?} >= {:?}",
+			tx.time_since_epoch,
+			enabled_at
+		);
 	})
 	.await;
 }
