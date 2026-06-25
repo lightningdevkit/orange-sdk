@@ -1,5 +1,5 @@
 use crate::logging::Logger;
-use crate::store::{self, PaymentId};
+use crate::store::{self, MppOutcome, PaymentId, TxMetadataStore, TxType};
 
 use crate::dyn_store::DynStore;
 use ldk_node::bitcoin::hashes::Hash;
@@ -15,7 +15,7 @@ use ldk_node::lightning_types::payment::{PaymentHash, PaymentPreimage};
 use ldk_node::payment::{ConfirmationStatus, PaymentKind};
 use ldk_node::{CustomTlvRecord, UserChannelId};
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use std::task::{Poll, Waker};
 use std::time::SystemTime;
@@ -209,21 +209,114 @@ impl_writeable_tlv_based_enum!(Event,
 /// [`Wallet`]: [`crate::Wallet`]
 pub struct EventQueue {
 	queue: Arc<Mutex<VecDeque<Event>>>,
+	pending_mpp_events: Arc<Mutex<HashMap<PaymentHash, Vec<Event>>>>,
 	waker: Arc<Mutex<Option<Waker>>>,
 	kv_store: Arc<dyn DynStore>,
+	tx_metadata: TxMetadataStore,
 	logger: Arc<Logger>,
 }
 
 impl EventQueue {
-	pub(crate) fn new(kv_store: Arc<dyn DynStore>, logger: Arc<Logger>) -> Self {
+	pub(crate) fn new(
+		kv_store: Arc<dyn DynStore>, tx_metadata: TxMetadataStore, logger: Arc<Logger>,
+	) -> Self {
 		let queue = Arc::new(Mutex::new(VecDeque::new()));
+		let pending_mpp_events = Arc::new(Mutex::new(HashMap::new()));
 		let waker = Arc::new(Mutex::new(None));
-		Self { queue, waker, kv_store, logger }
+		Self { queue, pending_mpp_events, waker, kv_store, tx_metadata, logger }
+	}
+
+	/// Starts buffering terminal events for a multi-path payment while its leg metadata is being
+	/// registered.
+	pub(crate) async fn begin_mpp_setup(&self, payment_hash: PaymentHash) {
+		self.pending_mpp_events.lock().await.entry(payment_hash).or_default();
+	}
+
+	/// Stops buffering terminal events for a multi-path payment and re-processes any events that
+	/// arrived before the leg metadata was registered.
+	pub(crate) async fn finish_mpp_setup(
+		&self, payment_hash: PaymentHash,
+	) -> Result<(), ldk_node::lightning::io::Error> {
+		let pending_events = self.pending_mpp_events.lock().await.remove(&payment_hash);
+		if let Some(events) = pending_events {
+			for event in events {
+				self.add_event(event).await?;
+			}
+		}
+		Ok(())
 	}
 
 	pub(crate) async fn add_event(
 		&self, event: Event,
 	) -> Result<(), ldk_node::lightning::io::Error> {
+		// Outgoing payments split across the trusted and lightning wallets emit a terminal event per
+		// leg. Record each leg's result onto the shared, persisted metadata; the leg that completes
+		// the payment yields the single combined event we surface instead of the per-leg ones.
+		match &event {
+			Event::PaymentSuccessful { payment_id, payment_preimage, fee_paid_msat, .. }
+				if self.is_mpp_leg(payment_id) =>
+			{
+				let combined = self
+					.tx_metadata
+					.record_mpp_leg(
+						*payment_id,
+						Some((fee_paid_msat.unwrap_or(0), payment_preimage.0)),
+					)
+					.await;
+				return self.push_combined_mpp(combined).await;
+			},
+			Event::PaymentFailed { payment_id, .. } if self.is_mpp_leg(payment_id) => {
+				let combined = self.tx_metadata.record_mpp_leg(*payment_id, None).await;
+				return self.push_combined_mpp(combined).await;
+			},
+			_ => {},
+		}
+
+		if let Some(payment_hash) = terminal_payment_hash(&event) {
+			let mut pending_mpp_events = self.pending_mpp_events.lock().await;
+			if let Some(events) = pending_mpp_events.get_mut(&payment_hash) {
+				events.push(event);
+				return Ok(());
+			}
+		}
+
+		self.push_event(event).await
+	}
+
+	/// Whether `id` identifies a leg of a multi-path payment.
+	fn is_mpp_leg(&self, id: &PaymentId) -> bool {
+		matches!(self.tx_metadata.read().get(id).map(|m| m.ty), Some(TxType::MppPayment { .. }))
+	}
+
+	/// Surfaces the single combined event for a multi-path payment, or nothing if the payment is
+	/// still waiting on its other leg (or already produced its combined event).
+	async fn push_combined_mpp(
+		&self, combined: Option<(PaymentId, MppOutcome)>,
+	) -> Result<(), ldk_node::lightning::io::Error> {
+		match combined {
+			Some((surface_id, MppOutcome::Succeeded { payment_hash, preimage, fee_msat })) => {
+				self.push_event(Event::PaymentSuccessful {
+					payment_id: surface_id,
+					payment_hash: PaymentHash(payment_hash),
+					payment_preimage: PaymentPreimage(preimage),
+					fee_paid_msat: Some(fee_msat),
+				})
+				.await
+			},
+			Some((surface_id, MppOutcome::Failed { payment_hash })) => {
+				self.push_event(Event::PaymentFailed {
+					payment_id: surface_id,
+					payment_hash: Some(PaymentHash(payment_hash)),
+					reason: None,
+				})
+				.await
+			},
+			None => Ok(()),
+		}
+	}
+
+	/// Appends an event to the queue and persists it, waking any pending consumer.
+	async fn push_event(&self, event: Event) -> Result<(), ldk_node::lightning::io::Error> {
 		{
 			let mut locked_queue = self.queue.lock().await;
 			locked_queue.push_back(event);
@@ -282,6 +375,104 @@ impl EventQueue {
 			e
 		})?;
 		Ok(())
+	}
+}
+
+fn terminal_payment_hash(event: &Event) -> Option<PaymentHash> {
+	match event {
+		Event::PaymentSuccessful { payment_hash, .. } => Some(*payment_hash),
+		Event::PaymentFailed { payment_hash, .. } => *payment_hash,
+		_ => None,
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+	use crate::logging::LoggerType;
+	use crate::store::{PaymentId, PaymentType, TxMetadata, TxMetadataStore, TxType};
+	use ldk_node::io::sqlite_store::SqliteStore;
+	use std::path::PathBuf;
+	use std::time::{Duration, UNIX_EPOCH};
+
+	fn temp_sqlite_store() -> (PathBuf, Arc<dyn DynStore>) {
+		let path = std::env::temp_dir().join(format!(
+			"orange-sdk-event-mpp-buffer-test-{}",
+			SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()
+		));
+		let store = SqliteStore::new(path.clone(), Some("orange.sqlite".to_string()), None)
+			.expect("sqlite store");
+		(path, Arc::new(store))
+	}
+
+	fn mpp_metadata(surface_id: PaymentId, lightning_leg: [u8; 32]) -> TxMetadata {
+		TxMetadata {
+			ty: TxType::MppPayment {
+				surface_id,
+				lightning_leg,
+				total_amount_msat: 200_000,
+				ty: PaymentType::OutgoingLightningBolt11 { payment_preimage: None },
+				trusted_fee_msat: None,
+				lightning_fee_msat: None,
+				preimage: None,
+				failed: false,
+				finalized: false,
+			},
+			time: Duration::from_secs(1),
+		}
+	}
+
+	#[tokio::test]
+	async fn pending_mpp_setup_buffers_terminal_events_until_metadata_exists() {
+		let (_path, store) = temp_sqlite_store();
+		let tx_metadata = TxMetadataStore::new(Arc::clone(&store)).await;
+		let queue = EventQueue::new(
+			store,
+			tx_metadata.clone(),
+			Arc::new(Logger::new(&LoggerType::LogFacade).expect("logger")),
+		);
+
+		let payment_hash = PaymentHash([3u8; 32]);
+		let surface_id = PaymentId::Trusted([7u8; 32]);
+		let lightning_id = PaymentId::SelfCustodial(payment_hash.0);
+		let preimage = PaymentPreimage([1u8; 32]);
+
+		queue.begin_mpp_setup(payment_hash).await;
+		queue
+			.add_event(Event::PaymentSuccessful {
+				payment_id: surface_id,
+				payment_hash,
+				payment_preimage: preimage,
+				fee_paid_msat: Some(1_000),
+			})
+			.await
+			.expect("buffer event");
+		assert_eq!(queue.next_event().await, None);
+
+		tx_metadata.insert(surface_id, mpp_metadata(surface_id, payment_hash.0)).await;
+		tx_metadata.upsert(lightning_id, mpp_metadata(surface_id, payment_hash.0)).await;
+		queue.finish_mpp_setup(payment_hash).await.expect("replay buffered events");
+		assert_eq!(queue.next_event().await, None);
+
+		queue
+			.add_event(Event::PaymentSuccessful {
+				payment_id: lightning_id,
+				payment_hash,
+				payment_preimage: preimage,
+				fee_paid_msat: Some(2_000),
+			})
+			.await
+			.expect("complete mpp");
+
+		assert_eq!(
+			queue.next_event().await,
+			Some(Event::PaymentSuccessful {
+				payment_id: surface_id,
+				payment_hash,
+				payment_preimage: preimage,
+				fee_paid_msat: Some(3_000),
+			})
+		);
 	}
 }
 

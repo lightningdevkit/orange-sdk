@@ -66,6 +66,7 @@ pub struct Cashu {
 	payment_success_flag: watch::Receiver<()>,
 	logger: Arc<Logger>,
 	supports_bolt12: Arc<std::sync::atomic::AtomicBool>,
+	supports_mpp: Arc<std::sync::atomic::AtomicBool>,
 	mint_quote_sender: mpsc::Sender<MintQuote>,
 	event_queue: Arc<EventQueue>,
 	tx_metadata: TxMetadataStore,
@@ -312,159 +313,45 @@ impl TrustedWalletInterface for Cashu {
 			// We'll use the quote ID as the payment identifier
 			let payment_id = Self::id_to_32_byte_array(&quote.id);
 
-			// Execute the melt in separate thread, do not block on it being successful/failed
-			let cashu_wallet = Arc::clone(&self.cashu_wallet);
-			let logger = Arc::clone(&self.logger);
-			let event_queue = Arc::clone(&self.event_queue);
-			let tx_metadata = self.tx_metadata.clone();
-			let quote_id = quote.id.clone();
-			let payment_success_sender = self.payment_success_sender.clone();
-			self.runtime.spawn_background_task(async move {
-				let mut metadata = HashMap::new();
-				if let Some(hash) = &payment_hash {
-					metadata.insert(PAYMENT_HASH_METADATA_KEY.to_string(), hash.to_string());
-				}
+			// Execute the melt in a background task; do not block on it succeeding/failing.
+			self.spawn_melt(quote.id.clone(), payment_id, payment_hash);
 
-				let melt_result = async {
-					let prepared = cashu_wallet.prepare_melt(&quote_id, metadata).await?;
-					prepared.confirm().await
-				}
-				.await;
-				match melt_result {
-					Ok(res) => {
-						match res.state() {
-							MeltQuoteState::Paid => {
-								log_info!(logger, "Successfully sent for quote: {quote_id}");
+			Ok(payment_id)
+		})
+	}
 
-								let payment_id = PaymentId::Trusted(payment_id);
-								let is_rebalance = {
-									let map = tx_metadata.read();
-									map.get(&payment_id).is_some_and(|m| m.ty.is_rebalance())
-								};
-								if is_rebalance {
-									// make sure we still send payment success
-									payment_success_sender.send(()).unwrap();
-									return;
-								}
+	fn supports_partial_payments(&self) -> bool {
+		// Partial MPP payments require the mint to advertise NUT-15 support for BOLT 11 in our unit.
+		self.supports_mpp.load(std::sync::atomic::Ordering::Relaxed)
+	}
 
-								let preimage: Option<PaymentPreimage> = match res.payment_proof() {
-									Some(str) => match FromHex::from_hex(str) {
-										Ok(b) => Some(PaymentPreimage(b)),
-										Err(e) => {
-											log_error!(
-												logger,
-												"Failed to decode preimage ({:?}) for quote {quote_id}: {e}",
-												res.payment_proof()
-											);
-											None
-										},
-									},
-									None => {
-										debug_assert!(
-											false,
-											"Melt succeeded but no preimage for quote: {quote_id}"
-										);
-										log_error!(
-											logger,
-											"Melt succeeded but no preimage for quote: {quote_id}"
-										);
-										None // Placeholder, should not happen
-									},
-								};
+	fn pay_partial(
+		&self, invoice: Bolt11Invoice, partial_amount: Amount,
+	) -> Pin<Box<dyn Future<Output = Result<[u8; 32], TrustedError>> + Send + '_>> {
+		Box::pin(async move {
+			if !self.supports_mpp.load(std::sync::atomic::Ordering::Relaxed) {
+				return Err(TrustedError::UnsupportedOperation(
+					"Cashu mint does not support partial (MPP) payments".to_owned(),
+				));
+			}
 
-								let hash = match payment_hash {
-									Some(hash) => hash,
-									None => {
-										match preimage {
-											Some(pre) => {
-												let hash = Sha256::hash(&pre.0);
-												PaymentHash(hash.to_byte_array())
-											},
-											None => {
-												log_error!(
-													logger,
-													"Melt succeeded but no payment hash or preimage for quote: {quote_id}"
-												);
-												PaymentHash([0u8; 32]) // Placeholder, should not happen
-											},
-										}
-									},
-								};
+			// An MPP melt declares the partial amount this mint should pay toward the invoice; the
+			// remainder is paid out of the lightning wallet over the same payment hash.
+			let melt_options = Some(MeltOptions::new_mpp(partial_amount.milli_sats()));
+			let payment_hash = Some(invoice.payment_hash());
 
-								let payment_preimage =
-									preimage.unwrap_or(PaymentPreimage([0u8; 32]));
+			let quote = self
+				.cashu_wallet
+				.melt_quote(CdkPaymentMethod::BOLT11, invoice.to_string(), melt_options, None)
+				.await
+				.map_err(|e| {
+					TrustedError::WalletOperationFailed(format!(
+						"Failed to create MPP melt quote: {e}"
+					))
+				})?;
 
-								if tx_metadata
-									.set_preimage(payment_id, payment_preimage.0)
-									.await
-									.is_err()
-								{
-									log_error!(
-										logger,
-										"Failed to set preimage for payment {payment_id:?}"
-									);
-								}
-
-								let fee_paid_sat: u64 = res.fee_paid().into();
-								let _ = event_queue
-									.add_event(Event::PaymentSuccessful {
-										payment_id,
-										payment_hash: hash,
-										payment_preimage,
-										fee_paid_msat: Some(fee_paid_sat * 1_000), // convert to msats
-									})
-									.await;
-
-								payment_success_sender.send(()).unwrap();
-							},
-							MeltQuoteState::Failed => {
-								log_error!(logger, "Melt failed for quote: {quote_id}");
-								let payment_id = PaymentId::Trusted(payment_id);
-								let is_rebalance = {
-									let map = tx_metadata.read();
-									map.get(&payment_id).is_some_and(|m| m.ty.is_rebalance())
-								};
-
-								if !is_rebalance {
-									let _ = event_queue
-										.add_event(Event::PaymentFailed {
-											payment_id,
-											payment_hash,
-											reason: None,
-										})
-										.await;
-								}
-							},
-							state => {
-								log_error!(
-									logger,
-									"Melt in unknown state {state} for quote: {quote_id}"
-								);
-								// todo should we watch for it to complete?
-							},
-						}
-					},
-					Err(e) => {
-						log_error!(logger, "Failed to melt quote {quote_id}: {e}");
-						let payment_id = PaymentId::Trusted(payment_id);
-						let is_rebalance = {
-							let map = tx_metadata.read();
-							map.get(&payment_id).is_some_and(|m| m.ty.is_rebalance())
-						};
-
-						if !is_rebalance {
-							let _ = event_queue
-								.add_event(Event::PaymentFailed {
-									payment_id,
-									payment_hash,
-									reason: None,
-								})
-								.await;
-						}
-					},
-				}
-			});
-
+			let payment_id = Self::id_to_32_byte_array(&quote.id);
+			self.spawn_melt(quote.id.clone(), payment_id, payment_hash);
 			Ok(payment_id)
 		})
 	}
@@ -586,13 +473,27 @@ impl Cashu {
 		);
 
 		let supports_bolt12 = Arc::new(std::sync::atomic::AtomicBool::new(false));
+		let supports_mpp = Arc::new(std::sync::atomic::AtomicBool::new(false));
 		{
 			let w = Arc::clone(&cashu_wallet);
-			let flag = Arc::clone(&supports_bolt12);
+			let bolt12_flag = Arc::clone(&supports_bolt12);
+			let mpp_flag = Arc::clone(&supports_mpp);
+			let unit = cashu_config.unit.clone();
 			runtime.spawn_cancellable_background_task(async move {
 				if let Some(info) = w.fetch_mint_info().await.ok().flatten() {
 					if info.nuts.nut04.supported_methods().contains(&&CdkPaymentMethod::BOLT12) {
-						flag.store(true, std::sync::atomic::Ordering::Relaxed);
+						bolt12_flag.store(true, std::sync::atomic::Ordering::Relaxed);
+					}
+					// NUT-15 advertises which (method, unit) pairs the mint will accept partial MPP
+					// melts for.
+					let mpp_supported = info
+						.nuts
+						.nut15
+						.methods
+						.iter()
+						.any(|m| m.method == CdkPaymentMethod::BOLT11 && m.unit == unit);
+					if mpp_supported {
+						mpp_flag.store(true, std::sync::atomic::Ordering::Relaxed);
 					}
 				}
 			});
@@ -742,6 +643,7 @@ impl Cashu {
 			payment_success_flag,
 			logger,
 			supports_bolt12,
+			supports_mpp,
 			mint_quote_sender,
 			event_queue,
 			tx_metadata,
@@ -765,6 +667,166 @@ impl Cashu {
 		let (xonly, _) = sk.public_key(&secp).x_only_public_key();
 		let hrp = Hrp::parse("npub").expect("valid hrp");
 		encode::<Bech32>(hrp, &xonly.serialize()).map_err(|e| format!("bech32 encode: {e}"))
+	}
+
+	/// Executes a previously-created melt quote in a background task, emitting a
+	/// [`PaymentSuccessful`] or [`PaymentFailed`] event when it completes. The payment is not
+	/// awaited; this only kicks off the melt.
+	///
+	/// [`PaymentSuccessful`]: crate::event::Event::PaymentSuccessful
+	/// [`PaymentFailed`]: crate::event::Event::PaymentFailed
+	fn spawn_melt(
+		&self, quote_id: String, payment_id: [u8; 32], payment_hash: Option<PaymentHash>,
+	) {
+		let cashu_wallet = Arc::clone(&self.cashu_wallet);
+		let logger = Arc::clone(&self.logger);
+		let event_queue = Arc::clone(&self.event_queue);
+		let tx_metadata = self.tx_metadata.clone();
+		let payment_success_sender = self.payment_success_sender.clone();
+		self.runtime.spawn_background_task(async move {
+			let mut metadata = HashMap::new();
+			if let Some(hash) = &payment_hash {
+				metadata.insert(PAYMENT_HASH_METADATA_KEY.to_string(), hash.to_string());
+			}
+
+			let melt_result = async {
+				let prepared = cashu_wallet.prepare_melt(&quote_id, metadata).await?;
+				prepared.confirm().await
+			}
+			.await;
+			match melt_result {
+				Ok(res) => {
+					match res.state() {
+						MeltQuoteState::Paid => {
+							log_info!(logger, "Successfully sent for quote: {quote_id}");
+
+							let payment_id = PaymentId::Trusted(payment_id);
+							let is_rebalance = {
+								let map = tx_metadata.read();
+								map.get(&payment_id).is_some_and(|m| m.ty.is_rebalance())
+							};
+							if is_rebalance {
+								// make sure we still send payment success
+								payment_success_sender.send(()).unwrap();
+								return;
+							}
+
+							let preimage: Option<PaymentPreimage> = match res.payment_proof() {
+								Some(str) => match FromHex::from_hex(str) {
+									Ok(b) => Some(PaymentPreimage(b)),
+									Err(e) => {
+										log_error!(
+											logger,
+											"Failed to decode preimage ({:?}) for quote {quote_id}: {e}",
+											res.payment_proof()
+										);
+										None
+									},
+								},
+								None => {
+									debug_assert!(
+										false,
+										"Melt succeeded but no preimage for quote: {quote_id}"
+									);
+									log_error!(
+										logger,
+										"Melt succeeded but no preimage for quote: {quote_id}"
+									);
+									None // Placeholder, should not happen
+								},
+							};
+
+							let hash = match payment_hash {
+								Some(hash) => hash,
+								None => {
+									match preimage {
+										Some(pre) => {
+											let hash = Sha256::hash(&pre.0);
+											PaymentHash(hash.to_byte_array())
+										},
+										None => {
+											log_error!(
+												logger,
+												"Melt succeeded but no payment hash or preimage for quote: {quote_id}"
+											);
+											PaymentHash([0u8; 32]) // Placeholder, should not happen
+										},
+									}
+								},
+							};
+
+							let payment_preimage = preimage.unwrap_or(PaymentPreimage([0u8; 32]));
+
+							if tx_metadata
+								.set_preimage(payment_id, payment_preimage.0)
+								.await
+								.is_err()
+							{
+								log_error!(
+									logger,
+									"Failed to set preimage for payment {payment_id:?}"
+								);
+							}
+
+							let fee_paid_sat: u64 = res.fee_paid().into();
+							let _ = event_queue
+								.add_event(Event::PaymentSuccessful {
+									payment_id,
+									payment_hash: hash,
+									payment_preimage,
+									fee_paid_msat: Some(fee_paid_sat * 1_000), // convert to msats
+								})
+								.await;
+
+							payment_success_sender.send(()).unwrap();
+						},
+						MeltQuoteState::Failed => {
+							log_error!(logger, "Melt failed for quote: {quote_id}");
+							let payment_id = PaymentId::Trusted(payment_id);
+							let is_rebalance = {
+								let map = tx_metadata.read();
+								map.get(&payment_id).is_some_and(|m| m.ty.is_rebalance())
+							};
+
+							if !is_rebalance {
+								let _ = event_queue
+									.add_event(Event::PaymentFailed {
+										payment_id,
+										payment_hash,
+										reason: None,
+									})
+									.await;
+							}
+						},
+						state => {
+							log_error!(
+								logger,
+								"Melt in unknown state {state} for quote: {quote_id}"
+							);
+							// todo should we watch for it to complete?
+						},
+					}
+				},
+				Err(e) => {
+					log_error!(logger, "Failed to melt quote {quote_id}: {e}");
+					let payment_id = PaymentId::Trusted(payment_id);
+					let is_rebalance = {
+						let map = tx_metadata.read();
+						map.get(&payment_id).is_some_and(|m| m.ty.is_rebalance())
+					};
+
+					if !is_rebalance {
+						let _ = event_queue
+							.add_event(Event::PaymentFailed {
+								payment_id,
+								payment_hash,
+								reason: None,
+							})
+							.await;
+					}
+				},
+			}
+		});
 	}
 
 	/// Convert an ID string to a 32-byte array

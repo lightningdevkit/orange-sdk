@@ -452,6 +452,46 @@ impl TrustedWalletInterface for DummyTrustedWallet {
 		})
 	}
 
+	fn supports_partial_payments(&self) -> bool {
+		// The dummy wallet is backed by an LDK node, which supports underpaying MPP HTLCs.
+		true
+	}
+
+	fn pay_partial(
+		&self, invoice: Bolt11Invoice, partial_amount: Amount,
+	) -> Pin<Box<dyn Future<Output = Result<[u8; 32], TrustedError>> + Send + '_>> {
+		Box::pin(async move {
+			let id = self
+				.ldk_node
+				.bolt11_payment()
+				.send_using_amount_underpaying(&invoice, partial_amount.milli_sats(), None)
+				.map_err(|e| TrustedError::WalletOperationFailed(e.to_string()))?
+				.0;
+			let id = mangle_payment_id(id);
+
+			// subtract our portion from our balance
+			self.current_bal_msats.fetch_sub(partial_amount.milli_sats(), Ordering::SeqCst);
+
+			let now = std::time::SystemTime::now()
+				.duration_since(std::time::UNIX_EPOCH)
+				.unwrap_or_default()
+				.as_secs();
+
+			// add to payments
+			let mut list = self.payments.write().await;
+			list.push(Payment {
+				id,
+				amount: partial_amount,
+				fee: Amount::ZERO,
+				status: TxStatus::Pending,
+				outbound: true,
+				time_since_epoch: Duration::from_secs(now),
+			});
+
+			Ok(id)
+		})
+	}
+
 	fn await_payment_success(
 		&self, payment_hash: [u8; 32],
 	) -> Pin<Box<dyn Future<Output = Option<ReceivedLightningPayment>> + Send + '_>> {

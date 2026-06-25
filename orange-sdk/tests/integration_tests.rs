@@ -233,6 +233,147 @@ async fn test_pay_from_trusted() {
 
 #[tokio::test(flavor = "multi_thread")]
 #[test_log::test]
+#[cfg_attr(
+	feature = "_cashu-tests",
+	ignore = "CDK's test mint/payment processor does not support partial MPP melts"
+)]
+async fn test_pay_mpp_trusted_and_lightning() {
+	test_utils::run_test(|params| async move {
+		let wallet = Arc::clone(&params.wallet);
+		let bitcoind = Arc::clone(&params.bitcoind);
+		let third_party = Arc::clone(&params.third_party);
+		let electrsd = Arc::clone(&params.electrsd);
+		let lsp = Arc::clone(&params.lsp);
+		let desc = Bolt11InvoiceDescription::Direct(Description::empty());
+
+		// Fund the trusted wallet with 100 sats. This must happen before we have a channel: once
+		// inbound liquidity exists, small receives are routed to the lightning wallet instead.
+		let trusted_amt = Amount::from_sats(100).unwrap();
+		let uri = wallet.get_single_use_receive_uri(Some(trusted_amt)).await.unwrap();
+		assert!(uri.from_trusted);
+		third_party.bolt11_payment().send(&uri.invoice, None).unwrap();
+		test_utils::wait_for_condition("trusted balance funded", || async {
+			wallet.get_balance().await.unwrap().trusted == trusted_amt
+		})
+		.await;
+		assert!(matches!(wait_next_event(&wallet).await, Event::PaymentReceived { .. }));
+
+		// Open a lightning channel.
+		open_channel_from_lsp(&wallet, Arc::clone(&third_party)).await;
+		generate_blocks(&bitcoind, &electrsd, 6).await;
+		test_utils::wait_for_condition("wallet sync after channel open", || async {
+			wallet.channels().iter().any(|c| c.confirmations.is_some_and(|n| n > 0) && c.is_usable)
+		})
+		.await;
+
+		// The channel leaves us with a large spendable lightning balance, so on its own lightning
+		// could cover the 200 sat payment below (and the trusted wallet alone cannot). Drain the
+		// lightning balance down to ~150 sats so that neither balance suffices alone, forcing an
+		// MPP split. We drain by paying the LSP directly so we don't consume the LSP's outbound
+		// liquidity toward the third party, which the MPP payment still needs.
+		let sendable =
+			wallet.channels().iter().find(|c| c.is_usable).unwrap().next_outbound_htlc_limit_msat;
+		let drain = lsp.bolt11_payment().receive(sendable - 150_000, &desc, 300).unwrap();
+		let drain_info = PaymentInfo::build(
+			wallet.parse_payment_instructions(&drain.to_string()).await.unwrap(),
+			None,
+		)
+		.unwrap();
+		wallet.pay(&drain_info).await.unwrap();
+		assert!(matches!(wait_next_event(&wallet).await, Event::PaymentSuccessful { .. }));
+		test_utils::wait_for_condition("lightning balance drained below 200 sats", || async {
+			wallet
+				.channels()
+				.iter()
+				.find(|c| c.is_usable)
+				.is_some_and(|c| c.next_outbound_htlc_limit_msat < 200_000)
+		})
+		.await;
+
+		// Pay the 200 sat invoice: it must be split as 100 sats from trusted + 100 sats from LN.
+		let pay_amt = Amount::from_sats(200).unwrap();
+		let invoice =
+			third_party.bolt11_payment().receive(pay_amt.milli_sats(), &desc, 300).unwrap();
+		let info = PaymentInfo::build(
+			wallet.parse_payment_instructions(&invoice.to_string()).await.unwrap(),
+			Some(pay_amt),
+		)
+		.unwrap();
+		wallet.pay(&info).await.unwrap();
+
+		// Even though the payment was split across two legs, the user should see exactly one
+		// combined success event over the invoice's payment hash. Its fee is the sum of both legs'
+		// fees.
+		let combined_fee_msat = match wait_next_event(&wallet).await {
+			Event::PaymentSuccessful { payment_hash, fee_paid_msat, .. } => {
+				assert_eq!(payment_hash, invoice.payment_hash());
+				fee_paid_msat.expect("combined MPP payment should report a fee")
+			},
+			e => panic!("Expected a single combined PaymentSuccessful event, got {e:?}"),
+		};
+		// No per-leg event should leak through; the combined event is the only one.
+		assert_eq!(wallet.next_event(), None, "MPP must surface a single success event");
+
+		// The third party received the full 200 sats (the aggregated MPP parts), and the trusted
+		// wallet was fully drained — so the remaining 100 sats must have come from lightning.
+		test_utils::wait_for_condition("third party received full amount", || {
+			let tp = Arc::clone(&third_party);
+			async move {
+				tp.list_payments().iter().any(|p| {
+					p.direction == PaymentDirection::Inbound
+						&& p.status == PaymentStatus::Succeeded
+						&& p.amount_msat == Some(pay_amt.milli_sats())
+				})
+			}
+		})
+		.await;
+		test_utils::wait_for_condition("trusted balance fully spent", || async {
+			wallet.get_balance().await.unwrap().trusted == Amount::ZERO
+		})
+		.await;
+
+		// The split payment is deduplicated into a single transaction with the full amount, the
+		// summed fee (matching the combined event), and the lightning preimage. The individual
+		// 100 sat legs must not appear on their own.
+		let txs = wallet.list_transactions().await.unwrap();
+		let mpp_txs: Vec<_> =
+			txs.iter().filter(|t| t.outbound && t.amount == Some(pay_amt)).collect();
+		assert_eq!(
+			mpp_txs.len(),
+			1,
+			"the MPP payment should appear as exactly one transaction, got {mpp_txs:?}"
+		);
+		let mpp_tx = mpp_txs[0];
+		assert_eq!(mpp_tx.status, TxStatus::Completed);
+		assert_eq!(
+			mpp_tx.amount,
+			Some(pay_amt),
+			"combined amount should be the full payment amount"
+		);
+		assert_eq!(
+			mpp_tx.fee.map(|f| f.milli_sats()),
+			Some(combined_fee_msat),
+			"combined transaction fee should match the combined event fee"
+		);
+		assert!(
+			matches!(
+				mpp_tx.payment_type,
+				PaymentType::OutgoingLightningBolt11 { payment_preimage: Some(_) }
+			),
+			"combined transaction should carry the lightning preimage, got {:?}",
+			mpp_tx.payment_type
+		);
+		let leg_amt = Amount::from_sats(100).unwrap();
+		assert!(
+			!txs.iter().any(|t| t.outbound && t.amount == Some(leg_amt)),
+			"individual MPP legs must not appear as their own transactions"
+		);
+	})
+	.await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[test_log::test]
 async fn test_sweep_to_ln() {
 	test_utils::run_test(|params| async move {
 		let wallet = Arc::clone(&params.wallet);

@@ -373,6 +373,19 @@ impl LightningWallet {
 		}
 	}
 
+	/// Pays `amount` toward `invoice` as a single part of a multi-path payment (MPP), declaring the
+	/// invoice's own amount as the MPP total. The remainder is expected to be paid out of another
+	/// wallet over the same payment hash. This requires an amount-bearing invoice.
+	pub(crate) fn pay_bolt11_underpaying(
+		&self, invoice: &Bolt11Invoice, amount: Amount,
+	) -> Result<PaymentId, NodeError> {
+		self.inner.ldk_node.bolt11_payment().send_using_amount_underpaying(
+			invoice,
+			amount.milli_sats(),
+			None,
+		)
+	}
+
 	pub(crate) async fn splice_all_into_channel(&self) -> Result<UserChannelId, NodeError> {
 		// find existing channel to splice into
 		let channels = self.inner.ldk_node.list_channels();
