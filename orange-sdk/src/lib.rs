@@ -831,6 +831,8 @@ impl Wallet {
 							amount: Some(payment.amount),
 							fee: Some(payment.fee),
 							payment_type: *ty,
+							// Graduated receive: `tx_metadata.time` is the backend settle time
+							// the rebalancer stamped on first observing it, kept through promotion.
 							time_since_epoch: tx_metadata.time,
 						});
 					},
@@ -972,6 +974,8 @@ impl Wallet {
 								.map(|a| Amount::from_milli_sats(a).expect("Must be valid")),
 							fee,
 							payment_type: (&payment).into(),
+							// Graduated on-chain receive: `tx_metadata.time` is ldk-node's
+							// confirmation time, stamped on first observing it, kept through promotion.
 							time_since_epoch: tx_metadata.time,
 						});
 					},

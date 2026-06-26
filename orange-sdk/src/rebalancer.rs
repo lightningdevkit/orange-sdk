@@ -104,9 +104,10 @@ impl RebalanceTrigger for OrangeTrigger {
 								payment_id,
 								TxMetadata {
 									ty: TxType::Payment { ty: PaymentType::IncomingLightning {} },
-									time: SystemTime::now()
-										.duration_since(SystemTime::UNIX_EPOCH)
-										.unwrap(),
+									// Backend settle time, not detection time, so a receive that
+									// settled while offline keeps its real time. Preserved through
+									// promotion for the graduated-transfer display.
+									time: payment.time_since_epoch,
 								},
 							)
 							.await;
@@ -226,7 +227,7 @@ impl RebalanceTrigger for OrangeTrigger {
 						})
 						.max_by_key(|(t, _, _)| t.amount_msat);
 					match new {
-						Some((_, txid, trigger)) => {
+						Some((payment, txid, trigger)) => {
 							// make sure we have a metadata entry for the triggering transaction
 							if self.tx_metadata.read().get(&trigger).is_none() {
 								self.tx_metadata
@@ -238,9 +239,12 @@ impl RebalanceTrigger for OrangeTrigger {
 													txid: Some(txid),
 												},
 											},
-											time: SystemTime::now()
-												.duration_since(SystemTime::UNIX_EPOCH)
-												.unwrap(),
+											// ldk-node's confirmation time, not detection time, so a
+											// receive that confirmed while offline keeps its real
+											// time. Preserved through promotion for display.
+											time: Duration::from_secs(
+												payment.latest_update_timestamp,
+											),
 										},
 									)
 									.await;

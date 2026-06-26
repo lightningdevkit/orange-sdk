@@ -394,6 +394,201 @@ async fn test_sweep_to_ln() {
 
 #[tokio::test(flavor = "multi_thread")]
 #[test_log::test]
+async fn test_graduated_transfer_keeps_backend_settle_time() {
+	test_utils::run_test(|params| async move {
+		let wallet = Arc::clone(&params.wallet);
+		let lsp = Arc::clone(&params.lsp);
+		let third_party = Arc::clone(&params.third_party);
+
+		let starting_lsp_channels = lsp.list_channels();
+
+		// Disable rebalancing so both receives settle in the trusted wallet before
+		// the rebalancer ever observes them. This way the only thing that stamps a
+		// discovery time is the rebalancer run we trigger later.
+		wallet.set_rebalance_enabled(false).await;
+
+		let limit = wallet.get_tunables();
+		let first_amt =
+			Amount::from_milli_sats(limit.trusted_balance_limit.milli_sats() / 2).unwrap();
+		let second_amt = Amount::from_milli_sats(limit.trusted_balance_limit.milli_sats()).unwrap();
+
+		let uri = wallet.get_single_use_receive_uri(Some(first_amt)).await.unwrap();
+		assert!(uri.from_trusted);
+		third_party.bolt11_payment().send(&uri.invoice, None).unwrap();
+		test_utils::wait_for_condition("first receive", || async {
+			wallet.get_balance().await.unwrap().available_balance() >= first_amt
+		})
+		.await;
+
+		let uri = wallet.get_single_use_receive_uri(Some(second_amt)).await.unwrap();
+		assert!(uri.from_trusted);
+		third_party.bolt11_payment().send(&uri.invoice, None).unwrap();
+		test_utils::wait_for_condition("second receive", || async {
+			wallet.get_balance().await.unwrap().available_balance()
+				>= first_amt.saturating_add(second_amt)
+		})
+		.await;
+
+		// The backend recorded both settle times ~now. Sleep so any later discovery
+		// stamp lands a clearly later wall-clock time, then mark that boundary just
+		// before we let the rebalancer run.
+		tokio::time::sleep(Duration::from_secs(3)).await;
+		let enabled_at = SystemTime::now().duration_since(UNIX_EPOCH).unwrap();
+
+		// Re-enable rebalancing and start draining events. Marking each event handled
+		// re-triggers the rebalancer, which observes the payments for the first time
+		// (stamping discovery times >= enabled_at) and graduates the trusted balance
+		// into a Lightning channel.
+		wallet.set_rebalance_enabled(true).await;
+		test_utils::wait_for_condition("new channel opened", || async {
+			while wallet.next_event().is_some() {
+				wallet.event_handled().unwrap();
+			}
+			starting_lsp_channels.len() < lsp.list_channels().len()
+		})
+		.await;
+		// Drain the post-graduation events (ChannelOpened, the self-custodial
+		// PaymentReceived, RebalanceSuccessful) so the rebalance bookkeeping lands.
+		// Wait until a graduated receive shows a non-zero fee: that only happens once
+		// the trigger has been promoted to `PaymentTriggeringTransferLightning` and
+		// merged with its `TrustedToLightning` leg, which is exactly the display path
+		// under test. Without this we could read the list before promotion, while the
+		// receives are still plain (already-settle-timed) trusted payments.
+		test_utils::wait_for_condition("rebalance bookkeeping settles", || async {
+			while wallet.next_event().is_some() {
+				wallet.event_handled().unwrap();
+			}
+			let incoming: Vec<_> = wallet
+				.list_transactions()
+				.await
+				.unwrap()
+				.into_iter()
+				.filter(|tx| !tx.outbound)
+				.collect();
+			incoming.len() == 2
+				&& incoming.iter().any(|tx| tx.fee.is_some_and(|f| f > Amount::ZERO))
+		})
+		.await;
+
+		let txs = wallet.list_transactions().await.unwrap();
+		let incoming: Vec<_> = txs.into_iter().filter(|tx| !tx.outbound).collect();
+		assert_eq!(incoming.len(), 2, "Should have exactly 2 incoming transactions");
+
+		// Both receives settled (and were stamped by the backend) before we re-enabled
+		// rebalancing, so their displayed times must precede the discovery boundary —
+		// including the receive that graduated into a Lightning channel, which would
+		// otherwise surface the rebalancer's discovery stamp written at/after
+		// `enabled_at`.
+		for tx in &incoming {
+			assert!(
+				tx.time_since_epoch < enabled_at,
+				"expected backend settle time, got discovery stamp: {:?} >= {:?}",
+				tx.time_since_epoch,
+				enabled_at
+			);
+		}
+	})
+	.await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[test_log::test]
+async fn test_onchain_graduated_receive_keeps_confirmation_time() {
+	test_utils::run_test(|params| async move {
+		let wallet = Arc::clone(&params.wallet);
+		let bitcoind = Arc::clone(&params.bitcoind);
+		let third_party = Arc::clone(&params.third_party);
+		let electrsd = Arc::clone(&params.electrsd);
+
+		// Disable rebalancing so the on-chain receive confirms (and ldk-node records
+		// its update/confirmation time) before the rebalancer ever observes it. The
+		// rebalancer only stamps its discovery `now()` once we re-enable it.
+		wallet.set_rebalance_enabled(false).await;
+
+		let recv_amt = Amount::from_sats(200_000).unwrap();
+		let uri = wallet.get_single_use_receive_uri(Some(recv_amt)).await.unwrap();
+		let sent_txid = third_party
+			.onchain_payment()
+			.send_to_address(&uri.address.unwrap(), recv_amt.sats().unwrap(), None)
+			.unwrap();
+		wait_for_tx(&electrsd.client, sent_txid).await;
+		generate_blocks(&bitcoind, &electrsd, 6).await;
+		wallet.sync_ln_wallet().unwrap();
+
+		// Wait until ldk-node sees the confirmed receive. Its confirmation time is now
+		// recorded while rebalancing is still disabled (so it carries no metadata and
+		// renders via the confirmation-time path).
+		test_utils::wait_for_condition("onchain receive confirmed", || async {
+			wallet.get_balance().await.unwrap().pending_balance == recv_amt
+		})
+		.await;
+		let pre_grad_time = {
+			let txs = wallet.list_transactions().await.unwrap();
+			assert_eq!(txs.len(), 1);
+			txs[0].time_since_epoch
+		};
+
+		// Sleep so any later discovery stamp lands a clearly later wall-clock time,
+		// then mark that boundary just before we let the rebalancer run.
+		tokio::time::sleep(Duration::from_secs(3)).await;
+		let enabled_at = SystemTime::now().duration_since(UNIX_EPOCH).unwrap();
+
+		// Re-enable rebalancing; the periodic on-chain rebalance loop now observes the
+		// receive for the first time (stamping discovery >= enabled_at) and graduates
+		// it into a channel. Keep mining/syncing so the channel opening confirms, and
+		// wait until the receive renders via the graduated display path — i.e. it
+		// carries a rebalance fee, which only appears once the trigger is promoted to
+		// `PaymentTriggeringTransferLightning` and merged with its channel-open leg.
+		wallet.set_rebalance_enabled(true).await;
+		test_utils::wait_for_condition("graduated onchain receive shows fee", || async {
+			while wallet.next_event().is_some() {
+				wallet.event_handled().unwrap();
+			}
+			generate_blocks(&bitcoind, &electrsd, 6).await;
+			wallet.sync_ln_wallet().unwrap();
+			wallet
+				.list_transactions()
+				.await
+				.unwrap()
+				.iter()
+				.any(|tx| !tx.outbound && tx.fee.is_some_and(|f| f > Amount::ZERO))
+		})
+		.await;
+
+		let txs = wallet.list_transactions().await.unwrap();
+		let incoming: Vec<_> = txs.into_iter().filter(|tx| !tx.outbound).collect();
+		assert_eq!(incoming.len(), 1, "Should have exactly one incoming transaction");
+		let tx = &incoming[0];
+		assert!(
+			matches!(tx.payment_type, PaymentType::IncomingOnChain { .. }),
+			"Expected IncomingOnChain, got {:?}",
+			tx.payment_type
+		);
+		assert!(
+			tx.fee.is_some_and(|f| f > Amount::ZERO),
+			"graduated receive should carry a rebalance fee"
+		);
+
+		// The graduated receive must keep its on-chain confirmation time. Before the
+		// fix it surfaced the rebalancer's `now()` discovery stamp written at/after
+		// `enabled_at`. We check both that it precedes the discovery boundary and that
+		// graduation did not change the time the receive already displayed.
+		assert!(
+			tx.time_since_epoch < enabled_at,
+			"expected onchain confirmation time, got discovery stamp: {:?} >= {:?}",
+			tx.time_since_epoch,
+			enabled_at
+		);
+		assert_eq!(
+			tx.time_since_epoch, pre_grad_time,
+			"graduation should not change the displayed confirmation time"
+		);
+	})
+	.await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[test_log::test]
 async fn test_receive_to_ln() {
 	test_utils::run_test(|params| async move {
 		let wallet = Arc::clone(&params.wallet);
