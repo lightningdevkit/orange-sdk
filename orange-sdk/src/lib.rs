@@ -903,8 +903,9 @@ impl Wallet {
 		for payment in lightning_payments {
 			use ldk_node::payment::PaymentDirection;
 			let lightning_receive_fee = match payment.kind {
-				PaymentKind::Bolt11Jit { counterparty_skimmed_fee_msat, .. } => {
-					let msats = counterparty_skimmed_fee_msat.unwrap_or(0);
+				// A skimmed fee is only ever set on an inbound JIT-channel receive; outbound and
+				// regular inbound Bolt11 payments leave it `None`.
+				PaymentKind::Bolt11 { counterparty_skimmed_fee_msat: Some(msats), .. } => {
 					debug_assert_eq!(payment.direction, PaymentDirection::Inbound);
 					Some(Amount::from_milli_sats(msats).expect("Must be valid"))
 				},
@@ -1111,10 +1112,14 @@ impl Wallet {
 				let res = self.inner.ln_wallet.get_bolt11_invoice(amount).await;
 				match res {
 					Ok(inv) => inv,
-					Err(NodeError::ConnectionFailed) => {
+					Err(
+						NodeError::ConnectionFailed
+						| NodeError::LiquidityRequestFailed
+						| NodeError::LiquiditySourceUnavailable,
+					) => {
 						log_warn!(
 							self.inner.logger,
-							"Failed to connect to LSP when getting BOLT 11 invoice, falling back to trusted wallet"
+							"Failed to source inbound liquidity from LSP when getting BOLT 11 invoice, falling back to trusted wallet"
 						);
 						from_trusted = true;
 						self.inner.trusted.get_bolt11_invoice(amount).await?

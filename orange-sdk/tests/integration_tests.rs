@@ -1221,11 +1221,11 @@ async fn test_force_close_handling() {
 		let channel = lsp
 			.list_channels()
 			.into_iter()
-			.find(|c| c.counterparty_node_id == wallet.node_id())
+			.find(|c| c.counterparty.node_id == wallet.node_id())
 			.unwrap();
 
 		// force close the channel
-		lsp.force_close_channel(&channel.user_channel_id, channel.counterparty_node_id, None)
+		lsp.force_close_channel(&channel.user_channel_id, channel.counterparty.node_id, None)
 			.unwrap();
 
 		// wait for the channel to be closed
