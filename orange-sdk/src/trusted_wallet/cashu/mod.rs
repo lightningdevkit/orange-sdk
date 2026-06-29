@@ -216,7 +216,10 @@ impl TrustedWalletInterface for Cashu {
 						})?;
 
 					// The fee is in the quote
-					convert_amount(quote.fee_reserve, &self.unit)
+					let quote_fee = convert_amount(quote.fee_reserve, &self.unit)?;
+					let input_fee =
+						self.estimate_input_fee(quote.amount + quote.fee_reserve).await?;
+					Ok(quote_fee.saturating_add(input_fee))
 				},
 				PaymentMethod::LightningBolt12(offer) => {
 					let quote = self
@@ -230,7 +233,10 @@ impl TrustedWalletInterface for Cashu {
 						})?;
 
 					// The fee is in the quote
-					convert_amount(quote.fee_reserve, &self.unit)
+					let quote_fee = convert_amount(quote.fee_reserve, &self.unit)?;
+					let input_fee =
+						self.estimate_input_fee(quote.amount + quote.fee_reserve).await?;
+					Ok(quote_fee.saturating_add(input_fee))
 				},
 				PaymentMethod::OnChain(_) => Err(TrustedError::UnsupportedOperation(
 					"Cashu mint does not support onchain".to_owned(),
@@ -848,6 +854,55 @@ impl Cashu {
 			log_info!(logger, "Sent PaymentReceived event for mint quote: {}", mint_quote.id);
 		}
 		Ok(())
+	}
+
+	async fn estimate_input_fee(&self, input_amount: CdkAmount) -> Result<Amount, TrustedError> {
+		let proofs = self.cashu_wallet.get_unspent_proofs().await.map_err(|e| {
+			TrustedError::WalletOperationFailed(format!("Failed to get unspent proofs: {e}"))
+		})?;
+
+		let mut counts_by_keyset = HashMap::new();
+		for proof in proofs {
+			*counts_by_keyset.entry(proof.keyset_id).or_insert(0_u64) += 1;
+		}
+
+		let mut fee = Amount::ZERO;
+		for (keyset_id, proof_count) in counts_by_keyset {
+			let keyset_fee =
+				self.cashu_wallet.calculate_fee(proof_count, keyset_id).await.map_err(|e| {
+					TrustedError::WalletOperationFailed(format!(
+						"Failed to calculate input fee: {e}"
+					))
+				})?;
+			fee = fee.saturating_add(convert_amount(keyset_fee, &self.unit)?);
+		}
+
+		let active_keyset = self.cashu_wallet.get_active_keyset().await.map_err(|e| {
+			TrustedError::WalletOperationFailed(format!("Failed to get active keyset: {e}"))
+		})?;
+		let fee_and_amounts =
+			self.cashu_wallet.get_keyset_fees_and_amounts_by_id(active_keyset.id).await.map_err(
+				|e| {
+					TrustedError::WalletOperationFailed(format!(
+						"Failed to get keyset fee amounts: {e}"
+					))
+				},
+			)?;
+		let output_count = input_amount.split(&fee_and_amounts).map_err(|e| {
+			TrustedError::WalletOperationFailed(format!(
+				"Failed to calculate melt output count: {e}"
+			))
+		})?;
+		let output_fee = self
+			.cashu_wallet
+			.calculate_fee(output_count.len() as u64, active_keyset.id)
+			.await
+			.map_err(|e| {
+				TrustedError::WalletOperationFailed(format!("Failed to calculate output fee: {e}"))
+			})?;
+		fee = fee.saturating_add(convert_amount(output_fee, &self.unit)?);
+
+		Ok(fee)
 	}
 
 	pub(crate) async fn await_payment_success(&self) {
