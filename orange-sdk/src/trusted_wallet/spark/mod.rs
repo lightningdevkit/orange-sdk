@@ -249,6 +249,22 @@ impl TrustedWalletInterface for Spark {
 		})
 	}
 
+	fn supports_partial_payments(&self) -> bool {
+		// Spark pays the full invoice through the Spark service, so partial MPP payments are not
+		// supported.
+		false
+	}
+
+	fn pay_partial(
+		&self, _invoice: Bolt11Invoice, _partial_amount: Amount,
+	) -> Pin<Box<dyn Future<Output = Result<[u8; 32], TrustedError>> + Send + '_>> {
+		Box::pin(async move {
+			Err(TrustedError::UnsupportedOperation(
+				"Spark wallet does not support partial payments".to_owned(),
+			))
+		})
+	}
+
 	fn await_payment_success(
 		&self, payment_hash: [u8; 32],
 	) -> Pin<Box<dyn Future<Output = Option<ReceivedLightningPayment>> + Send + '_>> {

@@ -8,7 +8,7 @@ pub use bitcoin_payment_instructions::PaymentMethod;
 use bitcoin_payment_instructions::amount::Amount;
 
 use crate::rebalancer::{OrangeRebalanceEventHandler, OrangeTrigger};
-use crate::store::{TxMetadata, TxMetadataStore, TxType};
+use crate::store::{MppLegKind, MppMerge, TxMetadata, TxMetadataStore, TxType};
 #[cfg(feature = "cashu")]
 use crate::trusted_wallet::cashu::Cashu;
 #[cfg(feature = "_test-utils")]
@@ -611,9 +611,10 @@ impl Wallet {
 			},
 		};
 
-		let event_queue = Arc::new(EventQueue::new(Arc::clone(&store), Arc::clone(&logger)));
-
 		let tx_metadata = TxMetadataStore::new(Arc::clone(&store)).await;
+
+		let event_queue =
+			Arc::new(EventQueue::new(Arc::clone(&store), tx_metadata.clone(), Arc::clone(&logger)));
 
 		// Cashu must init before LDK Node because CashuKvDatabase does
 		// synchronous SQLite reads that deadlock with LDK Node's background
@@ -795,6 +796,11 @@ impl Wallet {
 			transaction: Option<Transaction>,
 		}
 
+		// Multi-path payments are split into a trusted leg and a lightning leg. We merge the two
+		// legs, keyed by the surfaced payment id, into a single transaction with the combined amount
+		// and summed fees.
+		let mut mpp_payments: HashMap<PaymentId, MppMerge> = HashMap::new();
+
 		for payment in trusted_payments {
 			if let Some(tx_metadata) = tx_metadata.get(&PaymentId::Trusted(payment.id)) {
 				match &tx_metadata.ty {
@@ -858,6 +864,17 @@ impl Wallet {
 								payment.time_since_epoch
 							},
 						});
+					},
+					TxType::MppPayment { surface_id, total_amount_msat, ty, .. } => {
+						let entry = mpp_payments.entry(*surface_id).or_default();
+						entry.accumulate(
+							MppLegKind::Trusted,
+							*total_amount_msat,
+							payment.fee.milli_sats(),
+							payment.status,
+							*ty,
+							tx_metadata.time,
+						);
 					},
 					TxType::PendingRebalance { .. } => {
 						// Pending rebalances are not shown in the transaction list.
@@ -990,6 +1007,17 @@ impl Wallet {
 						payment_type: (&payment).into(),
 						time_since_epoch: tx_metadata.time,
 					}),
+					TxType::MppPayment { surface_id, total_amount_msat, ty: _, .. } => {
+						let entry = mpp_payments.entry(*surface_id).or_default();
+						entry.accumulate(
+							MppLegKind::Lightning,
+							*total_amount_msat,
+							fee.unwrap_or(Amount::ZERO).milli_sats(),
+							payment.status.into(),
+							(&payment).into(),
+							tx_metadata.time,
+						);
+					},
 					TxType::PendingRebalance { .. } => {
 						// Pending rebalances are not shown in the transaction list.
 						continue;
@@ -1051,6 +1079,10 @@ impl Wallet {
 				);
 				res.push(transaction);
 			}
+		}
+
+		for (surface_id, merge) in mpp_payments {
+			res.push(merge.into_transaction(surface_id));
 		}
 
 		res.sort_by_key(|e| e.time_since_epoch);
@@ -1199,6 +1231,7 @@ impl Wallet {
 
 		let mut last_trusted_err = None;
 		let mut last_lightning_err = None;
+		let mut last_mpp_err: Option<WalletError> = None;
 
 		let mut pay_trusted = async |method: PaymentMethod, ty: fn() -> PaymentType| {
 			if instructions.amount <= trusted_balance {
@@ -1371,7 +1404,30 @@ impl Wallet {
 			}
 		}
 
-		// TODO: Try to MPP the payment using both trusted and LN funds
+		// If neither wallet can cover the full amount on its own, try to split the payment across
+		// both using a multi-path payment. This is only possible for amount-bearing BOLT 11
+		// invoices and when the trusted wallet supports partial payments.
+		if self.inner.trusted.supports_partial_payments() {
+			for method in &methods {
+				if let PaymentMethod::LightningBolt11(invoice) = method {
+					match self
+						.try_mpp_bolt11(
+							invoice,
+							instructions.amount,
+							trusted_balance,
+							ln_balance.lightning,
+						)
+						.await
+					{
+						Ok(id) => return Ok(id),
+						Err(e) => {
+							log_debug!(self.inner.logger, "MPP payment attempt failed: {e:?}");
+							last_mpp_err = Some(e);
+						},
+					}
+				}
+			}
+		}
 
 		// Finally, try trusted on-chain first,
 		for method in methods.clone() {
@@ -1395,9 +1451,144 @@ impl Wallet {
 			}
 		}
 
-		Err(last_lightning_err.unwrap_or(
-			last_trusted_err.unwrap_or(WalletError::LdkNodeFailure(NodeError::InsufficientFunds)),
-		))
+		Err(last_lightning_err
+			.or(last_mpp_err)
+			.or(last_trusted_err)
+			.unwrap_or(WalletError::LdkNodeFailure(NodeError::InsufficientFunds)))
+	}
+
+	/// Attempts to pay `invoice` as a multi-path payment split across the trusted wallet and the
+	/// self-custody lightning wallet.
+	///
+	/// `amount` must equal the invoice's amount, which is declared as the MPP total. The trusted
+	/// wallet pays as much as its balance allows (always strictly less than the total) and the
+	/// lightning wallet pays the remainder over the same payment hash. Returns the lightning
+	/// payment's id on success.
+	async fn try_mpp_bolt11(
+		&self, invoice: &Bolt11Invoice, amount: Amount, trusted_balance: Amount,
+		ln_lightning_balance: Amount,
+	) -> Result<PaymentId, WalletError> {
+		// We can only declare the invoice amount as the MPP total, so MPP requires an
+		// amount-bearing invoice whose amount matches what we intend to pay.
+		let invoice_amount_msat = invoice
+			.amount_milli_satoshis()
+			.ok_or(WalletError::LdkNodeFailure(NodeError::InvalidInvoice))?;
+		if invoice_amount_msat != amount.milli_sats() {
+			return Err(WalletError::LdkNodeFailure(NodeError::InvalidAmount));
+		}
+
+		let method = PaymentMethod::LightningBolt11(invoice.clone());
+
+		// Avoid the trusted wallet's normal fee estimate here. Cashu obtains estimates by creating
+		// a non-MPP melt quote, and an active full-amount quote can block the partial MPP quote we
+		// need below. If fees make the trusted portion unaffordable, `pay_partial` will fail and the
+		// caller will continue through the normal fallback order.
+		let trusted_portion = trusted_balance;
+		if trusted_portion == Amount::ZERO || trusted_portion >= amount {
+			// Either the trusted wallet can't contribute, or it could cover the whole payment on
+			// its own (which should have been handled earlier); there is nothing to split.
+			return Err(WalletError::LdkNodeFailure(NodeError::InsufficientFunds));
+		}
+		let ln_portion = amount.saturating_sub(trusted_portion);
+
+		// Make sure the lightning wallet can cover its portion.
+		let ln_fee =
+			self.inner.ln_wallet.estimate_fee(&method, ln_portion).await.unwrap_or(Amount::ZERO);
+		if ln_fee.saturating_add(ln_portion) > ln_lightning_balance {
+			return Err(WalletError::LdkNodeFailure(NodeError::InsufficientFunds));
+		}
+
+		log_debug!(
+			self.inner.logger,
+			"Splitting {}msat payment via MPP: {}msat from trusted, {}msat from lightning",
+			amount.milli_sats(),
+			trusted_portion.milli_sats(),
+			ln_portion.milli_sats()
+		);
+
+		let payment_hash = invoice.payment_hash();
+		self.inner.event_queue.begin_mpp_setup(payment_hash).await;
+
+		// Pay the trusted portion first; the receiver will hold it until the lightning portion
+		// arrives to complete the MPP. We surface the combined payment under the trusted leg's id.
+		let trusted_id =
+			match self.inner.trusted.pay_partial(invoice.clone(), trusted_portion).await {
+				Ok(id) => id,
+				Err(e) => {
+					if let Err(queue_err) =
+						self.inner.event_queue.finish_mpp_setup(payment_hash).await
+					{
+						log_error!(
+							self.inner.logger,
+							"Failed to clear pending MPP events: {queue_err}"
+						);
+					}
+					return Err(e.into());
+				},
+			};
+		let surface_id = PaymentId::Trusted(trusted_id);
+
+		// Then pay the remainder from the lightning wallet over the same payment hash.
+		let ln_id = match self.inner.ln_wallet.pay_bolt11_underpaying(invoice, ln_portion) {
+			Ok(id) => id,
+			Err(e) => {
+				log_error!(self.inner.logger, "Failed to send lightning MPP portion: {e:?}");
+				// The trusted leg is already in flight but there will be no lightning leg to
+				// complete the MPP. Record it as a plain payment so its eventual (failed) terminal
+				// event surfaces normally rather than waiting on a sibling leg that never comes.
+				self.inner
+					.tx_metadata
+					.insert(
+						surface_id,
+						TxMetadata {
+							ty: TxType::Payment {
+								ty: PaymentType::OutgoingLightningBolt11 { payment_preimage: None },
+							},
+							time: SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap(),
+						},
+					)
+					.await;
+				if let Err(queue_err) = self.inner.event_queue.finish_mpp_setup(payment_hash).await
+				{
+					log_error!(
+						self.inner.logger,
+						"Failed to replay pending MPP events: {queue_err}"
+					);
+				}
+				return Err(e.into());
+			},
+		};
+
+		// Record identical grouping metadata for both legs, keyed by their own ids. Each leg records
+		// its terminal result onto the entry surfaced under `surface_id`; whichever leg completes the
+		// payment yields the single combined event. The accumulated state is persisted, so the event
+		// is surfaced exactly once even across restarts.
+		let mpp_metadata = || TxMetadata {
+			ty: TxType::MppPayment {
+				surface_id,
+				lightning_leg: ln_id.0,
+				total_amount_msat: amount.milli_sats(),
+				ty: PaymentType::OutgoingLightningBolt11 { payment_preimage: None },
+				trusted_fee_msat: None,
+				lightning_fee_msat: None,
+				preimage: None,
+				failed: false,
+				finalized: false,
+			},
+			time: SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap(),
+		};
+		self.inner.tx_metadata.insert(surface_id, mpp_metadata()).await;
+		self.inner.tx_metadata.upsert(PaymentId::SelfCustodial(ln_id.0), mpp_metadata()).await;
+		if let Err(queue_err) = self.inner.event_queue.finish_mpp_setup(payment_hash).await {
+			log_error!(self.inner.logger, "Failed to replay pending MPP events: {queue_err}");
+		}
+
+		let inner_ref = Arc::clone(&self.inner);
+		self.inner.runtime.spawn_cancellable_background_task(async move {
+			inner_ref.rebalancer.do_rebalance_if_needed().await;
+		});
+
+		Ok(surface_id)
 	}
 
 	/// Initiates closing all channels in the lightning wallet. The channel will not be closed

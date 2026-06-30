@@ -255,6 +255,143 @@ pub(crate) enum TxType {
 		ty: PaymentType,
 	},
 	PendingRebalance {},
+	/// A single leg of a multi-path payment that is split across the trusted and lightning
+	/// wallets. Both legs carry the same `surface_id`; the entry stored under that id additionally
+	/// accumulates each leg's terminal result so the two can be coalesced into a single event. The
+	/// accumulated fields are persisted, so the combined event is emitted exactly once even across
+	/// restarts and races between the two legs completing.
+	MppPayment {
+		/// The id under which the combined payment is surfaced to the user (the trusted leg id).
+		surface_id: PaymentId,
+		/// The lightning leg's payment id (equal to the BOLT 11 payment hash).
+		lightning_leg: [u8; 32],
+		/// The total amount, in msats, of the combined payment (i.e. the invoice amount).
+		total_amount_msat: u64,
+		/// The payment type of the combined transaction.
+		ty: PaymentType,
+		/// The trusted leg's fee, in msats, set once that leg succeeds.
+		trusted_fee_msat: Option<u64>,
+		/// The lightning leg's fee, in msats, set once that leg succeeds.
+		lightning_fee_msat: Option<u64>,
+		/// The shared payment preimage, set once either leg succeeds.
+		preimage: Option<[u8; 32]>,
+		/// Set if either leg failed.
+		failed: bool,
+		/// Set once the single combined terminal event has been surfaced.
+		finalized: bool,
+	},
+}
+
+/// The terminal outcome of a multi-path payment once both legs have resolved, returned by
+/// [`TxMetadataStore::record_mpp_leg`] to the caller that should surface the single combined event.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MppOutcome {
+	/// Both legs succeeded.
+	Succeeded {
+		/// The BOLT 11 payment hash.
+		payment_hash: [u8; 32],
+		/// The shared payment preimage.
+		preimage: [u8; 32],
+		/// The combined fee, in msats, across both legs.
+		fee_msat: u64,
+	},
+	/// At least one leg failed.
+	Failed {
+		/// The BOLT 11 payment hash.
+		payment_hash: [u8; 32],
+	},
+}
+
+/// Which wallet a leg of a multi-path payment was paid out of.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MppLegKind {
+	/// The leg paid by the trusted wallet (surfaced under the combined payment's id).
+	Trusted,
+	/// The leg paid by the self-custody lightning wallet.
+	Lightning,
+}
+
+/// The state of a single leg of a multi-path payment as reflected in the transaction list.
+#[derive(Debug, Clone, Copy)]
+struct MppLeg {
+	status: TxStatus,
+	fee_msat: u64,
+}
+
+/// Accumulates the two legs of a multi-path payment back into the single combined [`Transaction`]
+/// surfaced to the user. Each leg ([`TxType::MppPayment`]) is folded in with [`Self::accumulate`],
+/// tagged by which wallet paid it, and the result is built with [`Self::into_transaction`]. Both
+/// legs carry the same total amount, and their fees are summed. Tracking the trusted and lightning
+/// legs separately (rather than just counting them) lets us tell which leg is missing or failed
+/// when describing the payment's state.
+#[derive(Debug, Default)]
+pub(crate) struct MppMerge {
+	total_amount_msat: u64,
+	trusted: Option<MppLeg>,
+	lightning: Option<MppLeg>,
+	payment_type: Option<PaymentType>,
+	time: Option<Duration>,
+}
+
+impl MppMerge {
+	/// Folds the `leg` of the multi-path payment into the merge.
+	pub(crate) fn accumulate(
+		&mut self, leg: MppLegKind, total_amount_msat: u64, fee_msat: u64, status: TxStatus,
+		ty: PaymentType, time: Duration,
+	) {
+		self.total_amount_msat = total_amount_msat;
+		let slot = match leg {
+			MppLegKind::Trusted => &mut self.trusted,
+			MppLegKind::Lightning => &mut self.lightning,
+		};
+		*slot = Some(MppLeg { status, fee_msat });
+		// Prefer a payment type that carries the preimage (the lightning leg) for the
+		// combined transaction.
+		let ty_has_preimage = matches!(
+			ty,
+			PaymentType::OutgoingLightningBolt11 { payment_preimage: Some(_) }
+				| PaymentType::OutgoingLightningBolt12 { payment_preimage: Some(_) }
+		);
+		if self.payment_type.is_none() || ty_has_preimage {
+			self.payment_type = Some(ty);
+		}
+		self.time = Some(self.time.map_or(time, |t| t.min(time)));
+	}
+
+	/// The combined status of the payment: failed if either leg failed, completed only once both
+	/// legs have completed, and otherwise still pending.
+	pub(crate) fn status(&self) -> TxStatus {
+		let leg_status = |leg: Option<MppLeg>| leg.map(|l| l.status);
+		if [self.trusted, self.lightning].iter().any(|l| leg_status(*l) == Some(TxStatus::Failed)) {
+			TxStatus::Failed
+		} else if leg_status(self.trusted) == Some(TxStatus::Completed)
+			&& leg_status(self.lightning) == Some(TxStatus::Completed)
+		{
+			TxStatus::Completed
+		} else {
+			TxStatus::Pending
+		}
+	}
+
+	/// Builds the single combined transaction surfaced under `surface_id`, summing both legs' fees.
+	pub(crate) fn into_transaction(self, surface_id: PaymentId) -> Transaction {
+		let status = self.status();
+		let fee_msat = self
+			.trusted
+			.map_or(0, |l| l.fee_msat)
+			.saturating_add(self.lightning.map_or(0, |l| l.fee_msat));
+		Transaction {
+			id: surface_id,
+			status,
+			outbound: true,
+			amount: Some(Amount::from_milli_sats(self.total_amount_msat).expect("valid amount")),
+			fee: Some(Amount::from_milli_sats(fee_msat).expect("valid amount")),
+			payment_type: self
+				.payment_type
+				.unwrap_or(PaymentType::OutgoingLightningBolt11 { payment_preimage: None }),
+			time_since_epoch: self.time.unwrap_or_default(),
+		}
+	}
 }
 
 impl TxType {
@@ -281,6 +418,17 @@ impl_writeable_tlv_based_enum!(TxType,
 	(2, PaymentTriggeringTransferLightning) => { (0, ty, required), },
 	(3, Payment) => { (0, ty, required), },
 	(4, PendingRebalance) => {},
+	(5, MppPayment) => {
+		(0, surface_id, required),
+		(2, total_amount_msat, required),
+		(4, ty, required),
+		(6, lightning_leg, required),
+		(8, finalized, required),
+		(10, failed, required),
+		(12, trusted_fee_msat, option),
+		(14, lightning_fee_msat, option),
+		(16, preimage, option),
+	},
 );
 
 #[derive(Debug, Copy, Clone)]
@@ -296,6 +444,12 @@ impl_writeable_tlv_based!(TxMetadata, { (0, ty, required), (2, time, required) }
 pub(crate) struct TxMetadataStore {
 	tx_metadata: Arc<RwLock<HashMap<PaymentId, TxMetadata>>>,
 	store: Arc<dyn DynStore>,
+	/// Serializes the read-modify-persist sequence in [`Self::record_mpp_leg`]. Both legs of a
+	/// multi-path payment record their result onto the same surface entry; without this, two
+	/// concurrent legs could each encode a partial snapshot under the in-memory lock and then
+	/// persist them out of order, leaving a stale (non-finalized) entry on disk that would
+	/// re-emit the combined event after a restart.
+	mpp_record_lock: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl TxMetadataStore {
@@ -315,7 +469,11 @@ impl TxMetadataStore {
 				.expect("Invalid data in transaction metadata storage");
 			tx_metadata.insert(key, data);
 		}
-		TxMetadataStore { store, tx_metadata: Arc::new(RwLock::new(tx_metadata)) }
+		TxMetadataStore {
+			store,
+			tx_metadata: Arc::new(RwLock::new(tx_metadata)),
+			mpp_record_lock: Arc::new(tokio::sync::Mutex::new(())),
+		}
 	}
 
 	pub fn read(&self) -> RwLockReadGuard<'_, HashMap<PaymentId, TxMetadata>> {
@@ -477,6 +635,100 @@ impl TxMetadataStore {
 			.expect("We do not allow writes to fail");
 		Ok(())
 	}
+
+	/// Records the terminal result of one leg of a multi-path payment, accumulating it onto the
+	/// shared entry surfaced to the user. `leg_id` is the leg's own payment id and `success` is
+	/// `Some((fee_msat, preimage))` if it succeeded or `None` if it failed.
+	///
+	/// Returns `Some` exactly once — for the call that completes the payment (both legs succeeded,
+	/// or the first leg failed) — with the combined [`MppOutcome`] the caller should surface as a
+	/// single event. Returns `None` while still waiting on the other leg, after the combined event
+	/// has already been produced, or if `leg_id` is not a multi-path payment leg.
+	///
+	/// All accumulated state is persisted, so the combined event is emitted exactly once even across
+	/// restarts and races between the two legs completing.
+	pub(crate) async fn record_mpp_leg(
+		&self, leg_id: PaymentId, success: Option<(u64, [u8; 32])>,
+	) -> Option<(PaymentId, MppOutcome)> {
+		// Hold this across the whole read-modify-persist so the two legs can't interleave: the
+		// snapshot we persist below must reflect the latest in-memory mutation, otherwise a stale
+		// (non-finalized) entry could be written last and re-emit the combined event on restart.
+		let _record_guard = self.mpp_record_lock.lock().await;
+
+		let (surface_id, key_str, ser, outcome) = {
+			let mut map = self.tx_metadata.write().unwrap();
+
+			// The leg's own entry tells us which combined payment it belongs to.
+			let surface_id = match map.get(&leg_id).map(|m| m.ty) {
+				Some(TxType::MppPayment { surface_id, .. }) => surface_id,
+				_ => return None,
+			};
+			// The combined payment is surfaced under the trusted leg's id.
+			let is_trusted_leg = leg_id == surface_id;
+
+			let outcome = {
+				let metadata = match map.get_mut(&surface_id) {
+					Some(metadata) => metadata,
+					None => return None,
+				};
+				let TxType::MppPayment {
+					lightning_leg,
+					trusted_fee_msat,
+					lightning_fee_msat,
+					preimage,
+					failed,
+					finalized,
+					..
+				} = &mut metadata.ty
+				else {
+					return None;
+				};
+				if *finalized {
+					return None;
+				}
+
+				match success {
+					Some((fee_msat, leg_preimage)) => {
+						if is_trusted_leg {
+							*trusted_fee_msat = Some(fee_msat);
+						} else {
+							*lightning_fee_msat = Some(fee_msat);
+						}
+						*preimage = Some(leg_preimage);
+					},
+					None => *failed = true,
+				}
+
+				let payment_hash = *lightning_leg;
+				if *failed {
+					*finalized = true;
+					Some(MppOutcome::Failed { payment_hash })
+				} else if let (Some(trusted_fee), Some(lightning_fee)) =
+					(*trusted_fee_msat, *lightning_fee_msat)
+				{
+					*finalized = true;
+					Some(MppOutcome::Succeeded {
+						payment_hash,
+						preimage: preimage.expect("set whenever a leg succeeds"),
+						fee_msat: trusted_fee.saturating_add(lightning_fee),
+					})
+				} else {
+					None
+				}
+			};
+
+			// We mutated the surface entry (recorded this leg), so persist it regardless of whether
+			// the payment is now complete.
+			let ser = map.get(&surface_id).expect("surface entry present").encode();
+			(surface_id, surface_id.to_string(), ser, outcome)
+		};
+
+		KVStore::write(self.store.as_ref(), STORE_PRIMARY_KEY, STORE_SECONDARY_KEY, &key_str, ser)
+			.await
+			.expect("We do not allow writes to fail");
+
+		outcome.map(|outcome| (surface_id, outcome))
+	}
 }
 
 const REBALANCE_ENABLED_KEY: &str = "rebalance_enabled";
@@ -536,7 +788,160 @@ pub(crate) async fn read_splice_outs(store: &dyn DynStore) -> Vec<PaymentDetails
 mod tests {
 	use super::*;
 	use ldk_node::bitcoin::hex::DisplayHex;
+	use ldk_node::io::sqlite_store::SqliteStore;
+	use std::path::PathBuf;
 	use std::str::FromStr;
+	use std::time::{SystemTime, UNIX_EPOCH};
+
+	fn temp_sqlite_store() -> (PathBuf, Arc<dyn DynStore>) {
+		let path = std::env::temp_dir().join(format!(
+			"orange-sdk-mpp-finalize-test-{}",
+			SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()
+		));
+		let store = SqliteStore::new(path.clone(), Some("orange.sqlite".to_string()), None)
+			.expect("sqlite store");
+		(path, Arc::new(store))
+	}
+
+	const TRUSTED_LEG: [u8; 32] = [7u8; 32];
+	const LIGHTNING_LEG: [u8; 32] = [9u8; 32];
+
+	fn surface_id() -> PaymentId {
+		PaymentId::Trusted(TRUSTED_LEG)
+	}
+	fn lightning_id() -> PaymentId {
+		PaymentId::SelfCustodial(LIGHTNING_LEG)
+	}
+
+	fn mpp_metadata() -> TxMetadata {
+		TxMetadata {
+			ty: TxType::MppPayment {
+				surface_id: surface_id(),
+				lightning_leg: LIGHTNING_LEG,
+				total_amount_msat: 200_000,
+				ty: PaymentType::OutgoingLightningBolt11 { payment_preimage: None },
+				trusted_fee_msat: None,
+				lightning_fee_msat: None,
+				preimage: None,
+				failed: false,
+				finalized: false,
+			},
+			time: Duration::from_secs(1),
+		}
+	}
+
+	// Both legs record their result onto the shared entry; the second to land yields the single
+	// combined outcome.
+	async fn insert_legs(tx_metadata: &TxMetadataStore) {
+		tx_metadata.insert(surface_id(), mpp_metadata()).await;
+		tx_metadata.insert(lightning_id(), mpp_metadata()).await;
+	}
+
+	#[tokio::test]
+	async fn record_mpp_leg_combines_both_legs_once() {
+		let (_path, store) = temp_sqlite_store();
+		let tx_metadata = TxMetadataStore::new(store).await;
+		insert_legs(&tx_metadata).await;
+
+		// First leg: still waiting on the other.
+		assert_eq!(tx_metadata.record_mpp_leg(surface_id(), Some((1_000, [1u8; 32]))).await, None);
+
+		// Second leg completes the payment: a single combined success with the summed fees.
+		assert_eq!(
+			tx_metadata.record_mpp_leg(lightning_id(), Some((2_000, [1u8; 32]))).await,
+			Some((
+				surface_id(),
+				MppOutcome::Succeeded {
+					payment_hash: LIGHTNING_LEG,
+					preimage: [1u8; 32],
+					fee_msat: 3_000,
+				}
+			))
+		);
+
+		// A replayed leg event (e.g. after a crash) does not produce a second event.
+		assert_eq!(tx_metadata.record_mpp_leg(surface_id(), Some((1_000, [1u8; 32]))).await, None);
+		assert_eq!(
+			tx_metadata.record_mpp_leg(lightning_id(), Some((2_000, [1u8; 32]))).await,
+			None
+		);
+	}
+
+	// The exactly-once guarantee must survive a crash/restart: the recorded legs and the finalized
+	// flag are persisted, so reloading the store from disk still suppresses a re-emit. We simulate a
+	// crash/restart by dropping the `TxMetadataStore` and rebuilding it from the same on-disk store.
+	#[tokio::test]
+	async fn record_mpp_leg_persists_across_restart() {
+		let path = std::env::temp_dir().join(format!(
+			"orange-sdk-mpp-record-test-{}",
+			SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()
+		));
+		let open = |path: PathBuf| -> Arc<dyn DynStore> {
+			Arc::new(
+				SqliteStore::new(path, Some("orange.sqlite".to_string()), None)
+					.expect("sqlite store"),
+			)
+		};
+
+		{
+			let tx_metadata = TxMetadataStore::new(open(path.clone())).await;
+			insert_legs(&tx_metadata).await;
+			assert_eq!(
+				tx_metadata.record_mpp_leg(surface_id(), Some((1_000, [1u8; 32]))).await,
+				None
+			);
+			assert!(
+				tx_metadata
+					.record_mpp_leg(lightning_id(), Some((2_000, [1u8; 32])))
+					.await
+					.is_some()
+			);
+		}
+
+		// Simulate a crash/restart: reload from the same on-disk store.
+		{
+			let tx_metadata = TxMetadataStore::new(open(path.clone())).await;
+			// Both the recorded legs and the finalized flag survived, so a replayed event after the
+			// restart does not surface a duplicate combined event.
+			assert_eq!(
+				tx_metadata.record_mpp_leg(lightning_id(), Some((2_000, [1u8; 32]))).await,
+				None
+			);
+		}
+	}
+
+	#[tokio::test]
+	async fn record_mpp_leg_surfaces_failure_and_guards_non_mpp() {
+		let (_path, store) = temp_sqlite_store();
+		let tx_metadata = TxMetadataStore::new(store).await;
+		insert_legs(&tx_metadata).await;
+
+		// A failed leg fails the whole payment immediately, exactly once.
+		assert_eq!(
+			tx_metadata.record_mpp_leg(surface_id(), None).await,
+			Some((surface_id(), MppOutcome::Failed { payment_hash: LIGHTNING_LEG }))
+		);
+		assert_eq!(
+			tx_metadata.record_mpp_leg(lightning_id(), Some((2_000, [1u8; 32]))).await,
+			None
+		);
+
+		// Unknown ids and non-MPP payments are never treated as MPP legs.
+		assert_eq!(tx_metadata.record_mpp_leg(PaymentId::Trusted([5u8; 32]), None).await, None);
+		let plain = PaymentId::Trusted([4u8; 32]);
+		tx_metadata
+			.insert(
+				plain,
+				TxMetadata {
+					ty: TxType::Payment {
+						ty: PaymentType::OutgoingLightningBolt11 { payment_preimage: None },
+					},
+					time: Duration::from_secs(1),
+				},
+			)
+			.await;
+		assert_eq!(tx_metadata.record_mpp_leg(plain, Some((1, [0u8; 32]))).await, None);
+	}
 
 	#[test]
 	fn test_payment_id_round_trip() {

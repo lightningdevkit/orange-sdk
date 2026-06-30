@@ -83,6 +83,38 @@ pub trait TrustedWalletInterface: Send + Sync + private::Sealed {
 		&self, method: PaymentMethod, amount: Amount,
 	) -> Pin<Box<dyn Future<Output = Result<[u8; 32], TrustedError>> + Send + '_>>;
 
+	/// Returns whether this wallet supports making partial (multi-path) payments toward a
+	/// BOLT 11 invoice.
+	///
+	/// When `true`, [`pay_partial`] may be used to pay only a portion of an invoice's amount,
+	/// with the remainder paid out of another wallet (e.g. the self-custody lightning wallet)
+	/// over the same payment hash.
+	///
+	/// [`pay_partial`]: Self::pay_partial
+	fn supports_partial_payments(&self) -> bool;
+
+	/// Pays `partial_amount` toward the given BOLT 11 `invoice` as a single part of a
+	/// multi-path payment (MPP).
+	///
+	/// The invoice's own amount is declared as the MPP total, so the remaining
+	/// `invoice amount - partial_amount` is expected to be paid out of another wallet over the
+	/// same payment hash for the receiver to claim the payment. This requires an amount-bearing
+	/// invoice; paying toward a zero-amount invoice is not supported.
+	///
+	/// As with [`pay`], this only initiates the payment and returns its payment ID, later
+	/// emitting a [`PaymentSuccessful`] or [`PaymentFailed`] event.
+	///
+	/// Implementations that do not support partial payments (see [`supports_partial_payments`])
+	/// should return [`TrustedError::UnsupportedOperation`].
+	///
+	/// [`pay`]: Self::pay
+	/// [`supports_partial_payments`]: Self::supports_partial_payments
+	/// [`PaymentSuccessful`]: `crate::event::Event::PaymentSuccessful`
+	/// [`PaymentFailed`]: `crate::event::Event::PaymentFailed`
+	fn pay_partial(
+		&self, invoice: Bolt11Invoice, partial_amount: Amount,
+	) -> Pin<Box<dyn Future<Output = Result<[u8; 32], TrustedError>> + Send + '_>>;
+
 	/// Waits for a payment with the given payment hash to succeed.
 	/// Returns the `ReceivedLightningPayment` if successful, or `None` if it fails or times out.
 	fn await_payment_success(
