@@ -78,6 +78,11 @@ pub trait TrustedWallet: Send + Sync {
 		&self, method: PaymentMethod, amount: Amount,
 	) -> Pin<Box<dyn Future<Output = Result<[u8; 32], Self::Error>> + Send + '_>>;
 
+	/// Estimate the fee for making a payment using the trusted wallet
+	fn estimate_fee(
+		&self, method: PaymentMethod, amount: Amount,
+	) -> Pin<Box<dyn Future<Output = Result<Amount, Self::Error>> + Send + '_>>;
+
 	/// Wait for a payment success notification
 	fn await_payment_success(
 		&self, payment_hash: [u8; 32],
@@ -272,10 +277,38 @@ where
 
 	/// Perform a rebalance from trusted to lightning wallet
 	async fn do_trusted_rebalance_locked(&self, params: TriggerParams) {
-		let transfer_amt = params.amount;
+		let mut transfer_amt = params.amount;
 		log_info!(self.logger, "Initiating rebalance");
 
-		if let Ok(inv) = self.ln_wallet.get_bolt11_invoice(Some(transfer_amt)).await {
+		if let Ok(mut inv) = self.ln_wallet.get_bolt11_invoice(Some(transfer_amt)).await {
+			if let Ok(fee) = self
+				.trusted
+				.estimate_fee(PaymentMethod::LightningBolt11(inv.clone()), transfer_amt)
+				.await
+			{
+				if fee >= transfer_amt {
+					log_error!(
+						self.logger,
+						"Rebalance trusted transaction fee {fee:?} exceeds amount {transfer_amt:?}",
+					);
+					return;
+				}
+
+				if transfer_amt.saturating_add(fee) > params.amount {
+					transfer_amt = params.amount.saturating_sub(fee);
+					match self.ln_wallet.get_bolt11_invoice(Some(transfer_amt)).await {
+						Ok(reduced_inv) => inv = reduced_inv,
+						Err(e) => {
+							log_error!(
+								self.logger,
+								"Failed to create fee-adjusted rebalance invoice: {e:?}",
+							);
+							return;
+						},
+					}
+				}
+			}
+
 			log_debug!(
 				self.logger,
 				"Attempting to pay invoice {inv} to rebalance for {transfer_amt:?}",

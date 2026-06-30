@@ -451,21 +451,24 @@ async fn test_sweep_to_ln() {
 
 		let expect_amt = intermediate_amt.saturating_add(recv_amt);
 
-		let event = wait_next_event(&wallet).await;
-		match event {
+		let received_rebalance_amount = match wait_next_event(&wallet).await {
 			Event::PaymentReceived { payment_id, amount_msat, lsp_fee_msats, .. } => {
 				assert!(matches!(payment_id, orange_sdk::PaymentId::SelfCustodial(_)));
-				assert!(lsp_fee_msats.is_some());
-				assert_eq!(amount_msat, expect_amt.milli_sats() - lsp_fee_msats.unwrap());
+				let lsp_fee_msats = lsp_fee_msats.expect("rebalance receive should pay LSP fee");
+				assert!(
+					amount_msat + lsp_fee_msats <= expect_amt.milli_sats(),
+					"rebalance receive should not exceed trusted balance after fees"
+				);
+				amount_msat + lsp_fee_msats
 			},
 			e => panic!("Expected RebalanceSuccessful event, got {e:?}"),
-		}
+		};
 
 		let event = wait_next_event(&wallet).await;
 		match event {
 			Event::RebalanceSuccessful { amount_msat, fee_msat, .. } => {
 				assert!(fee_msat > 0);
-				assert_eq!(amount_msat, expect_amt.milli_sats());
+				assert_eq!(amount_msat, received_rebalance_amount);
 			},
 			e => panic!("Expected RebalanceSuccessful event, got {e:?}"),
 		}
@@ -927,9 +930,12 @@ async fn test_receive_to_onchain_with_channel() {
 
 		// check we received on-chain, should be pending
 		// wait for payment success
-		test_utils::wait_for_condition("pending balance to update", || async {
-			// onchain balance is always listed as pending until we splice it into the channel.
+		test_utils::wait_for_condition("onchain receive to appear", || async {
 			wallet.get_balance().await.unwrap().pending_balance == recv_amt
+				|| wallet.list_transactions().await.unwrap().iter().any(|tx| {
+					tx.payment_type == PaymentType::IncomingOnChain { txid: Some(sent_txid) }
+						&& tx.amount == Some(recv_amt)
+				})
 		})
 		.await;
 
@@ -1027,8 +1033,12 @@ async fn test_concurrent_splice_in_and_out_preserve_pending_events() {
 		generate_blocks(&bitcoind, &electrsd, 6).await;
 		wallet.sync_ln_wallet().unwrap();
 
-		test_utils::wait_for_condition("pending balance to update", || async {
+		test_utils::wait_for_condition("onchain receive to appear", || async {
 			wallet.get_balance().await.unwrap().pending_balance == recv_amt
+				|| wallet.list_transactions().await.unwrap().iter().any(|tx| {
+					tx.payment_type == PaymentType::IncomingOnChain { txid: Some(sent_txid) }
+						&& tx.amount == Some(recv_amt)
+				})
 		})
 		.await;
 

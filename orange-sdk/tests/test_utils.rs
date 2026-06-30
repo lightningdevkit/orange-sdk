@@ -2,7 +2,7 @@
 
 use bitcoin_payment_instructions::amount::Amount;
 #[cfg(feature = "_cashu-tests")]
-use cdk::mint::{MintBuilder, MintMeltLimits};
+use cdk::mint::{MintBuilder, MintMeltLimits, UnitConfig};
 #[cfg(feature = "_cashu-tests")]
 use cdk::types::FeeReserve;
 #[cfg(feature = "_cashu-tests")]
@@ -527,6 +527,12 @@ async fn build_test_nodes() -> TestParams {
 			let mut mint_seed: [u8; 64] = [0; 64];
 			rand::thread_rng().fill_bytes(&mut mint_seed);
 			let mut builder = MintBuilder::new(mem_db.clone());
+			builder
+				.configure_unit(
+					orange_sdk::CurrencyUnit::Sat,
+					UnitConfig { input_fee_ppk: 1, ..Default::default() },
+				)
+				.unwrap();
 
 			builder
 				.add_payment_processor(

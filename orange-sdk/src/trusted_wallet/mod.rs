@@ -159,6 +159,12 @@ impl<T: ?Sized + TrustedWalletInterface> graduated_rebalancer::TrustedWallet for
 		Box::pin(async move { self.0.pay(method, amount).await })
 	}
 
+	fn estimate_fee(
+		&self, method: PaymentMethod, amount: Amount,
+	) -> Pin<Box<dyn Future<Output = Result<Amount, Self::Error>> + Send + '_>> {
+		Box::pin(async move { self.0.estimate_fee(method, amount).await })
+	}
+
 	fn await_payment_success(
 		&self, payment_hash: [u8; 32],
 	) -> Pin<Box<dyn Future<Output = Option<ReceivedLightningPayment>> + Send + '_>> {
