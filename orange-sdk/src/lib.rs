@@ -27,7 +27,7 @@ use ldk_node::lightning::ln::msgs::SocketAddress;
 use ldk_node::lightning::util::logger::Logger as _;
 use ldk_node::lightning::{log_debug, log_error, log_info, log_trace, log_warn};
 use ldk_node::lightning_invoice::Bolt11Invoice;
-use ldk_node::payment::{PaymentDirection, PaymentKind};
+use ldk_node::payment::{PaymentDetails, PaymentDirection, PaymentKind};
 use ldk_node::{BuildError, ChannelDetails, NodeError};
 
 use crate::dyn_store::DynStore;
@@ -523,6 +523,29 @@ impl From<NodeError> for WalletError {
 	fn from(e: NodeError) -> WalletError {
 		WalletError::LdkNodeFailure(e)
 	}
+}
+
+fn should_surface_lightning_payment_without_metadata(status: TxStatus, kind: &PaymentKind) -> bool {
+	status == TxStatus::Completed || matches!(kind, PaymentKind::Onchain { .. })
+}
+
+fn lightning_payment_without_metadata_to_transaction(
+	payment: &PaymentDetails, fee: Option<Amount>,
+) -> Option<Transaction> {
+	let status = payment.status.into();
+	if !should_surface_lightning_payment_without_metadata(status, &payment.kind) {
+		return None;
+	}
+
+	Some(Transaction {
+		id: PaymentId::SelfCustodial(payment.id.0),
+		status,
+		outbound: payment.direction == PaymentDirection::Outbound,
+		amount: payment.amount_msat.map(|a| Amount::from_milli_sats(a).unwrap()),
+		fee,
+		payment_type: payment.into(),
+		time_since_epoch: Duration::from_secs(payment.latest_update_timestamp),
+	})
 }
 
 /// Represents a single-use Bitcoin URI for receiving payments.
@@ -1031,22 +1054,18 @@ impl Wallet {
 					payment.id
 				);
 
-				let status = payment.status.into();
-				if status != TxStatus::Completed {
-					// We don't bother to surface pending inbound transactions (i.e. issued but
-					// unpaid invoices) in our transaction list, in part because these may be
-					// failed rebalances.
+				if let Some(transaction) =
+					lightning_payment_without_metadata_to_transaction(&payment, fee)
+				{
+					res.push(transaction)
+				} else {
+					// We don't bother to surface pending inbound Lightning transactions (i.e.
+					// issued but unpaid invoices) in our transaction list, in part because these
+					// may be failed rebalances. On-chain payments, however, only exist once the
+					// transaction has been observed on-chain or in the mempool, so surface them
+					// with their real pending status.
 					continue;
 				}
-				res.push(Transaction {
-					id: PaymentId::SelfCustodial(payment.id.0),
-					status,
-					outbound: payment.direction == PaymentDirection::Outbound,
-					amount: payment.amount_msat.map(|a| Amount::from_milli_sats(a).unwrap()),
-					fee,
-					payment_type: (&payment).into(),
-					time_since_epoch: Duration::from_secs(payment.latest_update_timestamp),
-				})
 			}
 		}
 
@@ -1725,6 +1744,10 @@ impl Wallet {
 mod tests {
 	use super::*;
 	use ldk_node::bip39::Mnemonic;
+	use ldk_node::bitcoin::Txid;
+	use ldk_node::lightning::ln::channelmanager::PaymentId as LightningPaymentId;
+	use ldk_node::lightning::types::payment::PaymentHash;
+	use ldk_node::payment::{ConfirmationStatus, PaymentStatus};
 
 	#[test]
 	fn seed_debug_redacts_seed64_bytes() {
@@ -1743,5 +1766,55 @@ mod tests {
 		assert_eq!(debug, "Mnemonic { mnemonic: \"<redacted>\", passphrase: \"<redacted>\" }");
 		assert!(!debug.contains("abandon"));
 		assert!(!debug.contains("test passphrase"));
+	}
+
+	#[test]
+	fn pending_onchain_lightning_payments_without_metadata_are_listed() {
+		let kind = PaymentKind::Onchain {
+			txid: Txid::from_byte_array([42; 32]),
+			status: ConfirmationStatus::Unconfirmed,
+		};
+
+		assert!(should_surface_lightning_payment_without_metadata(TxStatus::Pending, &kind));
+	}
+
+	#[test]
+	fn pending_onchain_lightning_payment_without_metadata_becomes_transaction() {
+		let txid = Txid::from_byte_array([42; 32]);
+		let payment = PaymentDetails {
+			id: LightningPaymentId([24; 32]),
+			kind: PaymentKind::Onchain { txid, status: ConfirmationStatus::Unconfirmed },
+			amount_msat: Some(123_000),
+			fee_paid_msat: None,
+			direction: PaymentDirection::Inbound,
+			status: PaymentStatus::Pending,
+			latest_update_timestamp: 456,
+		};
+
+		let transaction =
+			lightning_payment_without_metadata_to_transaction(&payment, Some(Amount::ZERO))
+				.expect("pending on-chain payments should be surfaced");
+
+		assert_eq!(transaction.id, PaymentId::SelfCustodial([24; 32]));
+		assert_eq!(transaction.status, TxStatus::Pending);
+		assert!(!transaction.outbound);
+		assert_eq!(transaction.amount, Some(Amount::from_sats(123).expect("valid amount")));
+		assert_eq!(transaction.fee, Some(Amount::ZERO));
+		assert_eq!(transaction.payment_type, PaymentType::IncomingOnChain { txid: Some(txid) });
+		assert_eq!(transaction.time_since_epoch, Duration::from_secs(456));
+	}
+
+	#[test]
+	fn pending_non_onchain_lightning_payments_without_metadata_are_hidden() {
+		let kind = PaymentKind::Spontaneous { hash: PaymentHash([42; 32]), preimage: None };
+
+		assert!(!should_surface_lightning_payment_without_metadata(TxStatus::Pending, &kind));
+	}
+
+	#[test]
+	fn completed_lightning_payments_without_metadata_are_listed() {
+		let kind = PaymentKind::Spontaneous { hash: PaymentHash([42; 32]), preimage: None };
+
+		assert!(should_surface_lightning_payment_without_metadata(TxStatus::Completed, &kind));
 	}
 }
