@@ -92,7 +92,18 @@ impl LightningWallet {
 						);
 					},
 					Network::Testnet4 => {},
-					Network::Signet => {},
+					// No public RGS server exists for arbitrary signet networks, and
+					// small signet deployments (an LSP + a mint + phones) often never
+					// reach any public graph at all — so with no gossip source the
+					// wallet can only pay route-hinted invoices; anything from a node
+					// with an announced channel fails with RouteNotFound before an
+					// HTLC is even dispatched. P2P gossip from the wallet's own peers
+					// (its LSP) teaches it exactly the local topology it needs, and
+					// signet graphs are small enough that sync cost is negligible.
+					// An explicitly configured rgs_url still takes precedence above.
+					Network::Signet => {
+						builder.set_gossip_source_p2p();
+					},
 					Network::Regtest => {
 						// We don't want to run an RGS server in tests so just enable p2p gossip
 						builder.set_gossip_source_p2p();
