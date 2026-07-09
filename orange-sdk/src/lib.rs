@@ -529,15 +529,24 @@ impl From<NodeError> for WalletError {
 	}
 }
 
-fn should_surface_lightning_payment_without_metadata(status: TxStatus, kind: &PaymentKind) -> bool {
-	status == TxStatus::Completed || matches!(kind, PaymentKind::Onchain { .. })
+fn should_surface_lightning_payment_without_metadata(
+	status: TxStatus, kind: &PaymentKind, direction: PaymentDirection,
+) -> bool {
+	// Hide only non-completed *inbound* Lightning records (issued-but-unpaid
+	// invoices are noise). Outbound attempts always surface: a failed or
+	// still-pending send the user made must appear in their history —
+	// otherwise a failed payment leaves no record at all.
+	status == TxStatus::Completed
+		|| matches!(kind, PaymentKind::Onchain { .. })
+		|| direction == PaymentDirection::Outbound
 }
 
 fn lightning_payment_without_metadata_to_transaction(
 	payment: &PaymentDetails, fee: Option<Amount>,
 ) -> Option<Transaction> {
 	let status = payment.status.into();
-	if !should_surface_lightning_payment_without_metadata(status, &payment.kind) {
+	if !should_surface_lightning_payment_without_metadata(status, &payment.kind, payment.direction)
+	{
 		return None;
 	}
 
@@ -922,9 +931,10 @@ impl Wallet {
 					);
 				}
 
-				if payment.status != TxStatus::Completed {
-					// We don't bother to surface pending inbound transactions (i.e. issued but
-					// unpaid invoices) in our transaction list.
+				if !payment.outbound && payment.status != TxStatus::Completed {
+					// We don't bother to surface pending/expired inbound records
+					// (i.e. issued but unpaid quotes) in our transaction list.
+					// Outbound attempts always surface, including failures.
 					continue;
 				}
 
@@ -1779,7 +1789,11 @@ mod tests {
 			tx_type: None,
 		};
 
-		assert!(should_surface_lightning_payment_without_metadata(TxStatus::Pending, &kind));
+		assert!(should_surface_lightning_payment_without_metadata(
+			TxStatus::Pending,
+			&kind,
+			PaymentDirection::Inbound
+		));
 	}
 
 	#[test]
@@ -1813,16 +1827,54 @@ mod tests {
 	}
 
 	#[test]
-	fn pending_non_onchain_lightning_payments_without_metadata_are_hidden() {
+	fn pending_inbound_non_onchain_lightning_payments_without_metadata_are_hidden() {
 		let kind = PaymentKind::Spontaneous { hash: PaymentHash([42; 32]), preimage: None };
 
-		assert!(!should_surface_lightning_payment_without_metadata(TxStatus::Pending, &kind));
+		assert!(!should_surface_lightning_payment_without_metadata(
+			TxStatus::Pending,
+			&kind,
+			PaymentDirection::Inbound
+		));
 	}
 
 	#[test]
 	fn completed_lightning_payments_without_metadata_are_listed() {
 		let kind = PaymentKind::Spontaneous { hash: PaymentHash([42; 32]), preimage: None };
 
-		assert!(should_surface_lightning_payment_without_metadata(TxStatus::Completed, &kind));
+		assert!(should_surface_lightning_payment_without_metadata(
+			TxStatus::Completed,
+			&kind,
+			PaymentDirection::Inbound
+		));
+	}
+
+	#[test]
+	fn failed_and_pending_outbound_payments_are_listed() {
+		// A failed or in-flight send the user made must appear in their
+		// history — a failed payment that leaves no record erodes trust
+		// in the send flow (the wallet UI can't show what it never sees).
+		let kind = PaymentKind::Bolt11 {
+			hash: PaymentHash([42; 32]),
+			preimage: None,
+			secret: None,
+			counterparty_skimmed_fee_msat: None,
+		};
+
+		assert!(should_surface_lightning_payment_without_metadata(
+			TxStatus::Failed,
+			&kind,
+			PaymentDirection::Outbound
+		));
+		assert!(should_surface_lightning_payment_without_metadata(
+			TxStatus::Pending,
+			&kind,
+			PaymentDirection::Outbound
+		));
+		// Inbound failures (expired unpaid invoices) stay hidden.
+		assert!(!should_surface_lightning_payment_without_metadata(
+			TxStatus::Failed,
+			&kind,
+			PaymentDirection::Inbound
+		));
 	}
 }
