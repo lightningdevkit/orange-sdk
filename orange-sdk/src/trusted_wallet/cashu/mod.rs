@@ -730,15 +730,17 @@ impl Cashu {
 									},
 								},
 								None => {
-									debug_assert!(
-										false,
-										"Melt succeeded but no preimage for quote: {quote_id}"
-									);
-									log_error!(
+									// Expected for same-mint payments: when the melt's
+									// bolt11 destination is a mint quote on this same
+									// mint, cdk-mintd settles internally — no Lightning
+									// payment occurs, so there is no preimage to return.
+									// The success path below already tolerates None
+									// (hash falls back to the invoice payment_hash).
+									log_info!(
 										logger,
-										"Melt succeeded but no preimage for quote: {quote_id}"
+										"Melt for quote {quote_id} settled without a preimage (internal/same-mint settlement)"
 									);
-									None // Placeholder, should not happen
+									None
 								},
 							};
 
