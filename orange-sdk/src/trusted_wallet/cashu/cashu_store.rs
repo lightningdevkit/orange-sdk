@@ -35,6 +35,8 @@ const MINT_QUOTES_KEY: &str = "mint_quotes";
 const MELT_QUOTES_KEY: &str = "melt_quotes";
 const KEYS_KEY: &str = "keys";
 const PROOFS_KEY: &str = "proofs";
+const PROOFS_BLOB_KEY: &str = "proof_set";
+const PROOFS_SCHEMA_VERSION: u8 = 1;
 const KEYSET_COUNTERS_KEY: &str = "keyset_counters";
 const TRANSACTIONS_KEY: &str = "transactions";
 const KEYSETS_TABLE_KEY: &str = "keysets_table";
@@ -42,6 +44,18 @@ const KEYSET_U32_MAPPING_KEY: &str = "keyset_u32_mapping";
 const SAGAS_KEY: &str = "sagas";
 const PROOF_RESERVATIONS_KEY: &str = "proof_reservations";
 const HAS_RECOVERED_KEY: &str = "has_recovered";
+
+#[derive(serde::Deserialize, serde::Serialize)]
+struct ProofsBlob {
+	schema_version: u8,
+	proofs: Vec<ProofInfo>,
+}
+
+#[derive(serde::Serialize)]
+struct ProofsBlobRef<'a> {
+	schema_version: u8,
+	proofs: &'a [ProofInfo],
+}
 
 /// Error type for database operations
 #[derive(Debug)]
@@ -116,6 +130,9 @@ impl From<DatabaseError> for cdk::cdk_database::Error {
 pub struct CashuKvDatabase {
 	store: Arc<dyn DynStore>,
 	keyset_counter_lock: Mutex<()>,
+	// This only serializes writers in this process. The whole-snapshot storage
+	// format requires a single active wallet instance for a given store.
+	proofs_mutation_lock: Mutex<()>,
 	// In-memory caches for frequently accessed data
 	mints_cache: Arc<RwLock<HashMap<MintUrl, Option<MintInfo>>>>,
 	proofs_cache: Arc<RwLock<Vec<ProofInfo>>>,
@@ -126,6 +143,7 @@ impl Debug for CashuKvDatabase {
 		f.debug_struct("CashuKvDatabase")
 			.field("store", &"<KVStore>")
 			.field("keyset_counter_lock", &self.keyset_counter_lock)
+			.field("proofs_mutation_lock", &self.proofs_mutation_lock)
 			.field("mints_cache", &self.mints_cache)
 			.field("proofs_cache", &self.proofs_cache)
 			.finish()
@@ -150,6 +168,7 @@ impl CashuKvDatabase {
 		let database = Self {
 			store,
 			keyset_counter_lock: Mutex::new(()),
+			proofs_mutation_lock: Mutex::new(()),
 			mints_cache: Arc::new(RwLock::new(HashMap::new())),
 			proofs_cache: Arc::new(RwLock::new(Vec::new())),
 		};
@@ -167,11 +186,11 @@ impl CashuKvDatabase {
 			*cache = mints;
 		}
 
-		// Load proofs cache
-		if let Ok(proofs) = self.load_proofs_from_store().await {
-			let mut cache = self.proofs_cache.write().unwrap();
-			*cache = proofs;
-		}
+		// Proof errors must not be hidden: presenting an empty cache for an unreadable
+		// proof set could make the wallet report an incorrect balance.
+		let proofs = self.load_proofs_from_store().await?;
+		let mut cache = self.proofs_cache.write().unwrap();
+		*cache = proofs;
 
 		Ok(())
 	}
@@ -203,25 +222,48 @@ impl CashuKvDatabase {
 	}
 
 	async fn load_proofs_from_store(&self) -> Result<Vec<ProofInfo>, DatabaseError> {
-		let keys = KVStore::list(self.store.as_ref(), CASHU_PRIMARY_KEY, PROOFS_KEY)
-			.await
-			.map_err(DatabaseError::Io)?;
+		let data = match KVStore::read(
+			self.store.as_ref(),
+			CASHU_PRIMARY_KEY,
+			PROOFS_KEY,
+			PROOFS_BLOB_KEY,
+		)
+		.await
+		{
+			Ok(data) if data.is_empty() => return Ok(Vec::new()),
+			Ok(data) => data,
+			Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+			Err(e) => return Err(DatabaseError::Io(e)),
+		};
 
-		let mut proofs = Vec::with_capacity(keys.len());
-		for key in keys {
-			let data = KVStore::read(self.store.as_ref(), CASHU_PRIMARY_KEY, PROOFS_KEY, &key)
-				.await
-				.map_err(DatabaseError::Io)?;
-
-			if !data.is_empty() {
-				let proof: ProofInfo = serde_json::from_slice(&data)
-					.map_err(|e| DatabaseError::Serialization(e.to_string()))?;
-
-				proofs.push(proof);
-			}
+		let blob: ProofsBlob = serde_json::from_slice(&data)
+			.map_err(|e| DatabaseError::Serialization(e.to_string()))?;
+		if blob.schema_version != PROOFS_SCHEMA_VERSION {
+			return Err(DatabaseError::InvalidFormat);
 		}
+		Self::ensure_unique_proof_ys(&blob.proofs)?;
 
-		Ok(proofs)
+		Ok(blob.proofs)
+	}
+
+	async fn persist_proofs(&self, proofs: &[ProofInfo]) -> Result<(), DatabaseError> {
+		Self::ensure_unique_proof_ys(proofs)?;
+		let blob = ProofsBlobRef { schema_version: PROOFS_SCHEMA_VERSION, proofs };
+		let data =
+			serde_json::to_vec(&blob).map_err(|e| DatabaseError::Serialization(e.to_string()))?;
+
+		KVStore::write(self.store.as_ref(), CASHU_PRIMARY_KEY, PROOFS_KEY, PROOFS_BLOB_KEY, data)
+			.await
+			.map_err(DatabaseError::Io)
+	}
+
+	fn ensure_unique_proof_ys(proofs: &[ProofInfo]) -> Result<(), DatabaseError> {
+		let mut ys = HashSet::with_capacity(proofs.len());
+		if proofs.iter().all(|proof| ys.insert(proof.y)) {
+			Ok(())
+		} else {
+			Err(DatabaseError::Duplicate)
+		}
 	}
 
 	async fn load_mint_info(&self, mint_url: &MintUrl) -> Result<Option<MintInfo>, DatabaseError> {
@@ -252,11 +294,6 @@ impl CashuKvDatabase {
 			.map_err(DatabaseError::Io)
 	}
 
-	fn generate_proof_key(proof: &ProofInfo) -> String {
-		// Generate a unique key for the proof based on the Y coordinate
-		format!("proof_{}", hex::encode(proof.y.serialize()))
-	}
-
 	fn update_proofs_cache(
 		cache: &mut Vec<ProofInfo>, added: Vec<ProofInfo>, removed_ys: Vec<PublicKey>,
 	) {
@@ -271,8 +308,8 @@ impl CashuKvDatabase {
 
 		let removed_ys: HashSet<_> = removed_ys.into_iter().collect();
 
-		// Match the KV store's proof_<Y> uniqueness by replacing cached entries with
-		// the same Y before appending the updated proof data.
+		// Keep one proof per Y by replacing cached entries with the same Y before
+		// appending the updated proof data.
 		cache.retain(|proof| !added_ys.contains(&proof.y));
 		cache.extend(added_deduped);
 
@@ -736,30 +773,18 @@ impl WalletDatabase<cdk::cdk_database::Error> for CashuKvDatabase {
 	async fn update_proofs(
 		&self, added: Vec<ProofInfo>, removed_ys: Vec<PublicKey>,
 	) -> Result<(), cdk::cdk_database::Error> {
-		// Add new proofs
-		for proof in &added {
-			let key = Self::generate_proof_key(proof);
-			let data = serde_json::to_vec(proof)
-				.map_err(|e| DatabaseError::Serialization(e.to_string()))?;
+		let _guard = self.proofs_mutation_lock.lock().await;
+		let (updated_proofs, changed) = {
+			let committed_proofs = self.proofs_cache.read().unwrap();
+			let mut updated_proofs = committed_proofs.clone();
+			Self::update_proofs_cache(&mut updated_proofs, added, removed_ys);
+			let changed = updated_proofs != *committed_proofs;
+			(updated_proofs, changed)
+		};
 
-			KVStore::write(self.store.as_ref(), CASHU_PRIMARY_KEY, PROOFS_KEY, &key, data)
-				.await
-				.map_err(DatabaseError::Io)?;
-		}
-
-		// Remove proofs by Y values
-		for y in &removed_ys {
-			let key = format!("proof_{}", hex::encode(y.serialize()));
-
-			KVStore::remove(self.store.as_ref(), CASHU_PRIMARY_KEY, PROOFS_KEY, &key, false)
-				.await
-				.map_err(DatabaseError::Io)?;
-		}
-
-		// Update cache
-		{
-			let mut cache = self.proofs_cache.write().unwrap();
-			Self::update_proofs_cache(&mut cache, added, removed_ys);
+		if changed {
+			self.persist_proofs(&updated_proofs).await?;
+			*self.proofs_cache.write().unwrap() = updated_proofs;
 		}
 
 		Ok(())
@@ -808,45 +833,20 @@ impl WalletDatabase<cdk::cdk_database::Error> for CashuKvDatabase {
 	async fn update_proofs_state(
 		&self, ys: Vec<PublicKey>, state: State,
 	) -> Result<(), cdk::cdk_database::Error> {
-		// Update proofs in storage and cache
-		for y in &ys {
-			let key = format!("proof_{}", hex::encode(y.serialize()));
-
-			// Read existing proof
-			match KVStore::read(self.store.as_ref(), CASHU_PRIMARY_KEY, PROOFS_KEY, &key).await {
-				Ok(data) if !data.is_empty() => {
-					let mut proof: ProofInfo = serde_json::from_slice(&data)
-						.map_err(|e| DatabaseError::Serialization(e.to_string()))?;
-
-					// Update state
-					proof.state = state;
-
-					// Write back
-					let updated_data = serde_json::to_vec(&proof)
-						.map_err(|e| DatabaseError::Serialization(e.to_string()))?;
-
-					KVStore::write(
-						self.store.as_ref(),
-						CASHU_PRIMARY_KEY,
-						PROOFS_KEY,
-						&key,
-						updated_data,
-					)
-					.await
-					.map_err(DatabaseError::Io)?;
-				},
-				_ => continue, // Proof not found, skip
+		let _guard = self.proofs_mutation_lock.lock().await;
+		let ys: HashSet<_> = ys.into_iter().collect();
+		let mut updated_proofs = self.proofs_cache.read().unwrap().clone();
+		let mut changed = false;
+		for proof in &mut updated_proofs {
+			if ys.contains(&proof.y) && proof.state != state {
+				proof.state = state;
+				changed = true;
 			}
 		}
 
-		// Update cache
-		{
-			let mut cache = self.proofs_cache.write().unwrap();
-			for proof in cache.iter_mut() {
-				if ys.contains(&proof.y) {
-					proof.state = state;
-				}
-			}
+		if changed {
+			self.persist_proofs(&updated_proofs).await?;
+			*self.proofs_cache.write().unwrap() = updated_proofs;
 		}
 
 		Ok(())
@@ -1287,6 +1287,77 @@ mod tests {
 	use cdk::Amount;
 	use cdk::nuts::Proof;
 	use cdk::secret::Secret;
+	use std::future::ready;
+	use std::sync::Mutex as StdMutex;
+	use std::sync::atomic::{AtomicBool, Ordering};
+
+	#[derive(Default)]
+	struct ProofTestStore {
+		proof_blob: Arc<StdMutex<Option<Vec<u8>>>>,
+		fail_next_proof_write: Arc<AtomicBool>,
+	}
+
+	impl ProofTestStore {
+		fn is_proof_blob(primary: &str, secondary: &str, key: &str) -> bool {
+			primary == CASHU_PRIMARY_KEY && secondary == PROOFS_KEY && key == PROOFS_BLOB_KEY
+		}
+
+		fn set_proof_blob(&self, blob: &ProofsBlob) {
+			*self.proof_blob.lock().unwrap() = Some(serde_json::to_vec(blob).unwrap());
+		}
+
+		fn set_raw_proof_blob(&self, blob: Vec<u8>) {
+			*self.proof_blob.lock().unwrap() = Some(blob);
+		}
+
+		fn fail_next_proof_write(&self) {
+			self.fail_next_proof_write.store(true, Ordering::SeqCst);
+		}
+	}
+
+	impl KVStore for ProofTestStore {
+		fn read(
+			&self, primary_namespace: &str, secondary_namespace: &str, key: &str,
+		) -> impl std::future::Future<Output = Result<Vec<u8>, io::Error>> + Send + 'static {
+			let blob = if Self::is_proof_blob(primary_namespace, secondary_namespace, key) {
+				self.proof_blob.lock().unwrap().clone()
+			} else {
+				None
+			};
+			ready(blob.ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "key not found")))
+		}
+
+		fn write(
+			&self, primary_namespace: &str, secondary_namespace: &str, key: &str, buf: Vec<u8>,
+		) -> impl std::future::Future<Output = Result<(), io::Error>> + Send + 'static {
+			let is_proof_blob = Self::is_proof_blob(primary_namespace, secondary_namespace, key);
+			assert!(is_proof_blob, "unexpected non-proof write");
+
+			let proof_blob = Arc::clone(&self.proof_blob);
+			let fail_next_proof_write = Arc::clone(&self.fail_next_proof_write);
+			async move {
+				// Make concurrent database updates overlap if they are not correctly locked.
+				tokio::task::yield_now().await;
+				if fail_next_proof_write.swap(false, Ordering::SeqCst) {
+					return Err(io::Error::new(io::ErrorKind::Other, "injected write failure"));
+				}
+				*proof_blob.lock().unwrap() = Some(buf);
+				Ok(())
+			}
+		}
+
+		fn remove(
+			&self, _primary_namespace: &str, _secondary_namespace: &str, _key: &str, _lazy: bool,
+		) -> impl std::future::Future<Output = Result<(), io::Error>> + Send + 'static {
+			ready(Ok(()))
+		}
+
+		fn list(
+			&self, _primary_namespace: &str, _secondary_namespace: &str,
+		) -> impl std::future::Future<Output = Result<Vec<String>, io::Error>> + Send + 'static {
+			ready(Ok(Vec::new()))
+		}
+	}
 
 	fn proof_info(secret: &str, amount: u64) -> ProofInfo {
 		let proof = Proof::new(
@@ -1306,6 +1377,10 @@ mod tests {
 			CurrencyUnit::Sat,
 		)
 		.unwrap()
+	}
+
+	async fn all_proofs(database: &CashuKvDatabase) -> Vec<ProofInfo> {
+		database.get_proofs(None, None, None, None).await.unwrap()
 	}
 
 	#[test]
@@ -1344,5 +1419,150 @@ mod tests {
 		CashuKvDatabase::update_proofs_cache(&mut cache, vec![proof.clone()], vec![proof.y]);
 
 		assert!(cache.is_empty());
+	}
+
+	#[tokio::test]
+	async fn concurrent_proof_updates_do_not_lose_changes() {
+		let store = Arc::new(ProofTestStore::default());
+		let database = Arc::new(CashuKvDatabase::new(store.clone()).await.unwrap());
+		let expected: Vec<_> = (0..40)
+			.map(|index| proof_info(&format!("concurrent proof {index}"), index + 1))
+			.collect();
+
+		let mut tasks = Vec::with_capacity(expected.len());
+		for proof in expected.clone() {
+			let database = Arc::clone(&database);
+			tasks.push(tokio::spawn(async move {
+				database.update_proofs(vec![proof], vec![]).await.unwrap();
+			}));
+		}
+		for task in tasks {
+			task.await.unwrap();
+		}
+
+		let committed = all_proofs(&database).await;
+		assert_eq!(committed.len(), expected.len());
+		assert!(expected.iter().all(|proof| committed.contains(proof)));
+
+		let restarted = CashuKvDatabase::new(store).await.unwrap();
+		let reloaded = all_proofs(&restarted).await;
+		assert_eq!(reloaded.len(), expected.len());
+		assert!(expected.iter().all(|proof| reloaded.contains(proof)));
+	}
+
+	#[tokio::test]
+	async fn proof_state_updates_persist_the_committed_snapshot() {
+		let store = Arc::new(ProofTestStore::default());
+		let database = CashuKvDatabase::new(store.clone()).await.unwrap();
+		let updated = proof_info("state updated proof", 1);
+		let unchanged = proof_info("state unchanged proof", 2);
+		database.update_proofs(vec![updated.clone(), unchanged.clone()], vec![]).await.unwrap();
+
+		database.update_proofs_state(vec![updated.y], State::Reserved).await.unwrap();
+
+		let proofs = all_proofs(&database).await;
+		assert_eq!(
+			proofs.iter().find(|proof| proof.y == updated.y).unwrap().state,
+			State::Reserved
+		);
+		assert_eq!(
+			proofs.iter().find(|proof| proof.y == unchanged.y).unwrap().state,
+			State::Unspent
+		);
+		let restarted = CashuKvDatabase::new(store).await.unwrap();
+		assert_eq!(all_proofs(&restarted).await, proofs);
+	}
+
+	#[tokio::test]
+	async fn failed_persistence_leaves_committed_cache_unchanged() {
+		let store = Arc::new(ProofTestStore::default());
+		let database = CashuKvDatabase::new(store.clone()).await.unwrap();
+		let committed = proof_info("committed proof", 1);
+		let rejected = proof_info("rejected proof", 2);
+		database.update_proofs(vec![committed.clone()], vec![]).await.unwrap();
+		store.fail_next_proof_write();
+
+		let result = database.update_proofs(vec![rejected], vec![committed.y]).await;
+
+		assert!(result.is_err());
+		assert_eq!(all_proofs(&database).await, vec![committed.clone()]);
+
+		store.fail_next_proof_write();
+		let result = database.update_proofs_state(vec![committed.y], State::Reserved).await;
+		assert!(result.is_err());
+		assert_eq!(all_proofs(&database).await, vec![committed.clone()]);
+
+		let restarted = CashuKvDatabase::new(store).await.unwrap();
+		assert_eq!(all_proofs(&restarted).await, vec![committed]);
+	}
+
+	#[tokio::test]
+	async fn empty_proof_blob_is_treated_as_missing() {
+		let store = Arc::new(ProofTestStore::default());
+		store.set_raw_proof_blob(Vec::new());
+
+		let database = CashuKvDatabase::new(store).await.unwrap();
+
+		assert!(all_proofs(&database).await.is_empty());
+	}
+
+	#[tokio::test]
+	async fn duplicate_added_proof_y_uses_the_last_proof() {
+		let store = Arc::new(ProofTestStore::default());
+		let database = CashuKvDatabase::new(store.clone()).await.unwrap();
+		let original = proof_info("duplicate persisted proof", 1);
+		let replacement = proof_info("duplicate persisted proof", 2);
+
+		database.update_proofs(vec![original, replacement.clone()], vec![]).await.unwrap();
+
+		assert_eq!(all_proofs(&database).await, vec![replacement.clone()]);
+		let restarted = CashuKvDatabase::new(store).await.unwrap();
+		assert_eq!(all_proofs(&restarted).await, vec![replacement]);
+	}
+
+	#[tokio::test]
+	async fn duplicate_proof_y_in_stored_blob_is_rejected() {
+		let store = Arc::new(ProofTestStore::default());
+		let original = proof_info("invalid duplicate proof", 1);
+		let duplicate = proof_info("invalid duplicate proof", 2);
+		store.set_proof_blob(&ProofsBlob {
+			schema_version: PROOFS_SCHEMA_VERSION,
+			proofs: vec![original, duplicate],
+		});
+
+		let result = CashuKvDatabase::new(store).await;
+
+		assert!(matches!(result, Err(DatabaseError::Duplicate)));
+	}
+
+	#[tokio::test]
+	async fn unsupported_proof_blob_schema_is_rejected() {
+		let store = Arc::new(ProofTestStore::default());
+		store.set_proof_blob(&ProofsBlob { schema_version: 2, proofs: vec![] });
+
+		let result = CashuKvDatabase::new(store).await;
+
+		assert!(matches!(result, Err(DatabaseError::InvalidFormat)));
+	}
+
+	#[test]
+	fn realistic_large_proof_set_blob_size() {
+		const PROOF_COUNT: usize = 1_500;
+		let proofs: Vec<_> = (0..PROOF_COUNT)
+			.map(|index| {
+				let secret = format!("{index:064x}");
+				proof_info(&secret, 1 << (index % 16))
+			})
+			.collect();
+		let serialized =
+			serde_json::to_vec(&ProofsBlob { schema_version: PROOFS_SCHEMA_VERSION, proofs })
+				.unwrap();
+
+		eprintln!(
+			"serialized {PROOF_COUNT}-proof snapshot: {} bytes ({:.1} bytes/proof)",
+			serialized.len(),
+			serialized.len() as f64 / PROOF_COUNT as f64
+		);
+		assert!(serialized.len() < 1024 * 1024);
 	}
 }

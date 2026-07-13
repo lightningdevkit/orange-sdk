@@ -218,6 +218,10 @@ pub enum VssAuth {
 /// failures are unrecoverable, i.e., if they remain unresolved after internal
 /// retries are exhausted.
 ///
+/// A VSS store must only be used by one active wallet instance at a time. Cashu
+/// proof mutations are serialized within one process, but separate instances can
+/// overwrite each other's proof snapshots.
+///
 /// [Versioned Storage Service (VSS)]: https://github.com/lightningdevkit/vss-server/blob/main/README.md
 #[derive(Debug, Clone)]
 pub struct VssConfig {
@@ -1030,7 +1034,7 @@ impl Wallet {
 						payment_type: (&payment).into(),
 						time_since_epoch: tx_metadata.time,
 					}),
-					TxType::MppPayment { surface_id, total_amount_msat, ty: _, .. } => {
+					TxType::MppPayment { surface_id, total_amount_msat, .. } => {
 						let entry = mpp_payments.entry(*surface_id).or_default();
 						entry.accumulate(
 							MppLegKind::Lightning,
