@@ -34,7 +34,7 @@ struct Cli {
 	/// npub.cash URL for lightning address support (requires --cashu)
 	#[arg(long, requires = "cashu")]
 	npubcash_url: Option<String>,
-	/// VSS server URL (e.g. http://127.0.0.1:8080/vss). When set, VSS replaces
+	/// VSS server URL (e.g. http://127.0.0.1:6754/vss). When set, VSS replaces
 	/// local SQLite for all wallet persistence.
 	#[arg(long)]
 	vss_url: Option<String>,
@@ -298,6 +298,10 @@ impl WalletState {
 
 #[tokio::main(flavor = "multi_thread")]
 async fn main() -> Result<()> {
+	rustls::crypto::ring::default_provider()
+		.install_default()
+		.expect("Rustls crypto provider already installed");
+
 	let cli = Cli::parse();
 
 	println!("{}", "🟠 Orange CLI Wallet".bright_yellow().bold());

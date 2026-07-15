@@ -49,3 +49,4 @@ pin-project-lite = { version = "0.2", default-features = false, optional = true 
 
 [dev-dependencies]
 test-log = "0.2.18"
+rustls = { version = "0.23", default-features = false, features = ["ring"] }

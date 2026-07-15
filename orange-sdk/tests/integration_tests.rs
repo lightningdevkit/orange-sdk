@@ -11,6 +11,8 @@ use ldk_node::payment::{ConfirmationStatus, PaymentDirection, PaymentStatus};
 use log::info;
 use orange_sdk::{Event, PaymentInfo, PaymentType, TxStatus, WalletError};
 use std::sync::Arc;
+#[cfg(feature = "_cashu-tests")]
+use std::time::Instant;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 mod test_utils;
@@ -22,6 +24,122 @@ async fn test_node_start() {
 		let bal = params.wallet.get_balance().await.unwrap();
 		assert_eq!(bal.available_balance(), Amount::ZERO);
 		assert_eq!(bal.pending_balance, Amount::ZERO);
+	})
+	.await;
+}
+
+#[cfg(feature = "_cashu-tests")]
+#[tokio::test(flavor = "multi_thread")]
+#[test_log::test]
+#[ignore = "manual populated Cashu wallet cold-start reproduction"]
+async fn test_cashu_populated_wallet_cold_start() {
+	test_utils::run_test(|params| async move {
+		const DEFAULT_RECEIVE_COUNT: usize = 10;
+		const RECEIVE_AMOUNT_SATS: u64 = 65_535;
+		const RECEIVE_TIMEOUT: Duration = Duration::from_secs(120);
+
+		let receive_count = std::env::var("ORANGE_TEST_CASHU_RECEIVES")
+			.ok()
+			.map(|value| {
+				value
+					.parse::<usize>()
+					.expect("ORANGE_TEST_CASHU_RECEIVES must be a positive integer")
+			})
+			.unwrap_or(DEFAULT_RECEIVE_COUNT);
+		assert!(receive_count > 0, "ORANGE_TEST_CASHU_RECEIVES must be positive");
+
+		let wallet = Arc::clone(&params.wallet);
+		let payer = Arc::clone(&params.third_party);
+		let receive_amount = Amount::from_sats(RECEIVE_AMOUNT_SATS).unwrap();
+		assert!(receive_amount < wallet.get_tunables().trusted_balance_limit);
+
+		// Keep all minted proofs in Cashu so the restart reloads a populated proof set.
+		wallet.set_rebalance_enabled(false).await;
+		let mut expected_trusted_balance = wallet.get_balance().await.unwrap().trusted;
+		let mut quote_durations = Vec::with_capacity(receive_count);
+		let mut settle_durations = Vec::with_capacity(receive_count);
+
+		for receive_index in 0..receive_count {
+			let quote_started = Instant::now();
+			let uri = wallet.get_single_use_receive_uri(Some(receive_amount)).await.unwrap();
+			quote_durations.push(quote_started.elapsed());
+			assert!(uri.from_trusted);
+
+			let settle_started = Instant::now();
+			let payment_id = payer.bolt11_payment().send(&uri.invoice, None).unwrap();
+			let payer_for_wait = Arc::clone(&payer);
+			test_utils::wait_for_condition_with_timeout(
+				"Cashu repro payer payment success",
+				RECEIVE_TIMEOUT,
+				|| {
+					let succeeded = payer_for_wait
+						.payment(&payment_id)
+						.is_some_and(|payment| payment.status == PaymentStatus::Succeeded);
+					async move { succeeded }
+				},
+			)
+			.await;
+
+			expected_trusted_balance = expected_trusted_balance.saturating_add(receive_amount);
+			test_utils::wait_for_condition_with_timeout(
+				"Cashu repro trusted balance update",
+				RECEIVE_TIMEOUT,
+				|| async {
+					wallet.get_balance().await.unwrap().trusted >= expected_trusted_balance
+				},
+			)
+			.await;
+			settle_durations.push(settle_started.elapsed());
+
+			let event = wait_next_event(&wallet).await;
+			assert!(matches!(event, Event::PaymentReceived { .. }));
+			println!(
+				"cashu_repro_receive index={} quote_ms={:.2} settle_ms={:.2}",
+				receive_index + 1,
+				quote_durations.last().unwrap().as_secs_f64() * 1_000.0,
+				settle_durations.last().unwrap().as_secs_f64() * 1_000.0,
+			);
+		}
+
+		let balance_before_restart = wallet.get_balance().await.unwrap();
+		let transaction_count_before_restart = wallet.list_transactions().await.unwrap().len();
+		let wallet_config = params.wallet_config.clone();
+		params.stop_wallet_for_restart().await;
+
+		let startup_started = Instant::now();
+		let restarted_wallet = Arc::new(orange_sdk::Wallet::new(wallet_config).await.unwrap());
+		let startup_duration = startup_started.elapsed();
+		let balance_read_started = Instant::now();
+		let balance_after_restart = restarted_wallet.get_balance().await.unwrap();
+		let balance_read_duration = balance_read_started.elapsed();
+		let transaction_count_after_restart =
+			restarted_wallet.list_transactions().await.unwrap().len();
+
+		assert_eq!(balance_after_restart.trusted, balance_before_restart.trusted);
+		assert_eq!(transaction_count_after_restart, transaction_count_before_restart);
+
+		let percentile_ms = |samples: &[Duration], percentile: usize| {
+			let mut sorted = samples.to_vec();
+			sorted.sort_unstable();
+			let index =
+				((sorted.len() * percentile).div_ceil(100)).saturating_sub(1).min(sorted.len() - 1);
+			sorted[index].as_secs_f64() * 1_000.0
+		};
+		println!(
+			"cashu_repro_summary receives={receive_count} amount_sats={RECEIVE_AMOUNT_SATS} \
+			 quote_median_ms={:.2} quote_p95_ms={:.2} settle_median_ms={:.2} \
+			 settle_p95_ms={:.2} cold_start_ms={:.2} balance_read_ms={:.2} \
+			 trusted_balance_sats={}",
+			percentile_ms(&quote_durations, 50),
+			percentile_ms(&quote_durations, 95),
+			percentile_ms(&settle_durations, 50),
+			percentile_ms(&settle_durations, 95),
+			startup_duration.as_secs_f64() * 1_000.0,
+			balance_read_duration.as_secs_f64() * 1_000.0,
+			balance_after_restart.trusted.sats().unwrap(),
+		);
+
+		restarted_wallet.stop().await;
 	})
 	.await;
 }

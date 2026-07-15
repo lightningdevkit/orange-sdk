@@ -19,7 +19,8 @@ use orange_sdk::bitcoin::Txid;
 #[cfg(not(feature = "_cashu-tests"))]
 use orange_sdk::trusted_wallet::dummy::DummyTrustedWalletExtraConfig;
 use orange_sdk::{
-	ChainSource, ExtraConfig, LoggerType, Seed, StorageConfig, Tunables, Wallet, WalletConfig,
+	ChainSource, ExtraConfig, LoggerType, Seed, StorageConfig, Tunables, VssAuth, VssConfig,
+	Wallet, WalletConfig,
 };
 use rand::RngCore;
 use std::env::temp_dir;
@@ -29,11 +30,51 @@ use std::net::SocketAddr;
 #[cfg(feature = "_cashu-tests")]
 use std::str::FromStr;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use uuid::Uuid;
 
+const TEST_VSS_URL_ENV: &str = "ORANGE_TEST_VSS_URL";
+const TEST_TIMEOUT_SECS_ENV: &str = "ORANGE_TEST_TIMEOUT_SECS";
+
+fn test_body_timeout() -> Duration {
+	match std::env::var(TEST_TIMEOUT_SECS_ENV) {
+		Ok(value) => Duration::from_secs(
+			value
+				.parse()
+				.unwrap_or_else(|_| panic!("{TEST_TIMEOUT_SECS_ENV} must be a positive integer")),
+		),
+		Err(std::env::VarError::NotPresent) if std::env::var("CI").is_ok() => {
+			Duration::from_secs(15 * 60)
+		},
+		Err(std::env::VarError::NotPresent) => Duration::from_secs(5 * 60),
+		Err(std::env::VarError::NotUnicode(_)) => {
+			panic!("{TEST_TIMEOUT_SECS_ENV} must contain valid Unicode")
+		},
+	}
+}
+
+fn test_storage_config(test_id: Uuid, sqlite_path: String) -> StorageConfig {
+	match std::env::var(TEST_VSS_URL_ENV) {
+		Ok(vss_url) if !vss_url.trim().is_empty() => {
+			let _ = rustls::crypto::ring::default_provider().install_default();
+			log::info!("using VSS storage for test {test_id}");
+			StorageConfig::Vss(VssConfig {
+				vss_url,
+				store_id: format!("orange-test-{test_id}"),
+				headers: VssAuth::SigsAuth,
+			})
+		},
+		Ok(_) => panic!("{TEST_VSS_URL_ENV} must not be empty"),
+		Err(std::env::VarError::NotPresent) => StorageConfig::LocalSQLite(sqlite_path),
+		Err(std::env::VarError::NotUnicode(_)) => {
+			panic!("{TEST_VSS_URL_ENV} must contain valid Unicode")
+		},
+	}
+}
+
 /// Waits for an async condition to be true, polling with exponential backoff until a timeout.
-pub async fn wait_for_condition<F, Fut>(condition_name: &str, mut condition: F)
+pub async fn wait_for_condition<F, Fut>(condition_name: &str, condition: F)
 where
 	F: FnMut() -> Fut,
 	Fut: Future<Output = bool>,
@@ -43,6 +84,16 @@ where
 	} else {
 		Duration::from_secs(20)
 	};
+	wait_for_condition_with_timeout(condition_name, timeout, condition).await;
+}
+
+/// Waits for an async condition using an explicit timeout.
+pub async fn wait_for_condition_with_timeout<F, Fut>(
+	condition_name: &str, timeout: Duration, mut condition: F,
+) where
+	F: FnMut() -> Fut,
+	Fut: Future<Output = bool>,
+{
 	let start = tokio::time::Instant::now();
 	let mut delay = Duration::from_millis(50);
 	log::info!("waiting for condition: {condition_name}");
@@ -260,17 +311,20 @@ async fn fund_two_nodes(a: &Node, b: &Node, bitcoind: &Bitcoind, electrsd: &Elec
 #[derive(Clone)]
 pub struct TestParams {
 	pub wallet: Arc<orange_sdk::Wallet>,
+	#[cfg(feature = "_cashu-tests")]
+	pub wallet_config: WalletConfig,
 	pub lsp: Arc<Node>,
 	pub third_party: Arc<Node>,
 	pub bitcoind: Arc<Bitcoind>,
 	pub electrsd: Arc<ElectrsD>,
 	#[cfg(feature = "_cashu-tests")]
 	pub _mint: Arc<cdk::Mint>,
+	wallet_stopped: Arc<AtomicBool>,
 }
 
 impl TestParams {
 	async fn stop(&self) {
-		stop_wallet("wallet", Arc::clone(&self.wallet)).await;
+		self.stop_primary_wallet().await;
 
 		#[cfg(feature = "_cashu-tests")]
 		let _ = self._mint.stop().await;
@@ -279,6 +333,17 @@ impl TestParams {
 			stop_ldk_node("lsp", Arc::clone(&self.lsp)),
 			stop_ldk_node("third_party", Arc::clone(&self.third_party)),
 		);
+	}
+
+	async fn stop_primary_wallet(&self) {
+		if !self.wallet_stopped.swap(true, Ordering::AcqRel) {
+			stop_wallet("wallet", Arc::clone(&self.wallet)).await;
+		}
+	}
+
+	#[cfg(feature = "_cashu-tests")]
+	pub async fn stop_wallet_for_restart(&self) {
+		self.stop_primary_wallet().await;
 	}
 }
 
@@ -332,11 +397,7 @@ where
 	F: FnOnce(TestParams) -> Fut + Send + 'static,
 	Fut: Future<Output = ()> + Send + 'static,
 {
-	let lifecycle_timeout = if std::env::var("CI").is_ok() {
-		Duration::from_secs(20 * 60)
-	} else {
-		Duration::from_secs(10 * 60)
-	};
+	let lifecycle_timeout = test_body_timeout() + Duration::from_secs(5 * 60);
 
 	log::info!("spawning test lifecycle for {test_name}");
 
@@ -373,11 +434,7 @@ where
 	log::info!("test body starting for {test_name}");
 	println!("=== test start: {test_name} ===");
 
-	let test_timeout = if std::env::var("CI").is_ok() {
-		Duration::from_secs(15 * 60)
-	} else {
-		Duration::from_secs(5 * 60)
-	};
+	let test_timeout = test_body_timeout();
 
 	let mut test_task = tokio::spawn({
 		let params = params.clone();
@@ -470,7 +527,7 @@ async fn build_test_nodes() -> TestParams {
 		let esplora_url = format!("http://localhost:{port}");
 
 		let wallet_config = WalletConfig {
-			storage_config: StorageConfig::LocalSQLite(tmp.to_str().unwrap().to_string()),
+			storage_config: test_storage_config(test_id, tmp.to_str().unwrap().to_string()),
 			logger_type: LoggerType::LogFacade,
 			scorer_url: None,
 			rgs_url: None,
@@ -620,7 +677,7 @@ async fn build_test_nodes() -> TestParams {
 
 		let tmp = temp_dir().join(format!("orange-test-{test_id}/wallet"));
 		let wallet_config = WalletConfig {
-			storage_config: StorageConfig::LocalSQLite(tmp.to_str().unwrap().to_string()),
+			storage_config: test_storage_config(test_id, tmp.to_str().unwrap().to_string()),
 			logger_type: LoggerType::LogFacade,
 			scorer_url: None,
 			tunables: Tunables::default(),
@@ -635,16 +692,32 @@ async fn build_test_nodes() -> TestParams {
 				npubcash_url: None,
 			}),
 		};
-		let wallet = Arc::new(Wallet::new(wallet_config).await.unwrap());
+		let wallet = Arc::new(Wallet::new(wallet_config.clone()).await.unwrap());
 
 		log::info!("finished building test nodes for {test_id}");
-		return TestParams { wallet, lsp, third_party, bitcoind, electrsd, _mint: mint };
+		return TestParams {
+			wallet,
+			wallet_config,
+			lsp,
+			third_party,
+			bitcoind,
+			electrsd,
+			_mint: mint,
+			wallet_stopped: Arc::new(AtomicBool::new(false)),
+		};
 	};
 
 	#[cfg(not(feature = "_cashu-tests"))]
 	{
 		log::info!("finished building test nodes for {test_id}");
-		TestParams { wallet, lsp, third_party, bitcoind, electrsd }
+		TestParams {
+			wallet,
+			lsp,
+			third_party,
+			bitcoind,
+			electrsd,
+			wallet_stopped: Arc::new(AtomicBool::new(false)),
+		}
 	}
 }
 

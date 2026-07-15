@@ -62,6 +62,57 @@ Add orange-sdk to your `Cargo.toml`:
 orange-sdk = "0.1"
 ```
 
+### Local VSS development
+
+The example CLI and integration tests can use a local [Versioned Storage Service (VSS)](https://github.com/lightningdevkit/vss-server) instead of SQLite. Docker with Compose support is required.
+
+Start VSS and its PostgreSQL database in one terminal:
+
+```bash
+just vss-server
+```
+
+Then start the VSS-backed CLI in another terminal:
+
+```bash
+just cli-vss
+```
+
+For the Cashu-backed CLI, pass the mint URL to:
+
+```bash
+just cli-cashu-vss <mint-url>
+```
+
+To run the integration tests against VSS instead, keep the server running and use:
+
+```bash
+just test-vss
+```
+
+To exercise the real Cashu wallet with VSS storage, use:
+
+```bash
+just test-cashu-vss
+```
+
+Set `VSS_URL` to run the CLI or tests through a remote HTTPS endpoint:
+
+```bash
+VSS_URL=https://vss.example.ts.net/vss just test-cashu-vss
+```
+
+Cashu tests use four test threads by default to avoid fixture port contention. Override this with `CASHU_TEST_THREADS` when needed.
+
+To populate a Cashu wallet and measure quote creation, settlement, and cold-start restore time:
+
+```bash
+just repro-cashu-cold-start
+VSS_URL=https://vss.example.ts.net/vss just repro-cashu-cold-start-vss
+```
+
+The reproduction creates ten 65,535-sat receives by default. Use `CASHU_REPRO_RECEIVES` to change the population size and `CASHU_REPRO_TIMEOUT_SECS` to extend its 15-minute timeout.
+
 ### Basic Example
 
 ```rust,no_run
