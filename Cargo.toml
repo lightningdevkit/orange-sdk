@@ -33,6 +33,6 @@ panic = "abort"
 bitreq = { path = "vendor/bitreq" }
 
 [patch."https://github.com/lightningdevkit/ldk-node"]
-# Reuse the schema-setup HTTP pool for subsequent VSS operations, avoiding a
-# second connection and TLS handshake during wallet startup.
+# Use the current VSS schema directly, avoiding a legacy schema probe during
+# wallet startup.
 ldk-node = { path = "vendor/ldk-node" }

@@ -21,11 +21,9 @@ use bitcoin::bip32::{ChildNumber, Xpriv};
 use bitcoin::hashes::{sha256, Hash, HashEngine, Hmac, HmacEngine};
 use bitcoin::key::Secp256k1;
 use bitcoin::Network;
-use lightning::impl_writeable_tlv_based_enum;
 use lightning::io::{self, Error, ErrorKind};
 use lightning::sign::{EntropySource as LdkEntropySource, RandomBytes};
 use lightning::util::persist::{KVStore, PageToken, PaginatedKVStore, PaginatedListResponse};
-use lightning::util::ser::{Readable, Writeable};
 use prost::Message;
 use vss_client::client::VssClient;
 use vss_client::error::VssError;
@@ -54,28 +52,10 @@ type CustomRetryPolicy = FilteredRetryPolicy<
 	Box<dyn Fn(&VssError) -> bool + 'static + Send + Sync>,
 >;
 
-#[derive(Debug, PartialEq)]
-enum VssSchemaVersion {
-	// The initial schema version.
-	// This used an empty `aad` and unobfuscated `primary_namespace`/`secondary_namespace`s in the
-	// stored key.
-	V0,
-	// The second deployed schema version.
-	// Here we started to obfuscate the primary and secondary namespaces and the obfuscated `store_key` (`obfuscate(primary_namespace#secondary_namespace)#obfuscate(key)`) is now used as `aad` for encryption, ensuring that the encrypted blobs commit to the key they're stored under.
-	V1,
-}
-
-impl_writeable_tlv_based_enum!(VssSchemaVersion,
-	(0, V0) => {},
-	(1, V1) => {},
-);
-
 const PAGE_SIZE: i32 = 50;
 
 const VSS_HARDENED_CHILD_INDEX: u32 = 877;
 const VSS_SIGS_AUTH_HARDENED_CHILD_INDEX: u32 = 139;
-const VSS_SCHEMA_VERSION_KEY: &str = "vss_schema_version";
-const VSS_HTTP_CLIENT_CAPACITY: usize = 10;
 
 // We set this to a small number of threads that would still allow to make some progress if one
 // would hit a blocking case
@@ -105,49 +85,16 @@ impl VssStore {
 		let (data_encryption_key, obfuscation_master_key) =
 			derive_data_encryption_and_obfuscation_keys(&vss_seed);
 		let key_obfuscator = KeyObfuscator::new(obfuscation_master_key);
-		let setup_key_obfuscator = KeyObfuscator::new(obfuscation_master_key);
 
 		let mut entropy_seed = [0u8; 32];
 		getrandom::fill(&mut entropy_seed).expect("Failed to generate random bytes");
 		let entropy_source = RandomBytes::new(entropy_seed);
-		let setup_entropy_source = RandomBytes::new(entropy_seed);
-
-		let http_client = bitreq::Client::new(VSS_HTTP_CLIENT_CAPACITY);
-		let setup_retry_policy = retry_policy();
-		let setup_client = VssClient::from_client_and_headers(
-			base_url.clone(),
-			http_client.clone(),
-			setup_retry_policy,
-			Arc::clone(&header_provider),
-		);
 
 		let async_retry_policy = retry_policy();
-		let async_client = VssClient::from_client_and_headers(
-			base_url,
-			http_client,
-			async_retry_policy,
-			header_provider,
-		);
-
-		let setup_store_id = store_id.clone();
-		let runtime_handle = internal_runtime.handle().clone();
-		let schema_version = std::thread::spawn(move || {
-			runtime_handle.block_on(async {
-				determine_and_write_schema_version(
-					&setup_client,
-					&setup_store_id,
-					data_encryption_key,
-					&setup_key_obfuscator,
-					&setup_entropy_source,
-				)
-				.await
-			})
-		})
-		.join()
-		.map_err(|_| io::Error::new(io::ErrorKind::Other, "VSS schema setup task panicked"))??;
+		let async_client =
+			VssClient::new_with_headers(base_url, async_retry_policy, header_provider);
 
 		let inner = Arc::new(VssStoreInner::new(
-			schema_version,
 			async_client,
 			store_id,
 			data_encryption_key,
@@ -339,9 +286,7 @@ impl Drop for VssStore {
 }
 
 struct VssStoreInner {
-	schema_version: VssSchemaVersion,
-	// A secondary client that will only be used for async persistence via `KVStore`, to ensure TCP
-	// connections aren't shared between our outer and the internal runtime.
+	// The VSS client is only used for async persistence on the internal runtime.
 	async_client: VssClient<CustomRetryPolicy>,
 	store_id: String,
 	data_encryption_key: [u8; 32],
@@ -354,20 +299,11 @@ struct VssStoreInner {
 
 impl VssStoreInner {
 	pub(crate) fn new(
-		schema_version: VssSchemaVersion, async_client: VssClient<CustomRetryPolicy>,
-		store_id: String, data_encryption_key: [u8; 32], key_obfuscator: KeyObfuscator,
-		entropy_source: RandomBytes,
+		async_client: VssClient<CustomRetryPolicy>, store_id: String,
+		data_encryption_key: [u8; 32], key_obfuscator: KeyObfuscator, entropy_source: RandomBytes,
 	) -> Self {
 		let locks = Mutex::new(HashMap::new());
-		Self {
-			schema_version,
-			async_client,
-			store_id,
-			data_encryption_key,
-			key_obfuscator,
-			entropy_source,
-			locks,
-		}
+		Self { async_client, store_id, data_encryption_key, key_obfuscator, entropy_source, locks }
 	}
 
 	fn get_inner_lock_ref(&self, locking_key: String) -> Arc<tokio::sync::Mutex<u64>> {
@@ -378,45 +314,22 @@ impl VssStoreInner {
 	fn build_obfuscated_key(
 		&self, primary_namespace: &str, secondary_namespace: &str, key: &str,
 	) -> String {
-		if self.schema_version == VssSchemaVersion::V1 {
-			let obfuscated_prefix =
-				self.build_obfuscated_prefix(primary_namespace, secondary_namespace);
-			let obfuscated_key = self.key_obfuscator.obfuscate(key);
-			format!("{}#{}", obfuscated_prefix, obfuscated_key)
-		} else {
-			// Default to V0 schema
-			let obfuscated_key = self.key_obfuscator.obfuscate(key);
-			if primary_namespace.is_empty() {
-				obfuscated_key
-			} else {
-				format!("{}#{}#{}", primary_namespace, secondary_namespace, obfuscated_key)
-			}
-		}
+		let obfuscated_prefix =
+			self.build_obfuscated_prefix(primary_namespace, secondary_namespace);
+		let obfuscated_key = self.key_obfuscator.obfuscate(key);
+		format!("{}#{}", obfuscated_prefix, obfuscated_key)
 	}
 
 	fn build_obfuscated_prefix(
 		&self, primary_namespace: &str, secondary_namespace: &str,
 	) -> String {
-		if self.schema_version == VssSchemaVersion::V1 {
-			let prefix = format!("{}#{}", primary_namespace, secondary_namespace);
-			self.key_obfuscator.obfuscate(&prefix)
-		} else {
-			// Default to V0 schema
-			format!("{}#{}", primary_namespace, secondary_namespace)
-		}
+		let prefix = format!("{}#{}", primary_namespace, secondary_namespace);
+		self.key_obfuscator.obfuscate(&prefix)
 	}
 
 	fn extract_key(&self, unified_key: &str) -> io::Result<String> {
-		let mut parts = if self.schema_version == VssSchemaVersion::V1 {
-			let mut parts = unified_key.splitn(2, '#');
-			let _obfuscated_namespace = parts.next();
-			parts
-		} else {
-			// Default to V0 schema
-			let mut parts = unified_key.splitn(3, '#');
-			let (_primary_namespace, _secondary_namespace) = (parts.next(), parts.next());
-			parts
-		};
+		let mut parts = unified_key.splitn(2, '#');
+		let _obfuscated_namespace = parts.next();
 		match parts.next() {
 			Some(obfuscated_key) => {
 				let actual_key = self.key_obfuscator.deobfuscate(obfuscated_key)?;
@@ -488,9 +401,9 @@ impl VssStoreInner {
 				})?;
 
 		let storable_builder = StorableBuilder::new(VssEntropySource(&self.entropy_source));
-		let aad =
-			if self.schema_version == VssSchemaVersion::V1 { store_key.as_bytes() } else { &[] };
-		let decrypted = storable_builder.deconstruct(storable, &self.data_encryption_key, aad)?.0;
+		let decrypted = storable_builder
+			.deconstruct(storable, &self.data_encryption_key, store_key.as_bytes())?
+			.0;
 		Ok(decrypted)
 	}
 
@@ -509,10 +422,12 @@ impl VssStoreInner {
 		let store_key = self.build_obfuscated_key(&primary_namespace, &secondary_namespace, &key);
 		let vss_version = -1;
 		let storable_builder = StorableBuilder::new(VssEntropySource(&self.entropy_source));
-		let aad =
-			if self.schema_version == VssSchemaVersion::V1 { store_key.as_bytes() } else { &[] };
-		let storable =
-			storable_builder.build(buf.to_vec(), vss_version, &self.data_encryption_key, aad);
+		let storable = storable_builder.build(
+			buf.to_vec(),
+			vss_version,
+			&self.data_encryption_key,
+			store_key.as_bytes(),
+		);
 		let request = PutObjectRequest {
 			store_id: self.store_id.clone(),
 			global_version: None,
@@ -701,118 +616,6 @@ fn retry_policy() -> CustomRetryPolicy {
 					| VssError::VSSVersionMismatchError { .. }
 			)
 		}) as _)
-}
-
-async fn determine_and_write_schema_version(
-	client: &VssClient<CustomRetryPolicy>, store_id: &String, data_encryption_key: [u8; 32],
-	key_obfuscator: &KeyObfuscator, entropy_source: &RandomBytes,
-) -> io::Result<VssSchemaVersion> {
-	// Build the obfuscated `vss_schema_version` key.
-	let obfuscated_prefix = key_obfuscator.obfuscate(&format! {"{}#{}", "", ""});
-	let obfuscated_key = key_obfuscator.obfuscate(VSS_SCHEMA_VERSION_KEY);
-	let store_key = format!("{}#{}", obfuscated_prefix, obfuscated_key);
-
-	// Try to read the stored schema version.
-	let request = GetObjectRequest { store_id: store_id.clone(), key: store_key.clone() };
-	let resp = match client.get_object(&request).await {
-		Ok(resp) => Some(resp),
-		Err(VssError::NoSuchKeyError(..)) => {
-			// The value is not set.
-			None
-		},
-		Err(VssError::VSSVersionMismatchError { version_served, version_expected }) => {
-			let msg = format!(
-				"VSS version mismatch, expected: {version_expected}, got: {version_served:?}"
-			);
-			return Err(Error::new(ErrorKind::Other, msg));
-		},
-		Err(e) => {
-			let msg = format!("Failed to read schema version: {}", e);
-			return Err(Error::new(ErrorKind::Other, msg));
-		},
-	};
-
-	if let Some(resp) = resp {
-		// The schema version was present, so just decrypt the stored data.
-
-		// unwrap safety: resp.value must be always present for a non-erroneous VSS response, otherwise
-		// it is an API-violation which is converted to [`VssError::InternalServerError`] in [`VssClient`]
-		let storable =
-			Storable::decode(&resp.value.expect("VSS response must contain a value").value[..])
-				.map_err(|e| {
-					let msg = format!("Failed to decode schema version: {}", e);
-					Error::new(ErrorKind::Other, msg)
-				})?;
-
-		let storable_builder = StorableBuilder::new(VssEntropySource(entropy_source));
-		// Schema version was added starting with V1, so if set at all, we use the key as `aad`
-		let aad = store_key.as_bytes();
-		let decrypted = storable_builder
-			.deconstruct(storable, &data_encryption_key, aad)
-			.map_err(|e| {
-				let msg = format!("Failed to decode schema version: {}", e);
-				Error::new(ErrorKind::Other, msg)
-			})?
-			.0;
-
-		let schema_version: VssSchemaVersion = Readable::read(&mut &*decrypted).map_err(|e| {
-			let msg = format!("Failed to decode schema version: {}", e);
-			Error::new(ErrorKind::Other, msg)
-		})?;
-		Ok(schema_version)
-	} else {
-		// The schema version wasn't present, this either means we're running for the first time *or* it's V0 pre-migration (predating writing of the schema version).
-
-		// Check if any `bdk_wallet` data was written by listing keys under the respective
-		// (unobfuscated) prefix.
-		const V0_BDK_WALLET_PREFIX: &str = "bdk_wallet#";
-		let request = ListKeyVersionsRequest {
-			store_id: store_id.clone(),
-			key_prefix: Some(V0_BDK_WALLET_PREFIX.to_string()),
-			page_token: None,
-			page_size: None,
-		};
-
-		let response = client.list_key_versions(&request).await.map_err(|e| {
-			let msg = format!("Failed to determine schema version: {}", e);
-			Error::new(ErrorKind::Other, msg)
-		})?;
-
-		let wallet_data_present = !response.key_versions.is_empty();
-		if wallet_data_present {
-			// If the wallet data is present, it means we're not running for the first time.
-			Ok(VssSchemaVersion::V0)
-		} else {
-			// We're running for the first time, write the schema version to save unnecessary IOps
-			// on future startup.
-			let schema_version = VssSchemaVersion::V1;
-			let encoded_version = schema_version.encode();
-
-			let storable_builder = StorableBuilder::new(VssEntropySource(entropy_source));
-			let vss_version = -1;
-			let aad = store_key.as_bytes();
-			let storable =
-				storable_builder.build(encoded_version, vss_version, &data_encryption_key, aad);
-
-			let request = PutObjectRequest {
-				store_id: store_id.clone(),
-				global_version: None,
-				transaction_items: vec![KeyValue {
-					key: store_key,
-					version: vss_version,
-					value: storable.encode_to_vec(),
-				}],
-				delete_items: vec![],
-			};
-
-			client.put_object(&request).await.map_err(|e| {
-				let msg = format!("Failed to write schema version: {}", e);
-				Error::new(ErrorKind::Other, msg)
-			})?;
-
-			Ok(schema_version)
-		}
-	}
 }
 
 /// A thin wrapper bridging LDK's [`RandomBytes`] to the vss-client [`EntropySource`] trait.
