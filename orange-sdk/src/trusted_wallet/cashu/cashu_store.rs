@@ -3,7 +3,7 @@ use std::fmt::Debug;
 use std::str::FromStr;
 use std::sync::{Arc, RwLock};
 
-use crate::dyn_store::DynStore;
+use crate::dyn_store::{DynStore, read_keys_bounded};
 use async_trait::async_trait;
 use cdk::cdk_database::WalletDatabase;
 use cdk::wallet::types::WalletSaga;
@@ -180,15 +180,20 @@ impl CashuKvDatabase {
 	}
 
 	async fn load_caches(&self) -> Result<(), DatabaseError> {
-		// Load mints cache
-		if let Ok(mints) = self.load_mints_from_store().await {
+		// These use independent namespaces and can be restored concurrently. This
+		// lets remote stores pipeline the requests while synchronous stores retain
+		// their existing behavior.
+		let (mints, proofs) =
+			tokio::join!(self.load_mints_from_store(), self.load_proofs_from_store());
+
+		if let Ok(mints) = mints {
 			let mut cache = self.mints_cache.write().unwrap();
 			*cache = mints;
 		}
 
 		// Proof errors must not be hidden: presenting an empty cache for an unreadable
 		// proof set could make the wallet report an incorrect balance.
-		let proofs = self.load_proofs_from_store().await?;
+		let proofs = proofs?;
 		let mut cache = self.proofs_cache.write().unwrap();
 		*cache = proofs;
 
@@ -641,12 +646,12 @@ impl WalletDatabase<cdk::cdk_database::Error> for CashuKvDatabase {
 			.await
 			.map_err(DatabaseError::Io)?;
 
-		let mut quotes = Vec::with_capacity(keys.len());
-		for key in keys {
-			let data = KVStore::read(self.store.as_ref(), CASHU_PRIMARY_KEY, MINT_QUOTES_KEY, &key)
+		let records =
+			read_keys_bounded(Arc::clone(&self.store), CASHU_PRIMARY_KEY, MINT_QUOTES_KEY, keys)
 				.await
 				.map_err(DatabaseError::Io)?;
-
+		let mut quotes = Vec::with_capacity(records.len());
+		for (_, data) in records {
 			if !data.is_empty() {
 				let quote: MintQuote = serde_json::from_slice(&data)
 					.map_err(|e| DatabaseError::Serialization(e.to_string()))?;
