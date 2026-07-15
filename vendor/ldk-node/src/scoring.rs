@@ -1,0 +1,102 @@
+use std::sync::{Arc, Mutex};
+use std::time::SystemTime;
+
+use lightning::routing::scoring::ChannelLiquidities;
+use lightning::util::ser::Readable;
+use lightning::{log_error, log_info, log_trace};
+
+use crate::config::{
+	EXTERNAL_PATHFINDING_SCORES_MAX_SIZE, EXTERNAL_PATHFINDING_SCORES_SYNC_INTERVAL,
+	EXTERNAL_PATHFINDING_SCORES_SYNC_TIMEOUT_SECS,
+};
+use crate::io::utils::write_external_pathfinding_scores_to_cache;
+use crate::logger::LdkLogger;
+use crate::runtime::Runtime;
+use crate::types::DynStore;
+use crate::{update_and_persist_node_metrics, Logger, PersistedNodeMetrics, Scorer};
+
+/// Start a background task that periodically downloads scores via an external url and merges them into the local
+/// pathfinding scores.
+pub fn setup_background_pathfinding_scores_sync(
+	url: String, scorer: Arc<Mutex<crate::types::Scorer>>, node_metrics: Arc<PersistedNodeMetrics>,
+	kv_store: Arc<DynStore>, logger: Arc<Logger>, runtime: Arc<Runtime>,
+	mut stop_receiver: tokio::sync::watch::Receiver<()>,
+) {
+	log_info!(logger, "External scores background syncing enabled from {}", url);
+
+	let logger = Arc::clone(&logger);
+
+	runtime.spawn_background_processor_task(async move {
+		let mut interval = tokio::time::interval(EXTERNAL_PATHFINDING_SCORES_SYNC_INTERVAL);
+		loop {
+			tokio::select! {
+				_ = stop_receiver.changed() => {
+					log_trace!(
+						logger,
+						"Stopping background syncing external scores.",
+					);
+					return;
+				}
+				_ = interval.tick() => {
+					log_trace!(
+						logger,
+						"Background sync of external scores started.",
+					);
+
+					sync_external_scores(logger.as_ref(), scorer.as_ref(), node_metrics.as_ref(), Arc::clone(&kv_store), &url).await;
+				}
+			}
+		}
+	});
+}
+
+async fn sync_external_scores(
+	logger: &Logger, scorer: &Mutex<Scorer>, node_metrics: &PersistedNodeMetrics,
+	kv_store: Arc<DynStore>, url: &String,
+) -> () {
+	let request = bitreq::get(url)
+		.with_timeout(EXTERNAL_PATHFINDING_SCORES_SYNC_TIMEOUT_SECS)
+		.with_max_body_size(Some(EXTERNAL_PATHFINDING_SCORES_MAX_SIZE));
+
+	let response = match request.send_async().await {
+		Ok(resp) => resp,
+		Err(e) => {
+			log_error!(logger, "Failed to retrieve external scores update: {}", e);
+			return;
+		},
+	};
+	if response.status_code != 200 {
+		log_error!(
+			logger,
+			"Failed to retrieve external scores update: HTTP {}",
+			response.status_code
+		);
+		return;
+	}
+	let mut reader = response.as_bytes();
+	match ChannelLiquidities::read(&mut reader) {
+		Ok(liquidities) => {
+			if let Err(e) =
+				write_external_pathfinding_scores_to_cache(&*kv_store, &liquidities, logger).await
+			{
+				log_error!(logger, "Failed to persist external scores to cache: {}", e);
+			}
+
+			let duration_since_epoch = SystemTime::now()
+				.duration_since(SystemTime::UNIX_EPOCH)
+				.expect("system time must be after Unix epoch");
+			scorer.lock().expect("lock").merge(liquidities, duration_since_epoch);
+			update_and_persist_node_metrics(node_metrics, &*kv_store, logger, |m| {
+				m.latest_pathfinding_scores_sync_timestamp = Some(duration_since_epoch.as_secs());
+			})
+			.await
+			.unwrap_or_else(|e| {
+				log_error!(logger, "Persisting node metrics failed: {}", e);
+			});
+			log_trace!(logger, "External scores merged successfully");
+		},
+		Err(e) => {
+			log_error!(logger, "Failed to parse external scores update: {}", e);
+		},
+	}
+}

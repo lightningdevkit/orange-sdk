@@ -47,6 +47,15 @@ async fn test_cashu_populated_wallet_cold_start() {
 			})
 			.unwrap_or(DEFAULT_RECEIVE_COUNT);
 		assert!(receive_count > 0, "ORANGE_TEST_CASHU_RECEIVES must be positive");
+		let restart_count = std::env::var("ORANGE_TEST_CASHU_RESTARTS")
+			.ok()
+			.map(|value| {
+				value
+					.parse::<usize>()
+					.expect("ORANGE_TEST_CASHU_RESTARTS must be a positive integer")
+			})
+			.unwrap_or(1);
+		assert!(restart_count > 0, "ORANGE_TEST_CASHU_RESTARTS must be positive");
 
 		let wallet = Arc::clone(&params.wallet);
 		let payer = Arc::clone(&params.third_party);
@@ -106,17 +115,31 @@ async fn test_cashu_populated_wallet_cold_start() {
 		let wallet_config = params.wallet_config.clone();
 		params.stop_wallet_for_restart().await;
 
-		let startup_started = Instant::now();
-		let restarted_wallet = Arc::new(orange_sdk::Wallet::new(wallet_config).await.unwrap());
-		let startup_duration = startup_started.elapsed();
-		let balance_read_started = Instant::now();
-		let balance_after_restart = restarted_wallet.get_balance().await.unwrap();
-		let balance_read_duration = balance_read_started.elapsed();
-		let transaction_count_after_restart =
-			restarted_wallet.list_transactions().await.unwrap().len();
+		let mut startup_durations = Vec::with_capacity(restart_count);
+		let mut balance_read_durations = Vec::with_capacity(restart_count);
+		for restart_index in 0..restart_count {
+			let startup_started = Instant::now();
+			let restarted_wallet =
+				Arc::new(orange_sdk::Wallet::new(wallet_config.clone()).await.unwrap());
+			let startup_duration = startup_started.elapsed();
+			let balance_read_started = Instant::now();
+			let balance_after_restart = restarted_wallet.get_balance().await.unwrap();
+			let balance_read_duration = balance_read_started.elapsed();
+			let transaction_count_after_restart =
+				restarted_wallet.list_transactions().await.unwrap().len();
 
-		assert_eq!(balance_after_restart.trusted, balance_before_restart.trusted);
-		assert_eq!(transaction_count_after_restart, transaction_count_before_restart);
+			assert_eq!(balance_after_restart.trusted, balance_before_restart.trusted);
+			assert_eq!(transaction_count_after_restart, transaction_count_before_restart);
+			println!(
+				"cashu_repro_restart index={} startup_ms={:.2} balance_read_ms={:.2}",
+				restart_index + 1,
+				startup_duration.as_secs_f64() * 1_000.0,
+				balance_read_duration.as_secs_f64() * 1_000.0,
+			);
+			startup_durations.push(startup_duration);
+			balance_read_durations.push(balance_read_duration);
+			restarted_wallet.stop().await;
+		}
 
 		let percentile_ms = |samples: &[Duration], percentile: usize| {
 			let mut sorted = samples.to_vec();
@@ -128,18 +151,18 @@ async fn test_cashu_populated_wallet_cold_start() {
 		println!(
 			"cashu_repro_summary receives={receive_count} amount_sats={RECEIVE_AMOUNT_SATS} \
 			 quote_median_ms={:.2} quote_p95_ms={:.2} settle_median_ms={:.2} \
-			 settle_p95_ms={:.2} cold_start_ms={:.2} balance_read_ms={:.2} \
+			 settle_p95_ms={:.2} restarts={restart_count} cold_start_median_ms={:.2} \
+			 cold_start_p95_ms={:.2} balance_read_median_ms={:.2} \
 			 trusted_balance_sats={}",
 			percentile_ms(&quote_durations, 50),
 			percentile_ms(&quote_durations, 95),
 			percentile_ms(&settle_durations, 50),
 			percentile_ms(&settle_durations, 95),
-			startup_duration.as_secs_f64() * 1_000.0,
-			balance_read_duration.as_secs_f64() * 1_000.0,
-			balance_after_restart.trusted.sats().unwrap(),
+			percentile_ms(&startup_durations, 50),
+			percentile_ms(&startup_durations, 95),
+			percentile_ms(&balance_read_durations, 50),
+			balance_before_restart.trusted.sats().unwrap(),
 		);
-
-		restarted_wallet.stop().await;
 	})
 	.await;
 }

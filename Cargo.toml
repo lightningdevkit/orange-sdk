@@ -6,7 +6,7 @@ members = [
     "bindings/uniffi-bindgen",
 ]
 default-members = ["orange-sdk"]
-exclude = ["vendor/bitreq"]
+exclude = ["vendor/bitreq", "vendor/ldk-node"]
 resolver = "2"
 
 [profile.release-smaller]
@@ -31,3 +31,8 @@ panic = "abort"
 # Keep HTTP/1.1 VSS connections alive when a proxy omits the optional
 # `Connection: keep-alive` response header.
 bitreq = { path = "vendor/bitreq" }
+
+[patch."https://github.com/lightningdevkit/ldk-node"]
+# Reuse the schema-setup HTTP pool for subsequent VSS operations, avoiding a
+# second connection and TLS handshake during wallet startup.
+ldk-node = { path = "vendor/ldk-node" }

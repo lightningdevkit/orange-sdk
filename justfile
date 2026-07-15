@@ -1,6 +1,7 @@
 vss_url := env_var_or_default("VSS_URL", "http://127.0.0.1:6754/vss")
 cashu_test_threads := env_var_or_default("CASHU_TEST_THREADS", "4")
 cashu_repro_receives := env_var_or_default("CASHU_REPRO_RECEIVES", "10")
+cashu_repro_restarts := env_var_or_default("CASHU_REPRO_RESTARTS", "5")
 cashu_repro_timeout_secs := env_var_or_default("CASHU_REPRO_TIMEOUT_SECS", "900")
 
 default:
@@ -28,11 +29,11 @@ test-cashu-vss *args:
 
 # Populate and restart a Cashu wallet using SQLite, printing performance measurements.
 repro-cashu-cold-start:
-    ORANGE_TEST_CASHU_RECEIVES={{ cashu_repro_receives }} ORANGE_TEST_TIMEOUT_SECS={{ cashu_repro_timeout_secs }} cargo test test_cashu_populated_wallet_cold_start --features _cashu-tests -p orange-sdk -- --ignored --nocapture --test-threads=1
+    ORANGE_TEST_CASHU_RECEIVES={{ cashu_repro_receives }} ORANGE_TEST_CASHU_RESTARTS={{ cashu_repro_restarts }} ORANGE_TEST_TIMEOUT_SECS={{ cashu_repro_timeout_secs }} cargo test test_cashu_populated_wallet_cold_start --features _cashu-tests -p orange-sdk -- --ignored --nocapture --test-threads=1
 
 # Populate and restart a Cashu wallet using VSS, printing performance measurements.
 repro-cashu-cold-start-vss:
-    ORANGE_TEST_VSS_URL={{ vss_url }} ORANGE_TEST_CASHU_RECEIVES={{ cashu_repro_receives }} ORANGE_TEST_TIMEOUT_SECS={{ cashu_repro_timeout_secs }} cargo test test_cashu_populated_wallet_cold_start --features _cashu-tests -p orange-sdk -- --ignored --nocapture --test-threads=1
+    ORANGE_TEST_VSS_URL={{ vss_url }} ORANGE_TEST_CASHU_RECEIVES={{ cashu_repro_receives }} ORANGE_TEST_CASHU_RESTARTS={{ cashu_repro_restarts }} ORANGE_TEST_TIMEOUT_SECS={{ cashu_repro_timeout_secs }} cargo test test_cashu_populated_wallet_cold_start --features _cashu-tests -p orange-sdk -- --ignored --nocapture --test-threads=1
 
 cli:
     cd examples/cli && cargo run
