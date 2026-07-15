@@ -6,6 +6,7 @@ members = [
     "bindings/uniffi-bindgen",
 ]
 default-members = ["orange-sdk"]
+exclude = ["vendor/bitreq"]
 resolver = "2"
 
 [profile.release-smaller]
@@ -25,3 +26,8 @@ panic = "abort"
 
 [profile.dev]
 panic = "abort"
+
+[patch.crates-io]
+# Keep HTTP/1.1 VSS connections alive when a proxy omits the optional
+# `Connection: keep-alive` response header.
+bitreq = { path = "vendor/bitreq" }

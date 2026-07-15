@@ -1,0 +1,162 @@
+use core::{fmt, str};
+#[cfg(feature = "std")]
+use std::{error, io};
+
+use crate::UrlParseError;
+
+/// Represents an error while sending, receiving, or parsing an HTTP response.
+#[derive(Debug)]
+#[non_exhaustive]
+// TODO: Maybe make a few inner error types containing groups of these, based on
+// what the user might want to handle? This error doesn't really invite graceful
+// handling.
+pub enum Error {
+    #[cfg(feature = "json-using-serde")]
+    /// Ran into a Serde error.
+    SerdeJsonError(serde_json::Error),
+    /// The given URL is invalid and we failed parsing.
+    InvalidUrl(UrlParseError),
+    /// The response body contains invalid UTF-8, so the `as_str()`
+    /// conversion failed.
+    InvalidUtf8InBody(str::Utf8Error),
+    #[cfg(feature = "rustls")]
+    /// Ran into a rustls error while creating the connection.
+    RustlsCreateConnection(rustls::Error),
+    #[cfg(feature = "native-tls")]
+    /// Ran into a native-tls error while creating the connection.
+    NativeTlsCreateConnection(native_tls::Error),
+    /// Ran into an IO problem while loading the response.
+    #[cfg(feature = "std")]
+    IoError(io::Error),
+    /// Couldn't parse the incoming chunk's length while receiving a
+    /// response with the header `Transfer-Encoding: chunked`.
+    MalformedChunkLength,
+    /// The chunk did not end after reading the previously read amount
+    /// of bytes.
+    MalformedChunkEnd,
+    /// Couldn't parse the `Content-Length` header's value as an
+    /// `usize`.
+    MalformedContentLength,
+    /// The response contains headers whose total size surpasses
+    /// [Request::with_max_headers_size](crate::request::Request::with_max_headers_size).
+    HeadersOverflow,
+    /// The response's status line length surpasses
+    /// [Request::with_max_status_line_size](crate::request::Request::with_max_status_line_length).
+    StatusLineOverflow,
+    /// [ToSocketAddrs](std::net::ToSocketAddrs) did not resolve to an
+    /// address.
+    AddressNotFound,
+    /// The response was a redirection, but the `Location` header is
+    /// missing.
+    RedirectLocationMissing,
+    /// The response redirections caused an infinite redirection loop.
+    InfiniteRedirectionLoop,
+    /// Followed
+    /// [`max_redirections`](struct.Request.html#method.with_max_redirections)
+    /// redirections, won't follow any more.
+    TooManyRedirections,
+    /// The response contained invalid UTF-8 where it should be valid
+    /// (eg. headers), so the response cannot interpreted correctly.
+    InvalidUtf8InResponse,
+    /// Tried to send a secure request (ie. the url started with
+    /// `https://`), but the crate's `https` feature was not enabled,
+    /// and as such, a connection cannot be made.
+    HttpsFeatureNotEnabled,
+    /// The provided proxy information was not properly formatted. See
+    /// [Proxy](crate::Proxy) methods for the valid format.
+    #[cfg(feature = "proxy")]
+    BadProxy,
+    /// The provided credentials were rejected by the proxy server.
+    #[cfg(feature = "proxy")]
+    BadProxyCreds,
+    /// The provided proxy credentials were malformed.
+    #[cfg(feature = "proxy")]
+    ProxyConnect,
+    /// The provided credentials were rejected by the proxy server.
+    #[cfg(feature = "proxy")]
+    InvalidProxyCreds,
+    /// The response body size surpasses
+    /// [Request::with_max_body_size](crate::request::Request::with_max_body_size).
+    BodyOverflow,
+    // TODO: Uncomment these two for 3.0
+    // /// The URL does not start with http:// or https://.
+    // InvalidProtocol,
+    // /// The URL ended up redirecting to an URL that does not start
+    // /// with http:// or https://.
+    // InvalidProtocolInRedirect,
+    /// This is a special error case, one that should never be
+    /// returned! Think of this as a cleaner alternative to calling
+    /// `unreachable!()` inside the library. If you come across this,
+    /// please open an issue, and include the string inside this
+    /// error, as it can be used to locate the problem.
+    Other(&'static str),
+}
+
+impl fmt::Display for Error {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        use Error::*;
+        match self {
+            #[cfg(feature = "json-using-serde")]
+            SerdeJsonError(err) => write!(f, "{}", err),
+            #[cfg(feature = "std")]
+            IoError(err) => write!(f, "{}", err),
+            InvalidUrl(err) => write!(f, "failed to parse given URL: {}", err),
+            InvalidUtf8InBody(err) => write!(f, "{}", err),
+            #[cfg(feature = "rustls")]
+            RustlsCreateConnection(err) => write!(f, "error creating rustls connection: {}", err),
+            #[cfg(feature = "native-tls")]
+            NativeTlsCreateConnection(err) => write!(f, "error creating native-tls connection: {err}"),
+            MalformedChunkLength => write!(f, "non-usize chunk length with transfer-encoding: chunked"),
+            MalformedChunkEnd => write!(f, "chunk did not end after reading the expected amount of bytes"),
+            MalformedContentLength => write!(f, "non-usize content length"),
+            HeadersOverflow => write!(f, "the headers' total size surpassed max_headers_size"),
+            StatusLineOverflow => write!(f, "the status line length surpassed max_status_line_length"),
+            AddressNotFound => write!(f, "could not resolve host to a socket address"),
+            RedirectLocationMissing => write!(f, "redirection location header missing"),
+            InfiniteRedirectionLoop => write!(f, "infinite redirection loop detected"),
+            TooManyRedirections => write!(f, "too many redirections (over the max)"),
+            InvalidUtf8InResponse => write!(f, "response contained invalid utf-8 where valid utf-8 was expected"),
+            HttpsFeatureNotEnabled => write!(f, "request url contains https:// but the https feature is not enabled"),
+            #[cfg(feature = "proxy")]
+            BadProxy => write!(f, "the provided proxy information is malformed"),
+            #[cfg(feature = "proxy")]
+            BadProxyCreds => write!(f, "the provided proxy credentials are malformed"),
+            #[cfg(feature = "proxy")]
+            ProxyConnect => write!(f, "could not connect to the proxy server"),
+            #[cfg(feature = "proxy")]
+            InvalidProxyCreds => write!(f, "the provided proxy credentials are invalid"),
+            BodyOverflow => write!(f, "the response body size surpassed max_body_size"),
+            // TODO: Uncomment these two for 3.0
+            // InvalidProtocol => write!(f, "the url does not start with http:// or https://"),
+            // InvalidProtocolInRedirect => write!(f, "got redirected to an absolute url which does not start with http:// or https://"),
+            Other(msg) => write!(f, "error in bitreq: please open an issue in the bitreq repo, include the following: '{}'", msg),
+        }
+    }
+}
+
+#[cfg(feature = "std")]
+impl error::Error for Error {
+    fn source(&self) -> Option<&(dyn error::Error + 'static)> {
+        use Error::*;
+        match self {
+            #[cfg(feature = "json-using-serde")]
+            SerdeJsonError(err) => Some(err),
+            #[cfg(feature = "std")]
+            IoError(err) => Some(err),
+            InvalidUrl(err) => Some(err),
+            InvalidUtf8InBody(err) => Some(err),
+            #[cfg(feature = "rustls")]
+            RustlsCreateConnection(err) => Some(err),
+            _ => None,
+        }
+    }
+}
+
+#[cfg(feature = "std")]
+impl From<io::Error> for Error {
+    fn from(other: io::Error) -> Error { Error::IoError(other) }
+}
+
+impl From<UrlParseError> for Error {
+    fn from(other: UrlParseError) -> Error { Error::InvalidUrl(other) }
+}
