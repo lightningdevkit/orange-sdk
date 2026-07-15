@@ -3,7 +3,7 @@ use std::fmt::Debug;
 use std::str::FromStr;
 use std::sync::{Arc, RwLock};
 
-use crate::dyn_store::DynStore;
+use crate::dyn_store::{DynStore, read_keys_bounded};
 use async_trait::async_trait;
 use cdk::cdk_database::WalletDatabase;
 use cdk::wallet::types::WalletSaga;
@@ -646,12 +646,12 @@ impl WalletDatabase<cdk::cdk_database::Error> for CashuKvDatabase {
 			.await
 			.map_err(DatabaseError::Io)?;
 
-		let mut quotes = Vec::with_capacity(keys.len());
-		for key in keys {
-			let data = KVStore::read(self.store.as_ref(), CASHU_PRIMARY_KEY, MINT_QUOTES_KEY, &key)
+		let records =
+			read_keys_bounded(Arc::clone(&self.store), CASHU_PRIMARY_KEY, MINT_QUOTES_KEY, keys)
 				.await
 				.map_err(DatabaseError::Io)?;
-
+		let mut quotes = Vec::with_capacity(records.len());
+		for (_, data) in records {
 			if !data.is_empty() {
 				let quote: MintQuote = serde_json::from_slice(&data)
 					.map_err(|e| DatabaseError::Serialization(e.to_string()))?;
