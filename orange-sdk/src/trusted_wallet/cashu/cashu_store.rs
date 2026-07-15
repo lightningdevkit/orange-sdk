@@ -180,15 +180,20 @@ impl CashuKvDatabase {
 	}
 
 	async fn load_caches(&self) -> Result<(), DatabaseError> {
-		// Load mints cache
-		if let Ok(mints) = self.load_mints_from_store().await {
+		// These use independent namespaces and can be restored concurrently. This
+		// lets remote stores pipeline the requests while synchronous stores retain
+		// their existing behavior.
+		let (mints, proofs) =
+			tokio::join!(self.load_mints_from_store(), self.load_proofs_from_store());
+
+		if let Ok(mints) = mints {
 			let mut cache = self.mints_cache.write().unwrap();
 			*cache = mints;
 		}
 
 		// Proof errors must not be hidden: presenting an empty cache for an unreadable
 		// proof set could make the wallet report an incorrect balance.
-		let proofs = self.load_proofs_from_store().await?;
+		let proofs = proofs?;
 		let mut cache = self.proofs_cache.write().unwrap();
 		*cache = proofs;
 
