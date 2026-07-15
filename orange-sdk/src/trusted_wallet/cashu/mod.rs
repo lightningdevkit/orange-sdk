@@ -540,7 +540,12 @@ impl Cashu {
 			}
 		});
 
-		if let Ok(pending_mints) = cashu_wallet.get_active_mint_quotes().await {
+		// These are independent, read-only startup checks. Running them together
+		// avoids an extra round trip when the shared store is remote.
+		let (pending_mints, has_recovered) =
+			tokio::join!(cashu_wallet.get_active_mint_quotes(), read_has_recovered(&store),);
+
+		if let Ok(pending_mints) = pending_mints {
 			for pending_mint in pending_mints {
 				let id = pending_mint.id.clone();
 				if let Err(e) = mint_quote_sender.send(pending_mint).await {
@@ -562,7 +567,7 @@ impl Cashu {
 		});
 
 		// spawn background task to recover funds if first time initializing
-		let has_recovered = read_has_recovered(&store).await?;
+		let has_recovered = has_recovered?;
 		if !has_recovered {
 			let w = Arc::clone(&cashu_wallet);
 			let l = Arc::clone(&logger);
