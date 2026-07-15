@@ -13,7 +13,7 @@
 
 use bitcoin_payment_instructions::amount::Amount;
 
-use crate::dyn_store::DynStore;
+use crate::dyn_store::{DynStore, read_keys_bounded};
 use ldk_node::bitcoin::Txid;
 use ldk_node::bitcoin::hex::{DisplayHex, FromHex};
 use ldk_node::lightning::io;
@@ -458,11 +458,11 @@ impl TxMetadataStore {
 			.await
 			.expect("We do not allow reads to fail");
 		let mut tx_metadata = HashMap::with_capacity(keys.len());
-		for key in keys {
-			let data_bytes =
-				KVStore::read(store.as_ref(), STORE_PRIMARY_KEY, STORE_SECONDARY_KEY, &key)
-					.await
-					.expect("We do not allow reads to fail");
+		let records =
+			read_keys_bounded(Arc::clone(&store), STORE_PRIMARY_KEY, STORE_SECONDARY_KEY, keys)
+				.await
+				.expect("We do not allow reads to fail");
+		for (key, data_bytes) in records {
 			let key =
 				PaymentId::from_str(&key).expect("Invalid key in transaction metadata storage");
 			let data = Readable::read(&mut &data_bytes[..])
