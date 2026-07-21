@@ -65,6 +65,7 @@ impl DummyTrustedWallet {
 			bitcoind.params.rpc_socket.port(),
 			cookie.user,
 			cookie.password,
+			None,
 		);
 
 		let tmp = temp_dir().join(format!("orange-test-{uuid}/dummy-ldk"));

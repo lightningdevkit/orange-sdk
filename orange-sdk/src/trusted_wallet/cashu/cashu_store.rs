@@ -1292,6 +1292,7 @@ mod tests {
 	use cdk::Amount;
 	use cdk::nuts::Proof;
 	use cdk::secret::Secret;
+	use ldk_node::lightning::util::persist::{PageToken, PaginatedKVStore, PaginatedListResponse};
 	use std::future::ready;
 	use std::sync::Mutex as StdMutex;
 	use std::sync::atomic::{AtomicBool, Ordering};
@@ -1361,6 +1362,16 @@ mod tests {
 			&self, _primary_namespace: &str, _secondary_namespace: &str,
 		) -> impl std::future::Future<Output = Result<Vec<String>, io::Error>> + Send + 'static {
 			ready(Ok(Vec::new()))
+		}
+	}
+
+	impl PaginatedKVStore for ProofTestStore {
+		fn list_paginated(
+			&self, _primary_namespace: &str, _secondary_namespace: &str,
+			_page_token: Option<PageToken>,
+		) -> impl std::future::Future<Output = Result<PaginatedListResponse, io::Error>> + Send + 'static
+		{
+			ready(Ok(PaginatedListResponse { keys: Vec::new(), next_page_token: None }))
 		}
 	}
 

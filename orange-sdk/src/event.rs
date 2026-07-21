@@ -648,7 +648,7 @@ impl LdkEventHandler {
 					.add_event(Event::ChannelClosed {
 						channel_id,
 						user_channel_id,
-						counterparty_node_id: counterparty_node_id.unwrap(), // safe
+						counterparty_node_id,
 						reason,
 					})
 					.await

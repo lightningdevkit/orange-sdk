@@ -67,10 +67,8 @@ impl LightningWallet {
 			trusted_peers_no_reserve: vec![config.lsp.1],
 			..Default::default()
 		};
-		let ldk_node_config = ldk_node::config::Config {
-			anchor_channels_config: Some(anchor_channels_config),
-			..Default::default()
-		};
+		let ldk_node_config =
+			ldk_node::config::Config { anchor_channels_config, ..Default::default() };
 		let mut builder = ldk_node::Builder::from_config(ldk_node_config);
 		builder.set_network(config.network);
 		let node_entropy = config.seed.to_node_entropy();
@@ -113,6 +111,7 @@ impl LightningWallet {
 							fee_rate_cache_update_interval_secs: 30,
 						}),
 						timeouts_config: SyncTimeoutsConfig::default(),
+						..Default::default()
 					}
 				} else {
 					ldk_node::config::EsploraSyncConfig::default()
@@ -151,6 +150,7 @@ impl LightningWallet {
 							lightning_wallet_sync_interval_secs: 2,
 							fee_rate_cache_update_interval_secs: 30,
 						}),
+						..Default::default()
 					})
 				} else {
 					None
@@ -158,7 +158,7 @@ impl LightningWallet {
 				builder.set_chain_source_electrum(url, sync_config)
 			},
 			ChainSource::BitcoindRPC { host, port, user, password } => {
-				builder.set_chain_source_bitcoind_rpc(host, port, user, password)
+				builder.set_chain_source_bitcoind_rpc(host, port, user, password, None)
 			},
 		};
 
@@ -353,6 +353,7 @@ impl LightningWallet {
 								kind: PaymentKind::Onchain {
 									txid: funding_txo.txid,
 									status: ConfirmationStatus::Unconfirmed, // todo how do we update this?
+									tx_type: None,
 								},
 								amount_msat: Some(amount_sats * 1_000),
 								fee_paid_msat: Some(69), // todo get real fee

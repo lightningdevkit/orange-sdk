@@ -1,19 +1,22 @@
-//! Object-safe wrapper around ldk-node's async `KVStore` trait.
+//! Object-safe wrapper around ldk-node's async `PaginatedKVStore` trait.
 //!
 //! `lightning`'s `KVStore` returns `impl Future` from its methods, which makes the trait not
 //! object-safe — orange-sdk can't share a backend across components as `Arc<dyn KVStore>`.
 //!
 //! This module defines `DynStore`, an object-safe trait covering the kv methods (returning
-//! boxed futures), with a blanket impl over any concrete type that implements `KVStore`. The
-//! whole crate stores backends as `Arc<dyn DynStore>`; conversion to a value ldk-node accepts
-//! happens at the call site through a thin newtype that delegates back to `DynStore`.
+//! boxed futures), with a blanket impl over any concrete type that implements
+//! `PaginatedKVStore`. The whole crate stores backends as `Arc<dyn DynStore>`; conversion to a
+//! value ldk-node accepts happens at the call site through a thin newtype that delegates back to
+//! `DynStore`.
 
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 
 use ldk_node::lightning::io;
-use ldk_node::lightning::util::persist::KVStore;
+use ldk_node::lightning::util::persist::{
+	KVStore, PageToken, PaginatedKVStore, PaginatedListResponse,
+};
 use tokio::task::JoinSet;
 
 /// Matches the connection capacity used by the VSS HTTP client. Keeping the
@@ -38,11 +41,15 @@ pub(crate) trait DynStore: Send + Sync + 'static {
 	fn list_async(
 		&self, primary_namespace: &str, secondary_namespace: &str,
 	) -> Pin<Box<dyn Future<Output = Result<Vec<String>, io::Error>> + Send + 'static>>;
+
+	fn list_paginated_async(
+		&self, primary_namespace: &str, secondary_namespace: &str, page_token: Option<PageToken>,
+	) -> Pin<Box<dyn Future<Output = Result<PaginatedListResponse, io::Error>> + Send + 'static>>;
 }
 
 impl<T> DynStore for T
 where
-	T: KVStore + Send + Sync + 'static,
+	T: PaginatedKVStore + Send + Sync + 'static,
 {
 	fn read_async(
 		&self, p: &str, s: &str, k: &str,
@@ -66,6 +73,12 @@ where
 		&self, p: &str, s: &str,
 	) -> Pin<Box<dyn Future<Output = Result<Vec<String>, io::Error>> + Send + 'static>> {
 		Box::pin(<T as KVStore>::list(self, p, s))
+	}
+
+	fn list_paginated_async(
+		&self, p: &str, s: &str, page_token: Option<PageToken>,
+	) -> Pin<Box<dyn Future<Output = Result<PaginatedListResponse, io::Error>> + Send + 'static>> {
+		Box::pin(<T as PaginatedKVStore>::list_paginated(self, p, s, page_token))
 	}
 }
 
@@ -96,8 +109,16 @@ impl KVStore for dyn DynStore {
 	}
 }
 
+impl PaginatedKVStore for dyn DynStore {
+	fn list_paginated(
+		&self, p: &str, s: &str, page_token: Option<PageToken>,
+	) -> impl Future<Output = Result<PaginatedListResponse, io::Error>> + Send + 'static {
+		self.list_paginated_async(p, s, page_token)
+	}
+}
+
 /// Cloneable handle wrapping `Arc<dyn DynStore>` that satisfies ldk-node's
-/// `KVStore + Send + Sync + 'static` bound on `build_with_store`. The trait impl just
+/// `PaginatedKVStore + Send + Sync + 'static` bound on `build_with_store`. The trait impl just
 /// forwards to the underlying `dyn DynStore`.
 #[derive(Clone)]
 pub(crate) struct LdkNodeStore(pub(crate) Arc<dyn DynStore>);
@@ -122,6 +143,14 @@ impl KVStore for LdkNodeStore {
 		&self, p: &str, s: &str,
 	) -> impl Future<Output = Result<Vec<String>, io::Error>> + Send + 'static {
 		self.0.list_async(p, s)
+	}
+}
+
+impl PaginatedKVStore for LdkNodeStore {
+	fn list_paginated(
+		&self, p: &str, s: &str, page_token: Option<PageToken>,
+	) -> impl Future<Output = Result<PaginatedListResponse, io::Error>> + Send + 'static {
+		self.0.list_paginated_async(p, s, page_token)
 	}
 }
 
@@ -239,6 +268,15 @@ mod tests {
 			&self, _primary_namespace: &str, _secondary_namespace: &str,
 		) -> impl Future<Output = Result<Vec<String>, io::Error>> + Send + 'static {
 			ready(Ok(Vec::new()))
+		}
+	}
+
+	impl PaginatedKVStore for ControlledStore {
+		fn list_paginated(
+			&self, _primary_namespace: &str, _secondary_namespace: &str,
+			_page_token: Option<PageToken>,
+		) -> impl Future<Output = Result<PaginatedListResponse, io::Error>> + Send + 'static {
+			ready(Ok(PaginatedListResponse { keys: Vec::new(), next_page_token: None }))
 		}
 	}
 

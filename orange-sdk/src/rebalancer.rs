@@ -176,7 +176,7 @@ impl RebalanceTrigger for OrangeTrigger {
 				for payment in new_recvs {
 					let payment_id = PaymentId::SelfCustodial(payment.id.0);
 					let (txid, status) = match payment.kind {
-						PaymentKind::Onchain { txid, status } => (txid, status),
+						PaymentKind::Onchain { txid, status, .. } => (txid, status),
 						_ => continue,
 					};
 					let event = Event::OnchainPaymentReceived {

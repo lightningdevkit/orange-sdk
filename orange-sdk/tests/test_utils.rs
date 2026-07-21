@@ -155,6 +155,7 @@ fn create_lsp(uuid: Uuid, bitcoind: &Bitcoind) -> Arc<Node> {
 		bitcoind.params.rpc_socket.port(),
 		cookie.user,
 		cookie.password,
+		None,
 	);
 
 	let tmp = temp_dir().join(format!("orange-test-{uuid}/lsp"));
@@ -213,6 +214,7 @@ fn create_third_party(uuid: Uuid, bitcoind: &Bitcoind) -> Arc<Node> {
 		bitcoind.params.rpc_socket.port(),
 		cookie.user,
 		cookie.password,
+		None,
 	);
 
 	let tmp = temp_dir().join(format!("orange-test-{uuid}/payer"));

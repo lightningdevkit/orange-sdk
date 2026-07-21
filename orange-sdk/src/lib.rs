@@ -1777,6 +1777,7 @@ mod tests {
 		let kind = PaymentKind::Onchain {
 			txid: Txid::from_byte_array([42; 32]),
 			status: ConfirmationStatus::Unconfirmed,
+			tx_type: None,
 		};
 
 		assert!(should_surface_lightning_payment_without_metadata(TxStatus::Pending, &kind));
@@ -1787,7 +1788,11 @@ mod tests {
 		let txid = Txid::from_byte_array([42; 32]);
 		let payment = PaymentDetails {
 			id: LightningPaymentId([24; 32]),
-			kind: PaymentKind::Onchain { txid, status: ConfirmationStatus::Unconfirmed },
+			kind: PaymentKind::Onchain {
+				txid,
+				status: ConfirmationStatus::Unconfirmed,
+				tx_type: None,
+			},
 			amount_msat: Some(123_000),
 			fee_paid_msat: None,
 			direction: PaymentDirection::Inbound,
