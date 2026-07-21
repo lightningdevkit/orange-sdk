@@ -739,6 +739,11 @@ async fn test_receive_to_ln() {
 		let third_party = Arc::clone(&params.third_party);
 
 		let recv_amt = open_channel_from_lsp(&wallet, Arc::clone(&third_party)).await;
+		let channel = wallet.channels().into_iter().next().expect("expected a JIT channel");
+		assert_eq!(
+			channel.feerate_sat_per_1000_weight, 0,
+			"JIT channel should use zero-fee commitments"
+		);
 
 		let txs = wallet.list_transactions().await.unwrap();
 		assert_eq!(txs.len(), 1);

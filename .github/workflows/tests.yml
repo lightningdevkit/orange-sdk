@@ -34,6 +34,21 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2.7.8
 
+      - name: Cache package-enabled Esplora
+        id: cache-esplora
+        uses: actions/cache@v4
+        with:
+          path: bin/electrs-${{ runner.os }}-${{ runner.arch }}
+          key: electrs-submit-package-8c06d801-${{ runner.os }}-${{ runner.arch }}
+
+      - name: Build package-enabled Esplora
+        if: steps.cache-esplora.outputs.cache-hit != 'true'
+        run: |
+          ./scripts/build_package_esplora.sh "bin/electrs-${{ runner.os }}-${{ runner.arch }}"
+
+      - name: Configure package-enabled Esplora
+        run: echo "ELECTRS_EXE=$(pwd)/bin/electrs-${{ runner.os }}-${{ runner.arch }}" >> "$GITHUB_ENV"
+
       - name: Check formatting
         run: cargo fmt --check
 
@@ -61,6 +76,21 @@ jobs:
           repo-token: ${{ secrets.GITHUB_TOKEN }}
 
       - uses: Swatinem/rust-cache@v2.7.8
+
+      - name: Cache package-enabled Esplora
+        id: cache-esplora
+        uses: actions/cache@v4
+        with:
+          path: bin/electrs-${{ runner.os }}-${{ runner.arch }}
+          key: electrs-submit-package-8c06d801-${{ runner.os }}-${{ runner.arch }}
+
+      - name: Build package-enabled Esplora
+        if: steps.cache-esplora.outputs.cache-hit != 'true'
+        run: |
+          ./scripts/build_package_esplora.sh "bin/electrs-${{ runner.os }}-${{ runner.arch }}"
+
+      - name: Configure package-enabled Esplora
+        run: echo "ELECTRS_EXE=$(pwd)/bin/electrs-${{ runner.os }}-${{ runner.arch }}" >> "$GITHUB_ENV"
 
       - name: Run cashu tests
         run: cargo test --features _cashu-tests -- --test-threads=2 --nocapture

@@ -26,6 +26,7 @@ use std::env::temp_dir;
 use std::future::Future;
 #[cfg(feature = "_cashu-tests")]
 use std::net::SocketAddr;
+use std::path::PathBuf;
 #[cfg(feature = "_cashu-tests")]
 use std::str::FromStr;
 use std::sync::Arc;
@@ -91,9 +92,8 @@ async fn create_bitcoind(uuid: Uuid) -> (Arc<Bitcoind>, Arc<ElectrsD>) {
 	let mut electrsd_conf = electrsd::Conf::default();
 	electrsd_conf.http_enabled = true;
 	electrsd_conf.network = "regtest";
-	let electrsd =
-		ElectrsD::with_conf(electrsd::downloaded_exe_path().unwrap(), &bitcoind, &electrsd_conf)
-			.unwrap_or_else(|_| panic!("Failed to start electrsd for test {uuid}"));
+	let electrsd = ElectrsD::with_conf(package_esplora_exe_path(), &bitcoind, &electrsd_conf)
+		.unwrap_or_else(|_| panic!("Failed to start electrsd for test {uuid}"));
 
 	// mine 101 blocks to get some spendable funds
 	let address = bitcoind.client.new_address().unwrap();
@@ -102,6 +102,21 @@ async fn create_bitcoind(uuid: Uuid) -> (Arc<Bitcoind>, Arc<ElectrsD>) {
 	wait_for_block(&electrsd.client, 101).await;
 
 	(Arc::new(bitcoind), Arc::new(electrsd))
+}
+
+fn package_esplora_exe_path() -> String {
+	let path = std::env::var_os("ELECTRS_EXE").map(PathBuf::from).unwrap_or_else(|| {
+		PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../target/package-esplora/electrs")
+	});
+
+	if !path.is_file() {
+		panic!(
+			"Package-enabled Esplora not found at {}. Run ./scripts/build_package_esplora.sh or set ELECTRS_EXE.",
+			path.display()
+		);
+	}
+
+	path.into_os_string().into_string().expect("Esplora executable path must be valid UTF-8")
 }
 
 fn wait_for_bitcoind_ready(bitcoind: &Bitcoind) {
@@ -140,7 +155,9 @@ pub async fn generate_blocks(bitcoind: &Bitcoind, electrs: &ElectrsD, num: usize
 }
 
 fn create_lsp(uuid: Uuid, bitcoind: &Bitcoind) -> Arc<Node> {
-	let mut builder = ldk_node::Builder::new();
+	let mut config = ldk_node::config::Config::default();
+	config.anchor_channels_config.enable_zero_fee_commitments = true;
+	let mut builder = ldk_node::Builder::from_config(config);
 	builder.set_network(Network::Regtest);
 	let mut seed: [u8; 64] = [0; 64];
 	rand::thread_rng().fill_bytes(&mut seed);
@@ -155,6 +172,7 @@ fn create_lsp(uuid: Uuid, bitcoind: &Bitcoind) -> Arc<Node> {
 		bitcoind.params.rpc_socket.port(),
 		cookie.user,
 		cookie.password,
+		None,
 	);
 
 	let tmp = temp_dir().join(format!("orange-test-{uuid}/lsp"));
@@ -198,7 +216,9 @@ fn create_lsp(uuid: Uuid, bitcoind: &Bitcoind) -> Arc<Node> {
 }
 
 fn create_third_party(uuid: Uuid, bitcoind: &Bitcoind) -> Arc<Node> {
-	let mut builder = ldk_node::Builder::new();
+	let mut config = ldk_node::config::Config::default();
+	config.anchor_channels_config.enable_zero_fee_commitments = true;
+	let mut builder = ldk_node::Builder::from_config(config);
 	builder.set_network(Network::Regtest);
 	let mut seed: [u8; 64] = [0; 64];
 	rand::thread_rng().fill_bytes(&mut seed);
@@ -213,6 +233,7 @@ fn create_third_party(uuid: Uuid, bitcoind: &Bitcoind) -> Arc<Node> {
 		bitcoind.params.rpc_socket.port(),
 		cookie.user,
 		cookie.password,
+		None,
 	);
 
 	let tmp = temp_dir().join(format!("orange-test-{uuid}/payer"));
