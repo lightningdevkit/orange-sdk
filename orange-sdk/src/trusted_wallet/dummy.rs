@@ -52,7 +52,9 @@ impl DummyTrustedWallet {
 		uuid: Uuid, lsp: Arc<Node>, bitcoind: Arc<Bitcoind>, tx_metadata: TxMetadataStore,
 		event_queue: Arc<EventQueue>, rt: Arc<Runtime>,
 	) -> Self {
-		let mut builder = ldk_node::Builder::new();
+		let mut config = ldk_node::config::Config::default();
+		config.anchor_channels_config.enable_zero_fee_commitments = true;
+		let mut builder = ldk_node::Builder::from_config(config);
 		builder.set_network(Network::Regtest);
 		let mut seed: [u8; 64] = [0; 64];
 		rand::thread_rng().fill_bytes(&mut seed);

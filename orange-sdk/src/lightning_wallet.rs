@@ -65,6 +65,7 @@ impl LightningWallet {
 		log_info!(logger, "Creating LDK node...");
 		let anchor_channels_config = ldk_node::config::AnchorChannelsConfig {
 			trusted_peers_no_reserve: vec![config.lsp.1],
+			enable_zero_fee_commitments: true,
 			..Default::default()
 		};
 		let ldk_node_config =
