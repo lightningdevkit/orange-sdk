@@ -12,6 +12,7 @@ use bitcoin_payment_instructions::amount::Amount;
 
 use ldk_node::bitcoin::base64::Engine;
 use ldk_node::bitcoin::base64::prelude::BASE64_STANDARD;
+use ldk_node::bitcoin::io;
 use ldk_node::bitcoin::secp256k1::PublicKey;
 use ldk_node::bitcoin::{Address, Network};
 use ldk_node::config::{AsyncPaymentsRole, BackgroundSyncConfig, SyncTimeoutsConfig};
@@ -59,6 +60,19 @@ const DEFAULT_INVOICE_EXPIRY_SECS: u32 = 86_400; // 24 hours
 
 impl LightningWallet {
 	pub(super) async fn init(
+		runtime: Arc<Runtime>, config: WalletConfig, store: Arc<dyn DynStore>,
+		event_queue: Arc<EventQueue>, tx_metadata: TxMetadataStore, logger: Arc<Logger>,
+	) -> Result<Self, InitFailure> {
+		let handle = runtime.get_handle();
+		handle
+			.spawn(Self::init_inner(runtime, config, store, event_queue, tx_metadata, logger))
+			.await
+			.map_err(|e| {
+				io::Error::new(io::ErrorKind::Other, format!("LDK initialization task failed: {e}"))
+			})?
+	}
+
+	async fn init_inner(
 		runtime: Arc<Runtime>, config: WalletConfig, store: Arc<dyn DynStore>,
 		event_queue: Arc<EventQueue>, tx_metadata: TxMetadataStore, logger: Arc<Logger>,
 	) -> Result<Self, InitFailure> {
