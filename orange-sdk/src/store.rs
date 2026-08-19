@@ -29,6 +29,7 @@ use std::fmt;
 use std::str::FromStr;
 use std::sync::{Arc, RwLock, RwLockReadGuard};
 use std::time::Duration;
+use tokio::sync::Mutex;
 
 const STORE_PRIMARY_KEY: &str = "orange_sdk";
 const STORE_SECONDARY_KEY: &str = "payment_store";
@@ -733,27 +734,55 @@ impl TxMetadataStore {
 
 const REBALANCE_ENABLED_KEY: &str = "rebalance_enabled";
 
-pub(crate) async fn get_rebalance_enabled(store: &dyn DynStore) -> bool {
-	match KVStore::read(store, STORE_PRIMARY_KEY, "", REBALANCE_ENABLED_KEY).await {
-		Ok(bytes) => Readable::read(&mut &bytes[..]).expect("Invalid data in rebalance_enabled"),
-		Err(e) if e.kind() == io::ErrorKind::NotFound => {
-			// if rebalance_enabled is not found, default to true
-			// and write it to the store so we don't have to do this again
-			let rebalance_enabled = true;
-			set_rebalance_enabled(store, rebalance_enabled).await;
-			rebalance_enabled
-		},
-		Err(e) => {
-			panic!("Failed to read rebalance_enabled: {e}");
-		},
-	}
+pub(crate) struct RebalanceEnabledCache {
+	store: Arc<dyn DynStore>,
+	value: Mutex<Option<bool>>,
 }
 
-pub(crate) async fn set_rebalance_enabled(store: &dyn DynStore, enabled: bool) {
-	let bytes = enabled.encode();
-	KVStore::write(store, STORE_PRIMARY_KEY, "", REBALANCE_ENABLED_KEY, bytes)
-		.await
-		.expect("Failed to write rebalance_enabled");
+impl RebalanceEnabledCache {
+	pub(crate) fn new(store: Arc<dyn DynStore>) -> Self {
+		Self { store, value: Mutex::new(None) }
+	}
+
+	pub(crate) async fn get(&self) -> bool {
+		let mut cached = self.value.lock().await;
+		if let Some(value) = *cached {
+			return value;
+		}
+
+		let value =
+			match KVStore::read(self.store.as_ref(), STORE_PRIMARY_KEY, "", REBALANCE_ENABLED_KEY)
+				.await
+			{
+				Ok(bytes) => {
+					Readable::read(&mut &bytes[..]).expect("Invalid data in rebalance_enabled")
+				},
+				Err(e) if e.kind() == io::ErrorKind::NotFound => {
+					// If rebalance_enabled is not found, default to true and persist the value.
+					let value = true;
+					Self::write(self.store.as_ref(), value).await;
+					value
+				},
+				Err(e) => {
+					panic!("Failed to read rebalance_enabled: {e}");
+				},
+			};
+		*cached = Some(value);
+		value
+	}
+
+	pub(crate) async fn set(&self, enabled: bool) {
+		let mut cached = self.value.lock().await;
+		Self::write(self.store.as_ref(), enabled).await;
+		*cached = Some(enabled);
+	}
+
+	async fn write(store: &dyn DynStore, enabled: bool) {
+		let bytes = enabled.encode();
+		KVStore::write(store, STORE_PRIMARY_KEY, "", REBALANCE_ENABLED_KEY, bytes)
+			.await
+			.expect("Failed to write rebalance_enabled");
+	}
 }
 
 pub(crate) async fn write_splice_out(store: &dyn DynStore, details: &PaymentDetails) {
@@ -811,6 +840,26 @@ mod tests {
 	}
 	fn lightning_id() -> PaymentId {
 		PaymentId::SelfCustodial(LIGHTNING_LEG)
+	}
+
+	#[tokio::test]
+	async fn rebalance_enabled_set_updates_cache_and_store() {
+		let (_path, store) = temp_sqlite_store();
+		let cache = RebalanceEnabledCache::new(Arc::clone(&store));
+
+		cache.set(false).await;
+		assert!(!cache.get().await);
+		let stored = KVStore::read(store.as_ref(), STORE_PRIMARY_KEY, "", REBALANCE_ENABLED_KEY)
+			.await
+			.unwrap();
+		assert!(!bool::read(&mut &stored[..]).unwrap());
+
+		cache.set(true).await;
+		assert!(cache.get().await);
+		let stored = KVStore::read(store.as_ref(), STORE_PRIMARY_KEY, "", REBALANCE_ENABLED_KEY)
+			.await
+			.unwrap();
+		assert!(bool::read(&mut &stored[..]).unwrap());
 	}
 
 	fn mpp_metadata() -> TxMetadata {
