@@ -722,7 +722,6 @@ impl Wallet {
 			tunables,
 			tx_metadata.clone(),
 			Arc::clone(&event_queue),
-			Arc::clone(&store),
 			Arc::clone(&logger),
 		));
 
@@ -777,12 +776,12 @@ impl Wallet {
 
 	/// Sets whether the wallet should automatically rebalance from trusted/onchain to lightning.
 	pub async fn set_rebalance_enabled(&self, value: bool) {
-		store::set_rebalance_enabled(self.inner.store.as_ref(), value).await
+		self.inner.event_queue.set_rebalance_enabled(value).await
 	}
 
 	/// Whether the wallet should automatically rebalance from trusted/onchain to lightning.
 	pub async fn get_rebalance_enabled(&self) -> bool {
-		store::get_rebalance_enabled(self.inner.store.as_ref()).await
+		self.inner.event_queue.get_rebalance_enabled().await
 	}
 
 	/// Returns the lightning wallet's node id.

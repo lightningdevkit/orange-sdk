@@ -1,5 +1,5 @@
 use crate::logging::Logger;
-use crate::store::{self, MppOutcome, PaymentId, TxMetadataStore, TxType};
+use crate::store::{self, MppOutcome, PaymentId, RebalanceEnabledCache, TxMetadataStore, TxType};
 
 use crate::dyn_store::DynStore;
 use ldk_node::bitcoin::hashes::Hash;
@@ -212,6 +212,7 @@ pub struct EventQueue {
 	pending_mpp_events: Arc<Mutex<HashMap<PaymentHash, Vec<Event>>>>,
 	waker: Arc<Mutex<Option<Waker>>>,
 	kv_store: Arc<dyn DynStore>,
+	rebalance_enabled: RebalanceEnabledCache,
 	tx_metadata: TxMetadataStore,
 	logger: Arc<Logger>,
 }
@@ -223,7 +224,16 @@ impl EventQueue {
 		let queue = Arc::new(Mutex::new(VecDeque::new()));
 		let pending_mpp_events = Arc::new(Mutex::new(HashMap::new()));
 		let waker = Arc::new(Mutex::new(None));
-		Self { queue, pending_mpp_events, waker, kv_store, tx_metadata, logger }
+		let rebalance_enabled = RebalanceEnabledCache::new(Arc::clone(&kv_store));
+		Self { queue, pending_mpp_events, waker, kv_store, rebalance_enabled, tx_metadata, logger }
+	}
+
+	pub(crate) async fn get_rebalance_enabled(&self) -> bool {
+		self.rebalance_enabled.get().await
+	}
+
+	pub(crate) async fn set_rebalance_enabled(&self, enabled: bool) {
+		self.rebalance_enabled.set(enabled).await;
 	}
 
 	/// Starts buffering terminal events for a multi-path payment while its leg metadata is being
@@ -641,7 +651,7 @@ impl LdkEventHandler {
 			} => {
 				// We experienced a channel close, we disable rebalancing so we don't automatically
 				// try to reopen the channel.
-				store::set_rebalance_enabled(self.event_queue.kv_store.as_ref(), false).await;
+				self.event_queue.set_rebalance_enabled(false).await;
 
 				if let Err(e) = self
 					.event_queue

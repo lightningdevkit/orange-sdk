@@ -1,12 +1,11 @@
 use crate::bitcoin::Txid;
 use crate::bitcoin::hashes::Hash;
 use crate::bitcoin::hex::DisplayHex;
-use crate::dyn_store::DynStore;
 use crate::lightning_wallet::LightningWallet;
 use crate::logging::Logger;
 use crate::store::{PaymentId, TxMetadata, TxMetadataStore, TxType};
 use crate::trusted_wallet::DynTrustedWalletInterface;
-use crate::{Event, EventQueue, PaymentType, Tunables, store};
+use crate::{Event, EventQueue, PaymentType, Tunables};
 use bitcoin_payment_instructions::amount::Amount;
 use graduated_rebalancer::{RebalanceTrigger, RebalancerEvent, TriggerParams};
 use ldk_node::lightning::util::logger::Logger as _;
@@ -29,8 +28,6 @@ pub(crate) struct OrangeTrigger {
 	tx_metadata: TxMetadataStore,
 	/// The event handler for processing wallet events.
 	event_queue: Arc<EventQueue>,
-	/// Key-value store for persistent storage.
-	store: Arc<dyn DynStore>,
 	/// Time of the last on-chain sync, used to determine when to trigger rebalances.
 	onchain_sync_time: AtomicU64,
 	/// Logger for logging events and errors.
@@ -42,7 +39,7 @@ impl OrangeTrigger {
 	pub(crate) fn new(
 		ln_wallet: Arc<LightningWallet>, trusted: Arc<Box<DynTrustedWalletInterface>>,
 		tunables: Tunables, tx_metadata: TxMetadataStore, event_queue: Arc<EventQueue>,
-		store: Arc<dyn DynStore>, logger: Arc<Logger>,
+		logger: Arc<Logger>,
 	) -> Self {
 		let start =
 			ln_wallet.inner.ldk_node.status().latest_onchain_wallet_sync_timestamp.unwrap_or(0);
@@ -52,7 +49,6 @@ impl OrangeTrigger {
 			tunables,
 			tx_metadata,
 			event_queue,
-			store,
 			onchain_sync_time: AtomicU64::new(start),
 			logger,
 		}
@@ -62,7 +58,7 @@ impl OrangeTrigger {
 impl RebalanceTrigger for OrangeTrigger {
 	fn needs_trusted_rebalance(&self) -> impl Future<Output = Option<TriggerParams>> + Send {
 		async move {
-			let rebalance_enabled = store::get_rebalance_enabled(self.store.as_ref()).await;
+			let rebalance_enabled = self.event_queue.get_rebalance_enabled().await;
 			if !rebalance_enabled {
 				return None;
 			}
@@ -144,7 +140,7 @@ impl RebalanceTrigger for OrangeTrigger {
 
 	fn needs_onchain_rebalance(&self) -> impl Future<Output = Option<TriggerParams>> + Send {
 		async move {
-			let rebalance_enabled = store::get_rebalance_enabled(self.store.as_ref()).await;
+			let rebalance_enabled = self.event_queue.get_rebalance_enabled().await;
 			if !rebalance_enabled {
 				return None;
 			}
