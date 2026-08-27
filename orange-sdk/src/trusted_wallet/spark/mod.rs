@@ -27,7 +27,7 @@ use breez_sdk_spark::{
 
 use graduated_rebalancer::ReceivedLightningPayment;
 
-use tokio::sync::watch;
+use tokio::sync::{Notify, watch};
 
 use crate::runtime::Runtime;
 use std::future::Future;
@@ -97,7 +97,7 @@ impl SparkWalletConfig {
 pub(crate) struct Spark {
 	spark_wallet: Arc<BreezSdk>,
 	shutdown_sender: watch::Sender<()>,
-	payment_success_flag: watch::Receiver<()>,
+	payment_success_notify: Arc<Notify>,
 	logger: Arc<Logger>,
 }
 
@@ -269,7 +269,7 @@ impl TrustedWalletInterface for Spark {
 		&self, payment_hash: [u8; 32],
 	) -> Pin<Box<dyn Future<Output = Option<ReceivedLightningPayment>> + Send + '_>> {
 		Box::pin(async move {
-			loop {
+			let lookup = || async move {
 				let res =
 					self.spark_wallet.list_payments(ListPaymentsRequest::default()).await.ok()?;
 
@@ -281,17 +281,28 @@ impl TrustedWalletInterface for Spark {
 					} else {
 						false
 					}
-				})?;
+				});
 
-				if tx.status == PaymentStatus::Completed {
-					return Some(ReceivedLightningPayment {
-						id: payment_hash,
-						fee_paid_msat: Some((tx.fees * 1_000) as u64),
-					});
-				}
+				Some(match tx.as_ref().map(|payment| &payment.status) {
+					Some(PaymentStatus::Completed) => {
+						let tx = tx?;
+						PaymentLookup::Completed(ReceivedLightningPayment {
+							id: payment_hash,
+							fee_paid_msat: Some((tx.fees * 1_000) as u64),
+						})
+					},
+					Some(PaymentStatus::Failed) => PaymentLookup::Failed,
+					Some(PaymentStatus::Pending) | None => PaymentLookup::Wait,
+				})
+			};
 
-				self.await_payment_success().await;
-			}
+			wait_for_payment(
+				lookup,
+				&self.payment_success_notify,
+				self.shutdown_sender.subscribe(),
+				PAYMENT_WAIT_TIMEOUT,
+			)
+			.await
 		})
 	}
 
@@ -360,12 +371,12 @@ impl Spark {
 		log_info!(logger, "Started Spark wallet!");
 
 		let (shutdown_sender, shutdown_receiver) = watch::channel::<()>(());
-		let (payment_success_sender, payment_success_flag) = watch::channel(());
+		let payment_success_notify = Arc::new(Notify::new());
 
 		let listener = SparkEventHandler {
 			event_queue: Arc::clone(&event_queue),
 			tx_metadata,
-			payment_success_sender,
+			payment_success_notify: Arc::clone(&payment_success_notify),
 			logger: Arc::clone(&logger),
 		};
 
@@ -380,20 +391,14 @@ impl Spark {
 
 		log_info!(logger, "Spark wallet initialized");
 
-		Ok(Spark { spark_wallet, shutdown_sender, payment_success_flag, logger })
-	}
-
-	pub(crate) async fn await_payment_success(&self) {
-		let mut flag = self.payment_success_flag.clone();
-		flag.mark_unchanged();
-		let _ = flag.changed().await;
+		Ok(Spark { spark_wallet, shutdown_sender, payment_success_notify, logger })
 	}
 }
 
 struct SparkEventHandler {
 	event_queue: Arc<EventQueue>,
 	tx_metadata: TxMetadataStore,
-	payment_success_sender: watch::Sender<()>,
+	payment_success_notify: Arc<Notify>,
 	logger: Arc<Logger>,
 }
 
@@ -466,7 +471,7 @@ impl SparkEventHandler {
 								"Ignoring successful payment event for rebalance payment: {payment_id:?}"
 							);
 							// make sure we still send payment success
-							self.payment_success_sender.send(()).unwrap();
+							self.payment_success_notify.notify_waiters();
 							return Ok(());
 						}
 
@@ -500,7 +505,7 @@ impl SparkEventHandler {
 							})
 							.await?;
 
-						self.payment_success_sender.send(()).unwrap();
+						self.payment_success_notify.notify_waiters();
 					},
 					_ => {
 						log_debug!(self.logger, "Unsupported payment details for Send: {payment:?}")
@@ -548,6 +553,9 @@ impl SparkEventHandler {
 		&self, payment: breez_sdk_spark::Payment,
 	) -> Result<(), TrustedError> {
 		log_info!(self.logger, "Spark payment failed: {payment:?}");
+		// Wake `await_payment_success` so a failed rebalance payment stops the wait instead of
+		// holding the rebalancer until an unrelated payment succeeds.
+		self.payment_success_notify.notify_waiters();
 
 		let id = parse_payment_id(&payment.id)?;
 
@@ -615,6 +623,173 @@ fn convert_from_uuid_id(uuid: [u8; 16]) -> [u8; 32] {
 	let mut bytes = [0; 32];
 	bytes[..16].copy_from_slice(&uuid);
 	bytes
+}
+
+/// The longest time `await_payment_success` waits for a payment to settle. A payment that never
+/// becomes visible, for example when the detached send task fails before the backend records it,
+/// must not hold the rebalancer forever.
+const PAYMENT_WAIT_TIMEOUT: Duration = Duration::from_secs(10 * 60);
+
+/// The result of one payment status query in [`wait_for_payment`].
+#[derive(Clone)]
+enum PaymentLookup<T> {
+	Completed(T),
+	Failed,
+	Wait,
+}
+
+/// Waits until `lookup` reports a terminal payment state.
+///
+/// The notification is registered before each query, so a completion that races with the query
+/// still wakes the loop. The wait ends with `None` if the payment fails, if `lookup` returns
+/// `None` (query error), if the wallet shuts down, or after `timeout`.
+async fn wait_for_payment<T, F, Fut>(
+	lookup: F, notify: &Notify, mut shutdown: watch::Receiver<()>, timeout: Duration,
+) -> Option<T>
+where
+	F: Fn() -> Fut,
+	Fut: Future<Output = Option<PaymentLookup<T>>>,
+{
+	let deadline = tokio::time::sleep(timeout);
+	tokio::pin!(deadline);
+	loop {
+		let notified = notify.notified();
+		tokio::pin!(notified);
+		notified.as_mut().enable();
+
+		match lookup().await? {
+			PaymentLookup::Completed(payment) => return Some(payment),
+			PaymentLookup::Failed => return None,
+			PaymentLookup::Wait => {},
+		}
+
+		tokio::select! {
+			_ = notified => {},
+			_ = &mut deadline => return None,
+			_ = shutdown.changed() => return None,
+		}
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+	use std::sync::Mutex;
+
+	/// Returns the scripted states in order and repeats the last state.
+	struct ScriptedLookup {
+		states: Mutex<Vec<Option<PaymentLookup<u64>>>>,
+	}
+
+	impl ScriptedLookup {
+		fn new(states: Vec<Option<PaymentLookup<u64>>>) -> Arc<Self> {
+			Arc::new(Self { states: Mutex::new(states) })
+		}
+
+		fn next(&self) -> Option<PaymentLookup<u64>> {
+			let mut states = self.states.lock().unwrap();
+			if states.len() > 1 { states.remove(0) } else { states[0].clone() }
+		}
+	}
+
+	async fn run_wait(
+		lookup: Arc<ScriptedLookup>, notify: Arc<Notify>, shutdown: watch::Receiver<()>,
+		timeout: Duration,
+	) -> Option<u64> {
+		wait_for_payment(|| async { lookup.next() }, &notify, shutdown, timeout).await
+	}
+
+	#[tokio::test]
+	async fn missing_payment_completes_after_notification() {
+		let lookup = ScriptedLookup::new(vec![
+			Some(PaymentLookup::Wait),
+			Some(PaymentLookup::Wait),
+			Some(PaymentLookup::Completed(21)),
+		]);
+		let notify = Arc::new(Notify::new());
+		let (_shutdown_tx, shutdown_rx) = watch::channel(());
+
+		let waiter = tokio::spawn(run_wait(
+			Arc::clone(&lookup),
+			Arc::clone(&notify),
+			shutdown_rx,
+			Duration::from_secs(5),
+		));
+		tokio::task::yield_now().await;
+		notify.notify_waiters();
+		tokio::task::yield_now().await;
+		notify.notify_waiters();
+
+		let result = tokio::time::timeout(Duration::from_secs(1), waiter)
+			.await
+			.expect("waiter must finish")
+			.expect("waiter task");
+		assert_eq!(result, Some(21));
+	}
+
+	#[tokio::test]
+	async fn failed_payment_ends_the_wait_after_notification() {
+		let lookup =
+			ScriptedLookup::new(vec![Some(PaymentLookup::Wait), Some(PaymentLookup::Failed)]);
+		let notify = Arc::new(Notify::new());
+		let (_shutdown_tx, shutdown_rx) = watch::channel(());
+
+		let waiter = tokio::spawn(run_wait(
+			Arc::clone(&lookup),
+			Arc::clone(&notify),
+			shutdown_rx,
+			Duration::from_secs(5),
+		));
+		tokio::task::yield_now().await;
+		notify.notify_waiters();
+
+		let result = tokio::time::timeout(Duration::from_secs(1), waiter)
+			.await
+			.expect("waiter must finish")
+			.expect("waiter task");
+		assert_eq!(result, None);
+	}
+
+	#[tokio::test]
+	async fn never_visible_payment_times_out() {
+		let lookup = ScriptedLookup::new(vec![Some(PaymentLookup::Wait)]);
+		let notify = Arc::new(Notify::new());
+		let (_shutdown_tx, shutdown_rx) = watch::channel(());
+
+		let result = tokio::time::timeout(
+			Duration::from_secs(1),
+			run_wait(lookup, notify, shutdown_rx, Duration::from_millis(50)),
+		)
+		.await
+		.expect("timeout must end the wait");
+		assert_eq!(result, None);
+	}
+
+	#[tokio::test]
+	async fn shutdown_ends_the_wait() {
+		let lookup = ScriptedLookup::new(vec![Some(PaymentLookup::Wait)]);
+		let notify = Arc::new(Notify::new());
+		let (shutdown_tx, shutdown_rx) = watch::channel(());
+
+		let waiter = tokio::spawn(run_wait(lookup, notify, shutdown_rx, Duration::from_secs(5)));
+		tokio::task::yield_now().await;
+		shutdown_tx.send(()).expect("receiver alive");
+
+		let result = tokio::time::timeout(Duration::from_secs(1), waiter)
+			.await
+			.expect("shutdown must end the wait")
+			.expect("waiter task");
+		assert_eq!(result, None);
+	}
+
+	#[tokio::test]
+	async fn query_error_ends_the_wait() {
+		let lookup = ScriptedLookup::new(vec![None]);
+		let notify = Arc::new(Notify::new());
+		let (_shutdown_tx, shutdown_rx) = watch::channel(());
+
+		assert_eq!(run_wait(lookup, notify, shutdown_rx, Duration::from_secs(5)).await, None);
+	}
 }
 
 impl From<breez_sdk_spark::PaymentStatus> for TxStatus {
