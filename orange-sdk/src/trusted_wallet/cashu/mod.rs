@@ -269,8 +269,11 @@ impl TrustedWalletInterface for Cashu {
 							"Failed to get active melt quotes: {e}"
 						))
 					})?;
-					let active_quote =
-						quotes.into_iter().find(|q| q.request == invoice.to_string());
+					let invoice_string = invoice.to_string();
+					let active_quote = quotes.into_iter().find(|q| {
+						q.request == invoice_string
+							&& quote_amount_matches(q.amount, &self.unit, amount)
+					});
 
 					match active_quote {
 						Some(q) => q,
@@ -987,5 +990,30 @@ fn convert_amount(cdk_amount: CdkAmount, unit: &CurrencyUnit) -> Result<Amount, 
 		unit => {
 			Err(TrustedError::Other(format!("Unsupported currency unit {unit} for Cashu wallet")))
 		},
+	}
+}
+
+fn quote_amount_matches(cdk_amount: CdkAmount, unit: &CurrencyUnit, amount: Amount) -> bool {
+	convert_amount(cdk_amount, unit).is_ok_and(|quote_amount| quote_amount == amount)
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	#[test]
+	fn amountless_quote_must_match_payment_amount() {
+		let requested = Amount::from_sats(21).expect("amount");
+
+		assert!(quote_amount_matches(CdkAmount::from(21), &CurrencyUnit::Sat, requested));
+		assert!(!quote_amount_matches(CdkAmount::from(20), &CurrencyUnit::Sat, requested));
+	}
+
+	#[test]
+	fn amountless_quote_uses_wallet_unit() {
+		let requested = Amount::from_milli_sats(21).expect("amount");
+
+		assert!(quote_amount_matches(CdkAmount::from(21), &CurrencyUnit::Msat, requested));
+		assert!(!quote_amount_matches(CdkAmount::from(21), &CurrencyUnit::Sat, requested));
 	}
 }
