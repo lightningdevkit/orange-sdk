@@ -769,7 +769,7 @@ impl Cashu {
 							let payment_preimage = preimage.unwrap_or(PaymentPreimage([0u8; 32]));
 
 							if tx_metadata
-								.set_preimage(payment_id, payment_preimage.0)
+								.set_preimage(payment_id, hash.0, payment_preimage.0)
 								.await
 								.is_err()
 							{
