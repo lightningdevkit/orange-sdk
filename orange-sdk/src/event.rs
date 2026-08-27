@@ -337,7 +337,10 @@ impl EventQueue {
 		{
 			let mut locked_queue = self.queue.lock().await;
 			locked_queue.push_back(event);
-			self.persist_queue(&locked_queue).await?;
+			if let Err(error) = self.persist_queue(&locked_queue).await {
+				locked_queue.pop_back();
+				return Err(error);
+			}
 		}
 
 		self.event_notify.notify_waiters();
@@ -460,7 +463,12 @@ mod tests {
 	use crate::logging::LoggerType;
 	use crate::store::{PaymentId, PaymentType, TxMetadata, TxMetadataStore, TxType};
 	use ldk_node::io::sqlite_store::SqliteStore;
+	use ldk_node::lightning::io;
+	use ldk_node::lightning::util::persist::{PageToken, PaginatedListResponse};
+	use std::future::Future;
 	use std::path::PathBuf;
+	use std::pin::Pin;
+	use std::sync::atomic::{AtomicBool, Ordering};
 	use std::time::{Duration, UNIX_EPOCH};
 
 	fn temp_sqlite_store() -> (PathBuf, Arc<dyn DynStore>) {
@@ -471,6 +479,51 @@ mod tests {
 		let store = SqliteStore::new(path.clone(), Some("orange.sqlite".to_string()), None)
 			.expect("sqlite store");
 		(path, Arc::new(store))
+	}
+
+	type StoreFuture<T> = Pin<Box<dyn Future<Output = T> + Send + 'static>>;
+
+	struct FailEventWriteStore {
+		inner: Arc<dyn DynStore>,
+		fail_next_event_write: Arc<AtomicBool>,
+	}
+
+	impl DynStore for FailEventWriteStore {
+		fn read_async(
+			&self, primary: &str, secondary: &str, key: &str,
+		) -> StoreFuture<Result<Vec<u8>, io::Error>> {
+			self.inner.read_async(primary, secondary, key)
+		}
+
+		fn write_async(
+			&self, primary: &str, secondary: &str, key: &str, data: Vec<u8>,
+		) -> StoreFuture<Result<(), io::Error>> {
+			if key == EVENT_QUEUE_PERSISTENCE_KEY
+				&& self.fail_next_event_write.swap(false, Ordering::SeqCst)
+			{
+				Box::pin(async { Err(io::Error::new(io::ErrorKind::Other, "injected failure")) })
+			} else {
+				self.inner.write_async(primary, secondary, key, data)
+			}
+		}
+
+		fn remove_async(
+			&self, primary: &str, secondary: &str, key: &str, lazy: bool,
+		) -> StoreFuture<Result<(), io::Error>> {
+			self.inner.remove_async(primary, secondary, key, lazy)
+		}
+
+		fn list_async(
+			&self, primary: &str, secondary: &str,
+		) -> StoreFuture<Result<Vec<String>, io::Error>> {
+			self.inner.list_async(primary, secondary)
+		}
+
+		fn list_paginated_async(
+			&self, primary: &str, secondary: &str, token: Option<PageToken>,
+		) -> StoreFuture<Result<PaginatedListResponse, io::Error>> {
+			self.inner.list_paginated_async(primary, secondary, token)
+		}
 	}
 
 	fn mpp_metadata(surface_id: PaymentId, lightning_leg: [u8; 32]) -> TxMetadata {
@@ -539,6 +592,36 @@ mod tests {
 		let restarted = EventQueue::new(store, tx_metadata, logger).await.expect("restart queue");
 
 		assert_eq!(restarted.next_event().await, Some(expected));
+	}
+
+	#[tokio::test]
+	async fn failed_enqueue_is_removed_before_source_retry() {
+		let (_path, inner) = temp_sqlite_store();
+		let fail_next_event_write = Arc::new(AtomicBool::new(false));
+		let store: Arc<dyn DynStore> = Arc::new(FailEventWriteStore {
+			inner,
+			fail_next_event_write: Arc::clone(&fail_next_event_write),
+		});
+		let tx_metadata = TxMetadataStore::new(Arc::clone(&store)).await;
+		let queue = EventQueue::new(
+			store,
+			tx_metadata,
+			Arc::new(Logger::new(&LoggerType::LogFacade).expect("logger")),
+		)
+		.await
+		.expect("event queue");
+		let event = Event::PaymentFailed {
+			payment_id: PaymentId::SelfCustodial([1u8; 32]),
+			payment_hash: Some(PaymentHash([2u8; 32])),
+			reason: None,
+		};
+
+		fail_next_event_write.store(true, Ordering::SeqCst);
+		assert!(queue.add_event(event.clone()).await.is_err());
+		queue.add_event(event.clone()).await.expect("source retry");
+		assert_eq!(queue.next_event().await, Some(event));
+		queue.event_handled().await.expect("acknowledge event");
+		assert_eq!(queue.next_event().await, None);
 	}
 
 	#[tokio::test]
