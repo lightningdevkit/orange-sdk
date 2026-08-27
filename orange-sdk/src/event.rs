@@ -369,8 +369,13 @@ impl EventQueue {
 	pub(crate) async fn event_handled(&self) -> Result<(), ldk_node::lightning::io::Error> {
 		{
 			let mut locked_queue = self.queue.lock().await;
-			locked_queue.pop_front();
-			self.persist_queue(&locked_queue).await?;
+			let handled = locked_queue.pop_front();
+			if let Err(error) = self.persist_queue(&locked_queue).await {
+				if let Some(event) = handled {
+					locked_queue.push_front(event);
+				}
+				return Err(error);
+			}
 		}
 
 		self.event_notify.notify_waiters();
@@ -622,6 +627,40 @@ mod tests {
 		assert_eq!(queue.next_event().await, Some(event));
 		queue.event_handled().await.expect("acknowledge event");
 		assert_eq!(queue.next_event().await, None);
+	}
+
+	#[tokio::test]
+	async fn failed_acknowledgement_keeps_front_event() {
+		let (_path, inner) = temp_sqlite_store();
+		let fail_next_event_write = Arc::new(AtomicBool::new(false));
+		let store: Arc<dyn DynStore> = Arc::new(FailEventWriteStore {
+			inner,
+			fail_next_event_write: Arc::clone(&fail_next_event_write),
+		});
+		let tx_metadata = TxMetadataStore::new(Arc::clone(&store)).await;
+		let queue = EventQueue::new(
+			store,
+			tx_metadata,
+			Arc::new(Logger::new(&LoggerType::LogFacade).expect("logger")),
+		)
+		.await
+		.expect("event queue");
+		let first = Event::RebalanceInitiated {
+			trigger_payment_id: PaymentId::SelfCustodial([1u8; 32]),
+			trusted_rebalance_payment_id: [2u8; 32],
+			amount_msat: 1,
+		};
+		let second = Event::RebalanceInitiated {
+			trigger_payment_id: PaymentId::SelfCustodial([3u8; 32]),
+			trusted_rebalance_payment_id: [4u8; 32],
+			amount_msat: 2,
+		};
+		queue.add_event(first.clone()).await.expect("first event");
+		queue.add_event(second).await.expect("second event");
+
+		fail_next_event_write.store(true, Ordering::SeqCst);
+		assert!(queue.event_handled().await.is_err());
+		assert_eq!(queue.next_event().await, Some(first));
 	}
 
 	#[tokio::test]
