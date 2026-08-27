@@ -16,7 +16,6 @@ use cdk::nuts::{
 	CurrencyUnit, Id, KeySet, KeySetInfo, Keys, MintInfo, PublicKey, SpendingConditions, State,
 };
 use cdk::types::ProofInfo;
-use cdk::util::hex;
 use cdk::wallet::{
 	MeltQuote, MintQuote,
 	types::{Transaction, TransactionDirection, TransactionId},
@@ -42,7 +41,6 @@ const TRANSACTIONS_KEY: &str = "transactions";
 const KEYSETS_TABLE_KEY: &str = "keysets_table";
 const KEYSET_U32_MAPPING_KEY: &str = "keyset_u32_mapping";
 const SAGAS_KEY: &str = "sagas";
-const PROOF_RESERVATIONS_KEY: &str = "proof_reservations";
 const HAS_RECOVERED_KEY: &str = "has_recovered";
 
 #[derive(serde::Deserialize, serde::Serialize)]
@@ -1060,49 +1058,47 @@ impl WalletDatabase<cdk::cdk_database::Error> for CashuKvDatabase {
 	async fn reserve_proofs(
 		&self, ys: Vec<PublicKey>, operation_id: &uuid::Uuid,
 	) -> Result<(), cdk::cdk_database::Error> {
-		// Store which Y values are reserved by this operation
-		let key = operation_id.to_string();
-		let ys_data: Vec<String> = ys.iter().map(|y| hex::encode(y.serialize())).collect();
-		let data = serde_json::to_vec(&ys_data)
-			.map_err(|e| DatabaseError::Serialization(e.to_string()))?;
-		KVStore::write(self.store.as_ref(), CASHU_PRIMARY_KEY, PROOF_RESERVATIONS_KEY, &key, data)
-			.await
-			.map_err(DatabaseError::Io)?;
+		let _guard = self.proofs_mutation_lock.lock().await;
+		let requested_count = ys.len();
+		let requested: HashSet<_> = ys.into_iter().collect();
+		let mut reserved_proofs = self.proofs_cache.read().unwrap().clone();
+		if requested.len() != requested_count
+			|| requested.len()
+				!= reserved_proofs
+					.iter()
+					.filter(|proof| requested.contains(&proof.y) && proof.state == State::Unspent)
+					.count()
+		{
+			return Err(cdk::cdk_database::Error::ProofNotUnspent);
+		}
 
-		self.update_proofs_state(ys, State::Reserved).await
+		for proof in &mut reserved_proofs {
+			if requested.contains(&proof.y) {
+				proof.state = State::Reserved;
+				proof.used_by_operation = Some(*operation_id);
+			}
+		}
+		self.persist_proofs(&reserved_proofs).await?;
+		*self.proofs_cache.write().unwrap() = reserved_proofs;
+		Ok(())
 	}
 
 	async fn release_proofs(
 		&self, operation_id: &uuid::Uuid,
 	) -> Result<(), cdk::cdk_database::Error> {
-		let key = operation_id.to_string();
-		match KVStore::read(self.store.as_ref(), CASHU_PRIMARY_KEY, PROOF_RESERVATIONS_KEY, &key)
-			.await
-		{
-			Ok(data) if !data.is_empty() => {
-				let ys_hex: Vec<String> = serde_json::from_slice(&data)
-					.map_err(|e| DatabaseError::Serialization(e.to_string()))?;
-				let ys: Vec<PublicKey> = ys_hex
-					.iter()
-					.filter_map(|h| {
-						let bytes = hex::decode(h).ok()?;
-						PublicKey::from_slice(&bytes).ok()
-					})
-					.collect();
-				if !ys.is_empty() {
-					self.update_proofs_state(ys, State::Unspent).await?;
-				}
-				KVStore::remove(
-					self.store.as_ref(),
-					CASHU_PRIMARY_KEY,
-					PROOF_RESERVATIONS_KEY,
-					&key,
-					false,
-				)
-				.await
-				.map_err(DatabaseError::Io)?;
-			},
-			_ => {},
+		let _guard = self.proofs_mutation_lock.lock().await;
+		let mut proofs = self.proofs_cache.read().unwrap().clone();
+		let mut changed = false;
+		for proof in &mut proofs {
+			if proof.used_by_operation == Some(*operation_id) {
+				proof.state = State::Unspent;
+				proof.used_by_operation = None;
+				changed = true;
+			}
+		}
+		if changed {
+			self.persist_proofs(&proofs).await?;
+			*self.proofs_cache.write().unwrap() = proofs;
 		}
 		Ok(())
 	}
@@ -1110,24 +1106,14 @@ impl WalletDatabase<cdk::cdk_database::Error> for CashuKvDatabase {
 	async fn get_reserved_proofs(
 		&self, operation_id: &uuid::Uuid,
 	) -> Result<Vec<ProofInfo>, cdk::cdk_database::Error> {
-		let key = operation_id.to_string();
-		match KVStore::read(self.store.as_ref(), CASHU_PRIMARY_KEY, PROOF_RESERVATIONS_KEY, &key)
-			.await
-		{
-			Ok(data) if !data.is_empty() => {
-				let ys_hex: Vec<String> = serde_json::from_slice(&data)
-					.map_err(|e| DatabaseError::Serialization(e.to_string()))?;
-				let ys: Vec<PublicKey> = ys_hex
-					.iter()
-					.filter_map(|h| {
-						let bytes = hex::decode(h).ok()?;
-						PublicKey::from_slice(&bytes).ok()
-					})
-					.collect();
-				self.get_proofs_by_ys(ys).await
-			},
-			_ => Ok(Vec::new()),
-		}
+		Ok(self
+			.proofs_cache
+			.read()
+			.unwrap()
+			.iter()
+			.filter(|proof| proof.used_by_operation == Some(*operation_id))
+			.cloned()
+			.collect())
 	}
 
 	async fn reserve_melt_quote(
@@ -1487,6 +1473,34 @@ mod tests {
 		);
 		let restarted = CashuKvDatabase::new(store).await.unwrap();
 		assert_eq!(all_proofs(&restarted).await, proofs);
+	}
+
+	#[tokio::test]
+	async fn a_proof_cannot_be_reserved_by_two_operations() {
+		let store = Arc::new(ProofTestStore::default());
+		let database = CashuKvDatabase::new(store.clone()).await.unwrap();
+		let proof = proof_info("exclusively reserved proof", 1);
+		database.update_proofs(vec![proof.clone()], vec![]).await.unwrap();
+		let first_operation = uuid::Uuid::from_u128(1);
+		let second_operation = uuid::Uuid::from_u128(2);
+
+		database.reserve_proofs(vec![proof.y], &first_operation).await.unwrap();
+		let second_result = database.reserve_proofs(vec![proof.y], &second_operation).await;
+
+		assert!(matches!(second_result, Err(cdk::cdk_database::Error::ProofNotUnspent)));
+		let mut reserved_proof = proof;
+		reserved_proof.state = State::Reserved;
+		reserved_proof.used_by_operation = Some(first_operation);
+		assert_eq!(
+			database.get_reserved_proofs(&first_operation).await.unwrap(),
+			vec![reserved_proof]
+		);
+		assert!(database.get_reserved_proofs(&second_operation).await.unwrap().is_empty());
+
+		let restarted = CashuKvDatabase::new(store).await.unwrap();
+		assert_eq!(restarted.get_reserved_proofs(&first_operation).await.unwrap().len(), 1);
+		restarted.release_proofs(&first_operation).await.unwrap();
+		assert!(restarted.get_reserved_proofs(&first_operation).await.unwrap().is_empty());
 	}
 
 	#[tokio::test]
