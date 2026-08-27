@@ -36,6 +36,9 @@ pub trait RebalanceTrigger: Send + Sync {
 
 	/// If we need to do an Onchain -> LN rebalance, if the amount is None, no rebalance will be triggered.
 	fn needs_onchain_rebalance(&self) -> impl Future<Output = Option<TriggerParams>> + Send;
+
+	/// Durably reserve a trusted rebalance trigger before payment starts.
+	fn reserve_trusted_rebalance(&self, trigger_id: [u8; 32]) -> impl Future<Output = bool> + Send;
 }
 
 /// Configuration parameters for rebalancing decisions
@@ -314,6 +317,10 @@ where
 				"Attempting to pay invoice {inv} to rebalance for {transfer_amt:?}",
 			);
 			let expected_hash = inv.payment_hash();
+			if !self.trigger.reserve_trusted_rebalance(params.id).await {
+				log_info!(self.logger, "Rebalance trigger was already reserved");
+				return;
+			}
 			match self.trusted.pay(PaymentMethod::LightningBolt11(inv), transfer_amt).await {
 				Ok(rebalance_id) => {
 					log_debug!(

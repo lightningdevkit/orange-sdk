@@ -268,6 +268,10 @@ impl RebalanceTrigger for OrangeTrigger {
 			}
 		}
 	}
+
+	fn reserve_trusted_rebalance(&self, trigger_id: [u8; 32]) -> impl Future<Output = bool> + Send {
+		async move { self.tx_metadata.reserve_tx_for_rebalance(&PaymentId::Trusted(trigger_id)).await }
+	}
 }
 
 fn is_completed_inbound(outbound: bool, status: TxStatus) -> bool {

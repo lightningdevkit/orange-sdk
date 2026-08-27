@@ -451,6 +451,8 @@ pub(crate) struct TxMetadataStore {
 	/// persist them out of order, leaving a stale (non-finalized) entry on disk that would
 	/// re-emit the combined event after a restart.
 	mpp_record_lock: Arc<tokio::sync::Mutex<()>>,
+	/// Serializes durable trigger reservations.
+	rebalance_reservation_lock: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl TxMetadataStore {
@@ -474,6 +476,7 @@ impl TxMetadataStore {
 			store,
 			tx_metadata: Arc::new(RwLock::new(tx_metadata)),
 			mpp_record_lock: Arc::new(tokio::sync::Mutex::new(())),
+			rebalance_reservation_lock: Arc::new(tokio::sync::Mutex::new(())),
 		}
 	}
 
@@ -504,6 +507,13 @@ impl TxMetadataStore {
 	}
 
 	pub async fn set_tx_caused_rebalance(&self, payment_id: &PaymentId) -> Result<(), ()> {
+		if matches!(
+			self.tx_metadata.read().unwrap().get(payment_id).map(|metadata| metadata.ty),
+			Some(TxType::PaymentTriggeringTransferLightning { .. })
+		) {
+			return Ok(());
+		}
+
 		let (key_str, ser) = {
 			let mut tx_metadata = self.tx_metadata.write().unwrap();
 			if let Some(metadata) = tx_metadata.get_mut(payment_id) {
@@ -525,6 +535,36 @@ impl TxMetadataStore {
 			.await
 			.expect("We do not allow writes to fail");
 		Ok(())
+	}
+
+	/// Durably reserves an incoming payment as a trusted rebalance trigger.
+	///
+	/// Returns `false` if the payment is absent, is not an ordinary payment, or
+	/// was already reserved.
+	pub async fn reserve_tx_for_rebalance(&self, payment_id: &PaymentId) -> bool {
+		let _reservation_guard = self.rebalance_reservation_lock.lock().await;
+		let reserved = {
+			let metadata = match self.tx_metadata.read().unwrap().get(payment_id).copied() {
+				Some(metadata) => metadata,
+				None => return false,
+			};
+			let TxType::Payment { ty } = metadata.ty else {
+				return false;
+			};
+			TxMetadata { ty: TxType::PaymentTriggeringTransferLightning { ty }, ..metadata }
+		};
+
+		KVStore::write(
+			self.store.as_ref(),
+			STORE_PRIMARY_KEY,
+			STORE_SECONDARY_KEY,
+			&payment_id.to_string(),
+			reserved.encode(),
+		)
+		.await
+		.expect("We do not allow writes to fail");
+		self.tx_metadata.write().unwrap().insert(*payment_id, reserved);
+		true
 	}
 
 	/// Atomically marks `trigger_id` as a rebalance trigger and writes `splice_metadata` for
@@ -860,6 +900,27 @@ mod tests {
 			.await
 			.unwrap();
 		assert!(bool::read(&mut &stored[..]).unwrap());
+	}
+
+	#[tokio::test]
+	async fn rebalance_trigger_reservation_is_durable_and_unique() {
+		let (_path, store) = temp_sqlite_store();
+		let tx_metadata = TxMetadataStore::new(Arc::clone(&store)).await;
+		let trigger = PaymentId::Trusted([3u8; 32]);
+		let metadata = TxMetadata {
+			ty: TxType::Payment { ty: PaymentType::IncomingLightning {} },
+			time: Duration::from_secs(1),
+		};
+		tx_metadata.insert(trigger, metadata).await;
+
+		assert!(tx_metadata.reserve_tx_for_rebalance(&trigger).await);
+		assert!(!tx_metadata.reserve_tx_for_rebalance(&trigger).await);
+
+		let restarted = TxMetadataStore::new(store).await;
+		assert!(matches!(
+			restarted.read().get(&trigger).map(|metadata| metadata.ty),
+			Some(TxType::PaymentTriggeringTransferLightning { .. })
+		));
 	}
 
 	fn mpp_metadata() -> TxMetadata {
