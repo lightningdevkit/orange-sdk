@@ -121,7 +121,11 @@ impl DummyTrustedWallet {
 						// Send a PaymentSuccessful event if not a rebalance
 						if !is_rebalance {
 							if tx_metadata
-								.set_preimage(payment_id, payment_preimage.unwrap().0)
+								.set_preimage(
+									payment_id,
+									payment_hash.0,
+									payment_preimage.unwrap().0,
+								)
 								.await
 								.is_err()
 							{

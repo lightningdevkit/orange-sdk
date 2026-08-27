@@ -15,6 +15,7 @@ use bitcoin_payment_instructions::amount::Amount;
 
 use crate::dyn_store::{DynStore, read_keys_bounded};
 use ldk_node::bitcoin::Txid;
+use ldk_node::bitcoin::hashes::{Hash, sha256};
 use ldk_node::bitcoin::hex::{DisplayHex, FromHex};
 use ldk_node::lightning::io;
 use ldk_node::lightning::ln::msgs::DecodeError;
@@ -445,6 +446,8 @@ impl_writeable_tlv_based!(TxMetadata, { (0, ty, required), (2, time, required) }
 pub(crate) struct TxMetadataStore {
 	tx_metadata: Arc<RwLock<HashMap<PaymentId, TxMetadata>>>,
 	store: Arc<dyn DynStore>,
+	/// Receipts that arrived before payment metadata was registered.
+	pending_preimages: Arc<RwLock<HashMap<PaymentId, PaymentPreimage>>>,
 	/// Serializes the read-modify-persist sequence in [`Self::record_mpp_leg`]. Both legs of a
 	/// multi-path payment record their result onto the same surface entry; without this, two
 	/// concurrent legs could each encode a partial snapshot under the in-memory lock and then
@@ -473,6 +476,7 @@ impl TxMetadataStore {
 		TxMetadataStore {
 			store,
 			tx_metadata: Arc::new(RwLock::new(tx_metadata)),
+			pending_preimages: Arc::new(RwLock::new(HashMap::new())),
 			mpp_record_lock: Arc::new(tokio::sync::Mutex::new(())),
 		}
 	}
@@ -481,12 +485,30 @@ impl TxMetadataStore {
 		self.tx_metadata.read().unwrap()
 	}
 
-	async fn do_set(&self, key: PaymentId, value: TxMetadata) -> bool {
+	async fn do_set(&self, key: PaymentId, mut value: TxMetadata) -> bool {
 		let key_str = key.to_string();
-		let ser = value.encode();
-		let old = {
+		let (old, ser) = {
 			let mut tx_metadata = self.tx_metadata.write().unwrap();
-			tx_metadata.insert(key, value)
+			if let Some(preimage) = self.pending_preimages.write().unwrap().remove(&key) {
+				value.ty = match value.ty {
+					TxType::Payment {
+						ty: PaymentType::OutgoingLightningBolt12 { payment_preimage: None },
+					} => TxType::Payment {
+						ty: PaymentType::OutgoingLightningBolt12 {
+							payment_preimage: Some(preimage),
+						},
+					},
+					TxType::Payment {
+						ty: PaymentType::OutgoingLightningBolt11 { payment_preimage: None },
+					} => TxType::Payment {
+						ty: PaymentType::OutgoingLightningBolt11 {
+							payment_preimage: Some(preimage),
+						},
+					},
+					other => other,
+				};
+			}
+			(tx_metadata.insert(key, value), value.encode())
 		};
 		KVStore::write(self.store.as_ref(), STORE_PRIMARY_KEY, STORE_SECONDARY_KEY, &key_str, ser)
 			.await
@@ -579,10 +601,15 @@ impl TxMetadataStore {
 		Ok(())
 	}
 
-	/// Sets the preimage for an outgoing lightning payment. If the payment already has a preimage,
-	/// this is a no-op and returns Ok(()). If the payment_id does not exist in the store, or if the payment
-	/// is not an outgoing lightning payment, returns Err(()).
-	pub async fn set_preimage(&self, payment_id: PaymentId, preimage: [u8; 32]) -> Result<(), ()> {
+	/// Sets the preimage for an outgoing Lightning payment.
+	///
+	/// If metadata does not exist, the receipt is staged until registration.
+	pub async fn set_preimage(
+		&self, payment_id: PaymentId, payment_hash: [u8; 32], preimage: [u8; 32],
+	) -> Result<(), ()> {
+		if sha256::Hash::hash(&preimage).to_byte_array() != payment_hash {
+			return Err(());
+		}
 		let (key_str, ser) = {
 			let mut tx_metadata = self.tx_metadata.write().unwrap();
 			if let Some(metadata) = tx_metadata.get_mut(&payment_id) {
@@ -626,8 +653,12 @@ impl TxMetadataStore {
 					},
 				}
 			} else {
-				eprintln!("doesn't exist in metadata store: {payment_id}");
-				return Err(());
+				self.pending_preimages
+					.write()
+					.unwrap()
+					.entry(payment_id)
+					.or_insert(PaymentPreimage(preimage));
+				return Ok(());
 			}
 		};
 
@@ -860,6 +891,38 @@ mod tests {
 			.await
 			.unwrap();
 		assert!(bool::read(&mut &stored[..]).unwrap());
+	}
+
+	#[tokio::test]
+	async fn preimage_is_staged_until_metadata_exists() {
+		let (_path, store) = temp_sqlite_store();
+		let tx_metadata = TxMetadataStore::new(store).await;
+		let preimage = [1u8; 32];
+		let payment_hash = sha256::Hash::hash(&preimage).to_byte_array();
+		let payment_id = PaymentId::SelfCustodial(payment_hash);
+
+		tx_metadata.set_preimage(payment_id, payment_hash, preimage).await.unwrap();
+		tx_metadata
+			.insert(
+				payment_id,
+				TxMetadata {
+					ty: TxType::Payment {
+						ty: PaymentType::OutgoingLightningBolt11 { payment_preimage: None },
+					},
+					time: Duration::from_secs(1),
+				},
+			)
+			.await;
+
+		let ty = tx_metadata.read().get(&payment_id).expect("metadata").ty;
+		assert!(matches!(
+			ty,
+			TxType::Payment {
+				ty: PaymentType::OutgoingLightningBolt11 {
+					payment_preimage: Some(PaymentPreimage(bytes))
+				}
+			} if bytes == preimage
+		));
 	}
 
 	fn mpp_metadata() -> TxMetadata {
