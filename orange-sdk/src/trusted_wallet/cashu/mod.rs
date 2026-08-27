@@ -905,13 +905,15 @@ impl Cashu {
 				TrustedError::Other(format!("Failed to parse invoice from mint quote: {e}"))
 			})?;
 			let hash = invoice.payment_hash();
+			let amount_msat =
+				mint_quote_amount_msat(mint_quote.amount.unwrap_or_default(), &mint_quote.unit)?;
 
 			// Send a PaymentReceived event
 			event_queue
 				.add_event(Event::PaymentReceived {
 					payment_id: PaymentId::Trusted(payment_id),
 					payment_hash: hash,
-					amount_msat: u64::from(mint_quote.amount.unwrap_or_default()) * 1_000, /* convert to msats */
+					amount_msat,
 					custom_records: vec![],
 					lsp_fee_msats: None,
 				})
@@ -997,6 +999,10 @@ fn quote_amount_matches(cdk_amount: CdkAmount, unit: &CurrencyUnit, amount: Amou
 	convert_amount(cdk_amount, unit).is_ok_and(|quote_amount| quote_amount == amount)
 }
 
+fn mint_quote_amount_msat(cdk_amount: CdkAmount, unit: &CurrencyUnit) -> Result<u64, TrustedError> {
+	Ok(convert_amount(cdk_amount, unit)?.milli_sats())
+}
+
 #[cfg(test)]
 mod tests {
 	use super::*;
@@ -1015,5 +1021,17 @@ mod tests {
 
 		assert!(quote_amount_matches(CdkAmount::from(21), &CurrencyUnit::Msat, requested));
 		assert!(!quote_amount_matches(CdkAmount::from(21), &CurrencyUnit::Sat, requested));
+	}
+
+	#[test]
+	fn mint_quote_event_amount_uses_quote_unit() {
+		assert_eq!(
+			mint_quote_amount_msat(CdkAmount::from(21), &CurrencyUnit::Sat).expect("amount"),
+			21_000
+		);
+		assert_eq!(
+			mint_quote_amount_msat(CdkAmount::from(21), &CurrencyUnit::Msat).expect("amount"),
+			21
+		);
 	}
 }
