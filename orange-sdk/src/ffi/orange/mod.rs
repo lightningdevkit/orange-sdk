@@ -68,6 +68,15 @@ pub enum PaymentId {
 	Trusted(String),
 }
 
+/// A custom Lightning TLV record.
+#[derive(Debug, Clone, Eq, PartialEq, uniffi::Record)]
+pub struct CustomTlvRecord {
+	/// The TLV type number.
+	pub type_num: u64,
+	/// The record value.
+	pub value: Vec<u8>,
+}
+
 impl From<OrangePaymentId> for PaymentId {
 	fn from(id: OrangePaymentId) -> Self {
 		match id {
@@ -200,7 +209,7 @@ pub enum Event {
 		/// The value, in msats, that has been received.
 		amount_msat: u64,
 		/// Custom TLV records received on the payment
-		custom_records: Vec<Vec<u8>>,
+		custom_records: Vec<CustomTlvRecord>,
 		/// The value, in msats, that was skimmed off of this payment as an extra fee taken by LSP.
 		/// Typically, this is only present for payments that result in opening a channel.
 		lsp_fee_msats: Option<u64>,
@@ -307,7 +316,13 @@ impl From<OrangeEvent> for Event {
 				payment_id: payment_id.into(),
 				payment_hash: payment_hash.0.to_vec(),
 				amount_msat,
-				custom_records: custom_records.into_iter().map(|r| r.value).collect(),
+				custom_records: custom_records
+					.into_iter()
+					.map(|record| CustomTlvRecord {
+						type_num: record.type_num,
+						value: record.value,
+					})
+					.collect(),
 				lsp_fee_msats,
 			},
 			OrangeEvent::OnchainPaymentReceived { payment_id, txid, amount_sat, status: _ } => {
