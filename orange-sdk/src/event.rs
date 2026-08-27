@@ -64,7 +64,9 @@ pub enum Event {
 		/// A local identifier used to track the payment.
 		payment_id: PaymentId,
 		/// The hash of the payment.
-		payment_hash: PaymentHash,
+		///
+		/// This is unavailable for a reusable BOLT 12 Cashu quote.
+		payment_hash: Option<PaymentHash>,
 		/// The value, in msats, that has been received.
 		amount_msat: u64,
 		/// Custom TLV records received on the payment
@@ -160,7 +162,7 @@ impl_writeable_tlv_based_enum!(Event,
 	},
 	(2, PaymentReceived) => {
 		(0, payment_id, required),
-		(2, payment_hash, required),
+		(2, payment_hash, option),
 		(4, amount_msat, required),
 		(5, custom_records, optional_vec),
 		(7, lsp_fee_msats, option),
@@ -811,7 +813,7 @@ impl LdkEventHandler {
 					.event_queue
 					.add_event(Event::PaymentReceived {
 						payment_id: PaymentId::SelfCustodial(payment_id.0),
-						payment_hash,
+						payment_hash: Some(payment_hash),
 						amount_msat,
 						custom_records,
 						lsp_fee_msats,

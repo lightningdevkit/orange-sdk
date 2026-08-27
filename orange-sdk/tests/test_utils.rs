@@ -702,7 +702,7 @@ pub async fn open_channel_from_lsp(wallet: &orange_sdk::Wallet, payer: Arc<Node>
 		orange_sdk::Event::PaymentReceived { payment_hash, amount_msat, lsp_fee_msats, .. } => {
 			assert!(lsp_fee_msats.is_some()); // we expect a fee to be paid for opening a channel
 			assert_eq!(recv_amt.milli_sats(), amount_msat + lsp_fee_msats.unwrap_or(0)); // the fee will be deducted from the amount received
-			assert_eq!(payment_hash, uri.invoice.payment_hash());
+			assert_eq!(payment_hash, Some(uri.invoice.payment_hash()));
 		},
 		_ => panic!("Expected PaymentReceived event"),
 	}

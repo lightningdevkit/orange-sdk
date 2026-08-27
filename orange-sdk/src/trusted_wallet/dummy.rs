@@ -204,7 +204,7 @@ impl DummyTrustedWallet {
 						event_queue
 							.add_event(crate::Event::PaymentReceived {
 								payment_id: PaymentId::Trusted(id),
-								payment_hash,
+								payment_hash: Some(payment_hash),
 								amount_msat,
 								custom_records: vec![],
 								lsp_fee_msats: None,

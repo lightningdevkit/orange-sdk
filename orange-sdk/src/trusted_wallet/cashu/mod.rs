@@ -21,7 +21,7 @@ use bitcoin_payment_instructions::amount::Amount;
 
 use cdk::amount::SplitTarget;
 use cdk::nuts::MeltOptions;
-use cdk::nuts::nut00::PaymentMethod as CdkPaymentMethod;
+use cdk::nuts::nut00::{PaymentMethod as CdkPaymentMethod, ProofsMethods};
 use cdk::nuts::nut23::Amountless;
 use cdk::nuts::{CurrencyUnit, MeltQuoteState};
 use cdk::wallet::MintQuote;
@@ -899,20 +899,18 @@ impl Cashu {
 			// Convert quote ID to a 32-byte payment ID
 			let payment_id = Self::id_to_32_byte_array(&mint_quote.id);
 
-			// Parse the invoice to get the payment hash
-			// todo this won't work for bolt12
-			let invoice = Bolt11Invoice::from_str(&mint_quote.request).map_err(|e| {
-				TrustedError::Other(format!("Failed to parse invoice from mint quote: {e}"))
+			let payment_hash =
+				mint_quote_payment_hash(&mint_quote.payment_method, &mint_quote.request)?;
+			let minted_amount = proofs.total_amount().map_err(|error| {
+				TrustedError::Other(format!("Failed to total mint proofs: {error}"))
 			})?;
-			let hash = invoice.payment_hash();
-			let amount_msat =
-				mint_quote_amount_msat(mint_quote.amount.unwrap_or_default(), &mint_quote.unit)?;
+			let amount_msat = mint_quote_amount_msat(minted_amount, &mint_quote.unit)?;
 
 			// Send a PaymentReceived event
 			event_queue
 				.add_event(Event::PaymentReceived {
 					payment_id: PaymentId::Trusted(payment_id),
-					payment_hash: hash,
+					payment_hash,
 					amount_msat,
 					custom_records: vec![],
 					lsp_fee_msats: None,
@@ -1003,6 +1001,19 @@ fn mint_quote_amount_msat(cdk_amount: CdkAmount, unit: &CurrencyUnit) -> Result<
 	Ok(convert_amount(cdk_amount, unit)?.milli_sats())
 }
 
+fn mint_quote_payment_hash(
+	payment_method: &CdkPaymentMethod, request: &str,
+) -> Result<Option<PaymentHash>, TrustedError> {
+	if payment_method == &CdkPaymentMethod::BOLT11 {
+		let invoice = Bolt11Invoice::from_str(request).map_err(|error| {
+			TrustedError::Other(format!("Failed to parse invoice from mint quote: {error}"))
+		})?;
+		Ok(Some(invoice.payment_hash()))
+	} else {
+		Ok(None)
+	}
+}
+
 #[cfg(test)]
 mod tests {
 	use super::*;
@@ -1032,6 +1043,15 @@ mod tests {
 		assert_eq!(
 			mint_quote_amount_msat(CdkAmount::from(21), &CurrencyUnit::Msat).expect("amount"),
 			21
+		);
+	}
+
+	#[test]
+	fn bolt12_mint_quote_does_not_require_bolt11_invoice() {
+		assert_eq!(
+			mint_quote_payment_hash(&CdkPaymentMethod::BOLT12, "not a BOLT 11 invoice")
+				.expect("BOLT 12 quote"),
+			None
 		);
 	}
 }
