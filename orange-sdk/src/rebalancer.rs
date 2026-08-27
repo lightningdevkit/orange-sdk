@@ -204,7 +204,10 @@ impl RebalanceTrigger for OrangeTrigger {
 						.filter_map(|t| {
 							if t.status != PaymentStatus::Succeeded
 								|| t.direction != PaymentDirection::Inbound
-								|| t.latest_update_timestamp <= onchain_sync_time
+								|| !trigger_amount_allows_onchain_rebalance(
+									t.amount_msat,
+									self.tunables.rebalance_min,
+								) || t.latest_update_timestamp <= onchain_sync_time
 							{
 								return None;
 							}
@@ -278,6 +281,12 @@ fn is_completed_inbound(outbound: bool, status: TxStatus) -> bool {
 	!outbound && status == TxStatus::Completed
 }
 
+fn trigger_amount_allows_onchain_rebalance(
+	trigger_amount_msat: Option<u64>, rebalance_min: Amount,
+) -> bool {
+	trigger_amount_msat.is_some_and(|amount| amount > rebalance_min.milli_sats())
+}
+
 #[cfg(test)]
 mod tests {
 	use super::*;
@@ -288,6 +297,15 @@ mod tests {
 		assert!(!is_completed_inbound(false, TxStatus::Pending));
 		assert!(!is_completed_inbound(false, TxStatus::Failed));
 		assert!(!is_completed_inbound(true, TxStatus::Completed));
+	}
+
+	#[test]
+	fn dust_receive_cannot_trigger_onchain_rebalance() {
+		let minimum = Amount::from_sats(5_000).expect("amount");
+
+		assert!(!trigger_amount_allows_onchain_rebalance(Some(1_000), minimum));
+		assert!(!trigger_amount_allows_onchain_rebalance(Some(5_000_000), minimum));
+		assert!(trigger_amount_allows_onchain_rebalance(Some(5_001_000), minimum));
 	}
 }
 
