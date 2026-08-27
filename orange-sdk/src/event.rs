@@ -712,8 +712,9 @@ impl LdkEventHandler {
 					return;
 				}
 			},
-			ldk_node::Event::SpliceNegotiationFailed { .. } => {
+			ldk_node::Event::SpliceNegotiationFailed { user_channel_id, .. } => {
 				log_warn!(self.logger, "Received SpliceNegotiationFailed event: {event:?}");
+				self.splice_pending_inbox.fail(user_channel_id.0);
 			},
 		}
 

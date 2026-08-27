@@ -228,7 +228,9 @@ impl LightningWallet {
 		Ok(Self { inner })
 	}
 
-	pub(crate) async fn await_splice_pending(&self, channel_id: u128) -> OutPoint {
+	pub(crate) async fn await_splice_pending(
+		&self, channel_id: u128,
+	) -> Result<OutPoint, NodeError> {
 		self.inner.splice_pending_inbox.wait_for(channel_id).await
 	}
 
@@ -348,7 +350,7 @@ impl LightningWallet {
 							)?;
 
 							let funding_txo =
-								self.await_splice_pending(chan.user_channel_id.0).await;
+								self.await_splice_pending(chan.user_channel_id.0).await?;
 
 							let id = PaymentId(funding_txo.txid.to_byte_array());
 							let details = PaymentDetails {
@@ -549,7 +551,7 @@ impl graduated_rebalancer::LightningWallet for LightningWallet {
 
 	fn await_splice_pending(
 		&self, channel_id: u128,
-	) -> Pin<Box<dyn Future<Output = OutPoint> + Send + '_>> {
+	) -> Pin<Box<dyn Future<Output = Result<OutPoint, Self::Error>> + Send + '_>> {
 		// `ChannelDetails.funding_txo` from `list_channels` still reports the old funding
 		// outpoint between `SplicePending` and `SpliceLocked`, so we return the new outpoint
 		// from the event itself rather than reading it back from the channel.
@@ -603,17 +605,27 @@ impl From<&PaymentDetails> for PaymentType {
 /// event: `watch` would let a second splice on the same channel observe the previous splice's stale
 /// outpoint instead of waiting for the new `SplicePending`.
 pub(crate) struct SplicePendingInbox {
-	pub(crate) pending: Mutex<HashMap<u128, VecDeque<OutPoint>>>,
+	pub(crate) pending: Mutex<HashMap<u128, VecDeque<Result<OutPoint, NodeError>>>>,
 	pub(crate) notify: Notify,
 }
 
 impl SplicePendingInbox {
 	pub(crate) fn deliver(&self, channel_id: u128, funding_txo: OutPoint) {
-		self.pending.lock().unwrap().entry(channel_id).or_default().push_back(funding_txo);
+		self.pending.lock().unwrap().entry(channel_id).or_default().push_back(Ok(funding_txo));
 		self.notify.notify_waiters();
 	}
 
-	pub(crate) async fn wait_for(&self, channel_id: u128) -> OutPoint {
+	pub(crate) fn fail(&self, channel_id: u128) {
+		self.pending
+			.lock()
+			.unwrap()
+			.entry(channel_id)
+			.or_default()
+			.push_back(Err(NodeError::ChannelSplicingFailed));
+		self.notify.notify_waiters();
+	}
+
+	pub(crate) async fn wait_for(&self, channel_id: u128) -> Result<OutPoint, NodeError> {
 		loop {
 			// Register interest BEFORE checking the queue so a `notify_waiters` racing with the
 			// check still wakes us up.
@@ -663,8 +675,18 @@ mod tests {
 		let mut pending = inbox.pending.lock().unwrap();
 		let queue = pending.get_mut(&channel_id).expect("channel should have pending events");
 
-		assert_eq!(queue.pop_front(), Some(first));
-		assert_eq!(queue.pop_front(), Some(second));
+		assert_eq!(queue.pop_front(), Some(Ok(first)));
+		assert_eq!(queue.pop_front(), Some(Ok(second)));
 		assert!(queue.is_empty());
+	}
+
+	#[tokio::test]
+	async fn splice_pending_inbox_reports_negotiation_failure() {
+		let inbox =
+			SplicePendingInbox { pending: Mutex::new(HashMap::new()), notify: Notify::new() };
+
+		inbox.fail(7);
+
+		assert_eq!(inbox.wait_for(7).await, Err(NodeError::ChannelSplicingFailed));
 	}
 }
