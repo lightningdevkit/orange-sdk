@@ -45,7 +45,7 @@ pub(crate) struct LightningWalletImpl {
 	pub(crate) ldk_node: Arc<ldk_node::Node>,
 	logger: Arc<Logger>,
 	store: Arc<dyn DynStore>,
-	payment_receipt_flag: watch::Receiver<()>,
+	payment_receipt_notify: Arc<Notify>,
 	channel_pending_receipt_flag: watch::Receiver<u128>,
 	splice_pending_inbox: Arc<SplicePendingInbox>,
 	lsp_node_id: PublicKey,
@@ -189,7 +189,7 @@ impl LightningWallet {
 
 		let ldk_node =
 			Arc::new(builder.build_with_store(node_entropy, LdkNodeStore(Arc::clone(&store)))?);
-		let (payment_receipt_sender, payment_receipt_flag) = watch::channel(());
+		let payment_receipt_notify = Arc::new(Notify::new());
 		let (channel_pending_sender, channel_pending_receipt_flag) = watch::channel(0);
 		let splice_pending_inbox = Arc::new(SplicePendingInbox {
 			pending: Mutex::new(HashMap::new()),
@@ -199,7 +199,7 @@ impl LightningWallet {
 			event_queue,
 			ldk_node: Arc::clone(&ldk_node),
 			tx_metadata,
-			payment_receipt_sender,
+			payment_receipt_notify: Arc::clone(&payment_receipt_notify),
 			channel_pending_sender,
 			splice_pending_inbox: Arc::clone(&splice_pending_inbox),
 			logger: Arc::clone(&logger),
@@ -208,7 +208,7 @@ impl LightningWallet {
 			ldk_node,
 			logger,
 			store,
-			payment_receipt_flag,
+			payment_receipt_notify,
 			channel_pending_receipt_flag,
 			splice_pending_inbox,
 			lsp_node_id,
@@ -226,12 +226,6 @@ impl LightningWallet {
 		});
 
 		Ok(Self { inner })
-	}
-
-	pub(crate) async fn await_payment_receipt(&self) {
-		let mut flag = self.inner.payment_receipt_flag.clone();
-		flag.mark_unchanged();
-		let _ = flag.changed().await;
 	}
 
 	pub(crate) async fn await_channel_pending(&self, channel_id: u128) {
@@ -491,6 +485,10 @@ impl graduated_rebalancer::LightningWallet for LightningWallet {
 		Box::pin(async move {
 			let id = PaymentId(payment_hash);
 			loop {
+				let notified = self.inner.payment_receipt_notify.notified();
+				tokio::pin!(notified);
+				notified.as_mut().enable();
+
 				if let Some(payment) = self.inner.ldk_node.payment(&id) {
 					let counterparty_skimmed_fee_msat = match payment.kind {
 						PaymentKind::Bolt11 { hash, counterparty_skimmed_fee_msat, .. } => {
@@ -510,7 +508,7 @@ impl graduated_rebalancer::LightningWallet for LightningWallet {
 						PaymentStatus::Failed => return None,
 					}
 				}
-				self.await_payment_receipt().await;
+				notified.await;
 			}
 		})
 	}
