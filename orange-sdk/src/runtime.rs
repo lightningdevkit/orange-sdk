@@ -60,6 +60,7 @@ impl Runtime {
 		F: Future<Output = ()> + Send + 'static,
 	{
 		let mut background_tasks = self.background_tasks.lock().unwrap();
+		self.reap_completed_tasks(&mut background_tasks);
 		let runtime_handle = self.handle();
 		background_tasks.spawn_on(future, runtime_handle);
 	}
@@ -69,6 +70,7 @@ impl Runtime {
 		F: Future<Output = ()> + Send + 'static,
 	{
 		let mut cancellable_background_tasks = self.cancellable_background_tasks.lock().unwrap();
+		self.reap_completed_tasks(&mut cancellable_background_tasks);
 		let runtime_handle = self.handle();
 		cancellable_background_tasks.spawn_on(future, runtime_handle);
 	}
@@ -144,9 +146,45 @@ impl Runtime {
 			RuntimeMode::Handle(handle) => handle,
 		}
 	}
+
+	fn reap_completed_tasks(&self, tasks: &mut JoinSet<()>) {
+		while let Some(result) = tasks.try_join_next() {
+			if let Err(error) = result {
+				log_error!(self.logger, "Background task failed: {error}");
+			}
+		}
+	}
 }
 
 enum RuntimeMode {
 	Owned(tokio::runtime::Runtime),
 	Handle(tokio::runtime::Handle),
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+	use crate::logging::LoggerType;
+	use std::sync::mpsc;
+
+	#[test]
+	fn spawning_reaps_completed_cancellable_tasks() {
+		let runtime = Runtime::new(Arc::new(Logger::new(&LoggerType::LogFacade).expect("logger")))
+			.expect("runtime");
+		let (done_tx, done_rx) = mpsc::channel();
+
+		for _ in 0..64 {
+			let done_tx = done_tx.clone();
+			runtime.spawn_cancellable_background_task(async move {
+				done_tx.send(()).expect("receiver");
+			});
+		}
+		for _ in 0..64 {
+			done_rx.recv_timeout(Duration::from_secs(1)).expect("task completion");
+		}
+
+		runtime.spawn_cancellable_background_task(async {});
+
+		assert!(runtime.cancellable_background_tasks.lock().unwrap().len() <= 1);
+	}
 }
