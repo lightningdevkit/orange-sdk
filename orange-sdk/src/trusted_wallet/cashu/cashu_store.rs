@@ -1060,16 +1060,52 @@ impl WalletDatabase<cdk::cdk_database::Error> for CashuKvDatabase {
 	async fn reserve_proofs(
 		&self, ys: Vec<PublicKey>, operation_id: &uuid::Uuid,
 	) -> Result<(), cdk::cdk_database::Error> {
-		// Store which Y values are reserved by this operation
+		let _guard = self.proofs_mutation_lock.lock().await;
+		let (committed_proofs, reserved_proofs) = {
+			let committed = self.proofs_cache.read().unwrap();
+			let mut requested = HashSet::with_capacity(ys.len());
+			if !ys.iter().all(|y| requested.insert(*y)) {
+				return Err(cdk::cdk_database::Error::Duplicate);
+			}
+			if !ys.iter().all(|y| {
+				committed.iter().any(|proof| proof.y == *y && proof.state == State::Unspent)
+			}) {
+				return Err(cdk::cdk_database::Error::Database(
+					"Proof is missing or already reserved".to_string().into(),
+				));
+			}
+
+			let mut reserved = committed.clone();
+			for proof in &mut reserved {
+				if requested.contains(&proof.y) {
+					proof.state = State::Reserved;
+				}
+			}
+			(committed.clone(), reserved)
+		};
+
+		// Persist the exclusive state before its owner. A crash between these writes leaves
+		// the proof unavailable instead of making it available to two operations.
+		self.persist_proofs(&reserved_proofs).await?;
 		let key = operation_id.to_string();
 		let ys_data: Vec<String> = ys.iter().map(|y| hex::encode(y.serialize())).collect();
 		let data = serde_json::to_vec(&ys_data)
 			.map_err(|e| DatabaseError::Serialization(e.to_string()))?;
-		KVStore::write(self.store.as_ref(), CASHU_PRIMARY_KEY, PROOF_RESERVATIONS_KEY, &key, data)
-			.await
-			.map_err(DatabaseError::Io)?;
+		if let Err(error) = KVStore::write(
+			self.store.as_ref(),
+			CASHU_PRIMARY_KEY,
+			PROOF_RESERVATIONS_KEY,
+			&key,
+			data,
+		)
+		.await
+		{
+			let _ = self.persist_proofs(&committed_proofs).await;
+			return Err(DatabaseError::Io(error).into());
+		}
 
-		self.update_proofs_state(ys, State::Reserved).await
+		*self.proofs_cache.write().unwrap() = reserved_proofs;
+		Ok(())
 	}
 
 	async fn release_proofs(
@@ -1300,6 +1336,7 @@ mod tests {
 	#[derive(Default)]
 	struct ProofTestStore {
 		proof_blob: Arc<StdMutex<Option<Vec<u8>>>>,
+		proof_reservations: Arc<StdMutex<HashMap<String, Vec<u8>>>>,
 		fail_next_proof_write: Arc<AtomicBool>,
 	}
 
@@ -1325,23 +1362,35 @@ mod tests {
 		fn read(
 			&self, primary_namespace: &str, secondary_namespace: &str, key: &str,
 		) -> impl std::future::Future<Output = Result<Vec<u8>, io::Error>> + Send + 'static {
-			let blob = if Self::is_proof_blob(primary_namespace, secondary_namespace, key) {
+			let value = if Self::is_proof_blob(primary_namespace, secondary_namespace, key) {
 				self.proof_blob.lock().unwrap().clone()
+			} else if primary_namespace == CASHU_PRIMARY_KEY
+				&& secondary_namespace == PROOF_RESERVATIONS_KEY
+			{
+				self.proof_reservations.lock().unwrap().get(key).cloned()
 			} else {
 				None
 			};
-			ready(blob.ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "key not found")))
+			ready(value.ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "key not found")))
 		}
 
 		fn write(
 			&self, primary_namespace: &str, secondary_namespace: &str, key: &str, buf: Vec<u8>,
 		) -> impl std::future::Future<Output = Result<(), io::Error>> + Send + 'static {
 			let is_proof_blob = Self::is_proof_blob(primary_namespace, secondary_namespace, key);
-			assert!(is_proof_blob, "unexpected non-proof write");
+			let is_reservation = primary_namespace == CASHU_PRIMARY_KEY
+				&& secondary_namespace == PROOF_RESERVATIONS_KEY;
+			assert!(is_proof_blob || is_reservation, "unexpected write");
 
 			let proof_blob = Arc::clone(&self.proof_blob);
+			let proof_reservations = Arc::clone(&self.proof_reservations);
 			let fail_next_proof_write = Arc::clone(&self.fail_next_proof_write);
+			let key = key.to_owned();
 			async move {
+				if is_reservation {
+					proof_reservations.lock().unwrap().insert(key, buf);
+					return Ok(());
+				}
 				// Make concurrent database updates overlap if they are not correctly locked.
 				tokio::task::yield_now().await;
 				if fail_next_proof_write.swap(false, Ordering::SeqCst) {
@@ -1353,8 +1402,13 @@ mod tests {
 		}
 
 		fn remove(
-			&self, _primary_namespace: &str, _secondary_namespace: &str, _key: &str, _lazy: bool,
+			&self, primary_namespace: &str, secondary_namespace: &str, key: &str, _lazy: bool,
 		) -> impl std::future::Future<Output = Result<(), io::Error>> + Send + 'static {
+			if primary_namespace == CASHU_PRIMARY_KEY
+				&& secondary_namespace == PROOF_RESERVATIONS_KEY
+			{
+				self.proof_reservations.lock().unwrap().remove(key);
+			}
 			ready(Ok(()))
 		}
 
@@ -1487,6 +1541,28 @@ mod tests {
 		);
 		let restarted = CashuKvDatabase::new(store).await.unwrap();
 		assert_eq!(all_proofs(&restarted).await, proofs);
+	}
+
+	#[tokio::test]
+	async fn a_proof_cannot_be_reserved_by_two_operations() {
+		let store = Arc::new(ProofTestStore::default());
+		let database = CashuKvDatabase::new(store).await.unwrap();
+		let proof = proof_info("exclusively reserved proof", 1);
+		database.update_proofs(vec![proof.clone()], vec![]).await.unwrap();
+		let first_operation = uuid::Uuid::from_u128(1);
+		let second_operation = uuid::Uuid::from_u128(2);
+
+		database.reserve_proofs(vec![proof.y], &first_operation).await.unwrap();
+		let second_result = database.reserve_proofs(vec![proof.y], &second_operation).await;
+
+		assert!(second_result.is_err());
+		let mut reserved_proof = proof;
+		reserved_proof.state = State::Reserved;
+		assert_eq!(
+			database.get_reserved_proofs(&first_operation).await.unwrap(),
+			vec![reserved_proof]
+		);
+		assert!(database.get_reserved_proofs(&second_operation).await.unwrap().is_empty());
 	}
 
 	#[tokio::test]
