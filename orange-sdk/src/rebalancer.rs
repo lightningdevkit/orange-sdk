@@ -204,7 +204,9 @@ impl RebalanceTrigger for OrangeTrigger {
 						.filter_map(|t| {
 							if t.status != PaymentStatus::Succeeded
 								|| t.direction != PaymentDirection::Inbound
-								|| t.latest_update_timestamp <= onchain_sync_time
+								|| !t.amount_msat.is_some_and(|amount| {
+									amount > self.tunables.rebalance_min.milli_sats()
+								}) || t.latest_update_timestamp <= onchain_sync_time
 							{
 								return None;
 							}
