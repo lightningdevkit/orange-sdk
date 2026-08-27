@@ -27,7 +27,7 @@ use breez_sdk_spark::{
 
 use graduated_rebalancer::ReceivedLightningPayment;
 
-use tokio::sync::watch;
+use tokio::sync::{Notify, watch};
 
 use crate::runtime::Runtime;
 use std::future::Future;
@@ -97,7 +97,7 @@ impl SparkWalletConfig {
 pub(crate) struct Spark {
 	spark_wallet: Arc<BreezSdk>,
 	shutdown_sender: watch::Sender<()>,
-	payment_success_flag: watch::Receiver<()>,
+	payment_success_notify: Arc<Notify>,
 	logger: Arc<Logger>,
 }
 
@@ -270,6 +270,10 @@ impl TrustedWalletInterface for Spark {
 	) -> Pin<Box<dyn Future<Output = Option<ReceivedLightningPayment>> + Send + '_>> {
 		Box::pin(async move {
 			loop {
+				let notified = self.payment_success_notify.notified();
+				tokio::pin!(notified);
+				notified.as_mut().enable();
+
 				let res =
 					self.spark_wallet.list_payments(ListPaymentsRequest::default()).await.ok()?;
 
@@ -281,16 +285,22 @@ impl TrustedWalletInterface for Spark {
 					} else {
 						false
 					}
-				})?;
+				});
 
-				if tx.status == PaymentStatus::Completed {
-					return Some(ReceivedLightningPayment {
-						id: payment_hash,
-						fee_paid_msat: Some((tx.fees * 1_000) as u64),
-					});
+				match payment_wait_status(tx.as_ref().map(|payment| &payment.status)) {
+					PaymentWaitStatus::Completed => {
+						if let Some(tx) = tx {
+							return Some(ReceivedLightningPayment {
+								id: payment_hash,
+								fee_paid_msat: Some((tx.fees * 1_000) as u64),
+							});
+						}
+					},
+					PaymentWaitStatus::Failed => return None,
+					PaymentWaitStatus::Wait => {},
 				}
 
-				self.await_payment_success().await;
+				notified.await;
 			}
 		})
 	}
@@ -360,12 +370,12 @@ impl Spark {
 		log_info!(logger, "Started Spark wallet!");
 
 		let (shutdown_sender, shutdown_receiver) = watch::channel::<()>(());
-		let (payment_success_sender, payment_success_flag) = watch::channel(());
+		let payment_success_notify = Arc::new(Notify::new());
 
 		let listener = SparkEventHandler {
 			event_queue: Arc::clone(&event_queue),
 			tx_metadata,
-			payment_success_sender,
+			payment_success_notify: Arc::clone(&payment_success_notify),
 			logger: Arc::clone(&logger),
 		};
 
@@ -380,20 +390,14 @@ impl Spark {
 
 		log_info!(logger, "Spark wallet initialized");
 
-		Ok(Spark { spark_wallet, shutdown_sender, payment_success_flag, logger })
-	}
-
-	pub(crate) async fn await_payment_success(&self) {
-		let mut flag = self.payment_success_flag.clone();
-		flag.mark_unchanged();
-		let _ = flag.changed().await;
+		Ok(Spark { spark_wallet, shutdown_sender, payment_success_notify, logger })
 	}
 }
 
 struct SparkEventHandler {
 	event_queue: Arc<EventQueue>,
 	tx_metadata: TxMetadataStore,
-	payment_success_sender: watch::Sender<()>,
+	payment_success_notify: Arc<Notify>,
 	logger: Arc<Logger>,
 }
 
@@ -466,7 +470,7 @@ impl SparkEventHandler {
 								"Ignoring successful payment event for rebalance payment: {payment_id:?}"
 							);
 							// make sure we still send payment success
-							self.payment_success_sender.send(()).unwrap();
+							self.payment_success_notify.notify_waiters();
 							return Ok(());
 						}
 
@@ -500,7 +504,7 @@ impl SparkEventHandler {
 							})
 							.await?;
 
-						self.payment_success_sender.send(()).unwrap();
+						self.payment_success_notify.notify_waiters();
 					},
 					_ => {
 						log_debug!(self.logger, "Unsupported payment details for Send: {payment:?}")
@@ -615,6 +619,32 @@ fn convert_from_uuid_id(uuid: [u8; 16]) -> [u8; 32] {
 	let mut bytes = [0; 32];
 	bytes[..16].copy_from_slice(&uuid);
 	bytes
+}
+
+#[derive(Debug, PartialEq)]
+enum PaymentWaitStatus {
+	Wait,
+	Completed,
+	Failed,
+}
+
+fn payment_wait_status(status: Option<&PaymentStatus>) -> PaymentWaitStatus {
+	match status {
+		Some(PaymentStatus::Completed) => PaymentWaitStatus::Completed,
+		Some(PaymentStatus::Failed) => PaymentWaitStatus::Failed,
+		Some(PaymentStatus::Pending) | None => PaymentWaitStatus::Wait,
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	#[test]
+	fn missing_spark_payment_remains_pending() {
+		assert_eq!(payment_wait_status(None), PaymentWaitStatus::Wait);
+		assert_eq!(payment_wait_status(Some(&PaymentStatus::Pending)), PaymentWaitStatus::Wait);
+	}
 }
 
 impl From<breez_sdk_spark::PaymentStatus> for TxStatus {
