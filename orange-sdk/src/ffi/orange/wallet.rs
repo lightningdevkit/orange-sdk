@@ -207,11 +207,8 @@ impl Wallet {
 	pub async fn estimate_fee(
 		&self, payment_info: Arc<PaymentInfo>,
 	) -> Result<Arc<Amount>, WalletError> {
-		let fee = RTPoller::new(
-			self.inner.estimate_fee(&payment_info.0.instructions),
-			Arc::clone(&self.rt),
-		)
-		.await;
+		let fee =
+			RTPoller::new(self.inner.estimate_fee(&payment_info.0), Arc::clone(&self.rt)).await?;
 		Ok(Arc::new(fee.into()))
 	}
 

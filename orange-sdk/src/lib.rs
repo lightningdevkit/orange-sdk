@@ -48,7 +48,7 @@ mod runtime;
 mod store;
 pub mod trusted_wallet;
 
-use lightning_wallet::LightningWallet;
+use lightning_wallet::{LightningWallet, LightningWalletBalance};
 use logging::Logger;
 use trusted_wallet::TrustedError;
 
@@ -989,7 +989,7 @@ impl Wallet {
 					TxType::OnchainToLightning { channel_txid, triggering_txid } => {
 						let entry = internal_transfers
 							.entry(PaymentId::SelfCustodial(triggering_txid.to_byte_array()))
-							.or_insert(InternalTransfer::default());
+							.or_default();
 						if &payment.id.0 == channel_txid.as_byte_array() {
 							debug_assert!(entry.send_fee.is_none());
 							entry.send_fee = payment
@@ -1091,7 +1091,6 @@ impl Wallet {
 				"Internal transfers must have a send fee, got {id}: {tx_info:?}",
 			);
 			debug_assert!(tx_info.transaction.is_some());
-
 			if let Some(mut transaction) = tx_info.transaction {
 				transaction.fee = Some(
 					transaction
@@ -1234,10 +1233,67 @@ impl Wallet {
 	//
 	// }
 
-	/// Estimates the fees required to pay a [`PaymentInstructions`]
-	pub async fn estimate_fee(&self, _payment_info: &PaymentInstructions) -> Amount {
-		// todo implement fee estimation
-		Amount::ZERO
+	/// Estimates the fees required to pay a [`PaymentInfo`].
+	///
+	/// The estimate follows the same route order as [`Self::pay`]: trusted Lightning, self-custody
+	/// Lightning, a multi-path split across both wallets, trusted on-chain, and self-custody
+	/// on-chain. The returned fee belongs to the first route that `pay` would take. Self-custody
+	/// Lightning fees are the routing fee limit the node enforces, so the fee paid is at most the
+	/// estimate. Returns an error if no route can be estimated; in particular, self-custody
+	/// on-chain fees cannot be estimated.
+	pub async fn estimate_fee(&self, payment_info: &PaymentInfo) -> Result<Amount, WalletError> {
+		let amount = payment_info.amount;
+		let inputs = FeeEstimateInputs {
+			amount,
+			trusted_balance: self.inner.trusted.get_balance().await?,
+			lightning_balance: self.inner.ln_wallet.get_balance(),
+			supports_partial_payments: self.inner.trusted.supports_partial_payments(),
+		};
+		let methods = self.payment_methods(payment_info).await?;
+		let mut last_error = None;
+		let mut quotes = Vec::with_capacity(methods.len());
+
+		for method in &methods {
+			let trusted_fee = match self.inner.trusted.estimate_fee(method.clone(), amount).await {
+				Ok(fee) => Some(fee),
+				Err(error) => {
+					last_error = Some(error.into());
+					None
+				},
+			};
+			let lightning_fee = match self.inner.ln_wallet.estimate_fee(method, amount).await {
+				Ok(fee) => Some(fee),
+				Err(error) => {
+					last_error = Some(error.into());
+					None
+				},
+			};
+			let bolt11_invoice_amount_msat = match method {
+				PaymentMethod::LightningBolt11(invoice) => invoice.amount_milli_satoshis(),
+				_ => None,
+			};
+			let lightning_partial_fee = match inputs.mpp_lightning_portion() {
+				Some(portion) if bolt11_invoice_amount_msat.is_some() => {
+					self.inner.ln_wallet.estimate_fee(method, portion).await.ok()
+				},
+				_ => None,
+			};
+			quotes.push(MethodFeeQuotes {
+				kind: match method {
+					PaymentMethod::LightningBolt11(_) | PaymentMethod::LightningBolt12(_) => {
+						MethodKind::Lightning
+					},
+					PaymentMethod::OnChain(_) => MethodKind::OnChain,
+				},
+				bolt11_invoice_amount_msat,
+				trusted_fee,
+				lightning_fee,
+				lightning_partial_fee,
+			});
+		}
+
+		select_fee_estimate(&inputs, &quotes)
+			.ok_or(last_error.unwrap_or(WalletError::LdkNodeFailure(NodeError::InsufficientFunds)))
 	}
 
 	/// Initiates a payment using the provided [`PaymentInfo`]. This will pay from the trusted
@@ -1319,62 +1375,44 @@ impl Wallet {
 			} else {
 				ln_balance.lightning
 			};
+			// The self-custody fee estimate is a routing fee limit, not the fee that will be
+			// paid, so it must not gate the attempt: the node only sends if the balance covers
+			// the amount plus the real route fee.
 			if instructions.amount <= balance {
-				if let Ok(lightning_fee) =
-					self.inner.ln_wallet.estimate_fee(method, instructions.amount).await
-				{
-					if lightning_fee.saturating_add(instructions.amount) <= balance {
-						let res = self.inner.ln_wallet.pay(method, instructions.amount).await;
-						match res {
-							Ok(id) => {
-								// Note that the Payment Id can be repeated if we make a payment,
-								// it fails, then we attempt to pay the same (BOLT 11) invoice
-								// again.
-								self.inner
-									.tx_metadata
-									.upsert(
-										PaymentId::SelfCustodial(id.0),
-										TxMetadata {
-											ty: TxType::Payment { ty: typ },
-											time: SystemTime::now()
-												.duration_since(SystemTime::UNIX_EPOCH)
-												.unwrap(),
-										},
-									)
-									.await;
-								let inner_ref = Arc::clone(&self.inner);
-								self.inner.runtime.spawn_cancellable_background_task(async move {
-									inner_ref.rebalancer.do_rebalance_if_needed().await;
-								});
-								return Ok(PaymentId::SelfCustodial(id.0));
-							},
-							Err(e) => {
-								log_debug!(self.inner.logger, "LN payment failed with {:?}", e);
-								last_lightning_err = Some(e.into())
-							},
-						}
-					}
+				let res = self.inner.ln_wallet.pay(method, instructions.amount).await;
+				match res {
+					Ok(id) => {
+						// Note that the Payment Id can be repeated if we make a payment,
+						// it fails, then we attempt to pay the same (BOLT 11) invoice
+						// again.
+						self.inner
+							.tx_metadata
+							.upsert(
+								PaymentId::SelfCustodial(id.0),
+								TxMetadata {
+									ty: TxType::Payment { ty: typ },
+									time: SystemTime::now()
+										.duration_since(SystemTime::UNIX_EPOCH)
+										.unwrap(),
+								},
+							)
+							.await;
+						let inner_ref = Arc::clone(&self.inner);
+						self.inner.runtime.spawn_cancellable_background_task(async move {
+							inner_ref.rebalancer.do_rebalance_if_needed().await;
+						});
+						return Ok(PaymentId::SelfCustodial(id.0));
+					},
+					Err(e) => {
+						log_debug!(self.inner.logger, "LN payment failed with {:?}", e);
+						last_lightning_err = Some(e.into())
+					},
 				}
 			}
 			Err(())
 		};
 
-		let methods = match &instructions.instructions {
-			PaymentInstructions::ConfigurableAmount(conf) => {
-				let res =
-					conf.clone().set_amount(instructions.amount, &HTTPHrnResolver::new()).await;
-				let fixed_instr = res.map_err(|e| {
-					log_error!(
-						self.inner.logger,
-						"Failed to set amount on payment instructions: {e}"
-					);
-					WalletError::LdkNodeFailure(NodeError::InvalidUri)
-				})?;
-
-				fixed_instr.methods().to_vec()
-			},
-			PaymentInstructions::FixedAmount(fixed) => fixed.methods().to_vec(),
-		};
+		let methods = self.payment_methods(instructions).await?;
 
 		// First try to pay via the trusted balance over lightning
 		for method in methods.clone() {
@@ -1480,6 +1518,27 @@ impl Wallet {
 			.unwrap_or(WalletError::LdkNodeFailure(NodeError::InsufficientFunds)))
 	}
 
+	async fn payment_methods(
+		&self, instructions: &PaymentInfo,
+	) -> Result<Vec<PaymentMethod>, WalletError> {
+		match &instructions.instructions {
+			PaymentInstructions::ConfigurableAmount(conf) => {
+				let res =
+					conf.clone().set_amount(instructions.amount, &HTTPHrnResolver::new()).await;
+				let fixed_instr = res.map_err(|e| {
+					log_error!(
+						self.inner.logger,
+						"Failed to set amount on payment instructions: {e}"
+					);
+					WalletError::LdkNodeFailure(NodeError::InvalidUri)
+				})?;
+
+				Ok(fixed_instr.methods().to_vec())
+			},
+			PaymentInstructions::FixedAmount(fixed) => Ok(fixed.methods().to_vec()),
+		}
+	}
+
 	/// Attempts to pay `invoice` as a multi-path payment split across the trusted wallet and the
 	/// self-custody lightning wallet.
 	///
@@ -1500,8 +1559,6 @@ impl Wallet {
 			return Err(WalletError::LdkNodeFailure(NodeError::InvalidAmount));
 		}
 
-		let method = PaymentMethod::LightningBolt11(invoice.clone());
-
 		// Avoid the trusted wallet's normal fee estimate here. Cashu obtains estimates by creating
 		// a non-MPP melt quote, and an active full-amount quote can block the partial MPP quote we
 		// need below. If fees make the trusted portion unaffordable, `pay_partial` will fail and the
@@ -1514,10 +1571,10 @@ impl Wallet {
 		}
 		let ln_portion = amount.saturating_sub(trusted_portion);
 
-		// Make sure the lightning wallet can cover its portion.
-		let ln_fee =
-			self.inner.ln_wallet.estimate_fee(&method, ln_portion).await.unwrap_or(Amount::ZERO);
-		if ln_fee.saturating_add(ln_portion) > ln_lightning_balance {
+		// Make sure the lightning wallet can cover its portion. The self-custody fee estimate is a
+		// routing fee limit, so it is not added here; the node only sends if the balance also
+		// covers the real route fee.
+		if ln_portion > ln_lightning_balance {
 			return Err(WalletError::LdkNodeFailure(NodeError::InsufficientFunds));
 		}
 
@@ -1744,6 +1801,113 @@ impl Wallet {
 	}
 }
 
+/// The kind of a payment method, as far as route selection is concerned.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MethodKind {
+	Lightning,
+	OnChain,
+}
+
+/// The balances and amount that decide which route [`Wallet::pay`] takes.
+#[derive(Debug, Clone, Copy)]
+struct FeeEstimateInputs {
+	amount: Amount,
+	trusted_balance: Amount,
+	lightning_balance: LightningWalletBalance,
+	supports_partial_payments: bool,
+}
+
+impl FeeEstimateInputs {
+	/// The lightning portion of a multi-path split, if `pay` would attempt one. Mirrors
+	/// [`Wallet::try_mpp_bolt11`]: the trusted wallet pays its full balance and the lightning
+	/// wallet pays the remainder.
+	fn mpp_lightning_portion(&self) -> Option<Amount> {
+		if !self.supports_partial_payments
+			|| self.trusted_balance == Amount::ZERO
+			|| self.trusted_balance >= self.amount
+		{
+			return None;
+		}
+		Some(self.amount.saturating_sub(self.trusted_balance))
+	}
+}
+
+/// Fee quotes gathered for one payment method. `None` means the wallet could not quote a fee.
+#[derive(Debug, Clone, Copy)]
+struct MethodFeeQuotes {
+	kind: MethodKind,
+	/// The invoice amount of an amount-bearing BOLT 11 invoice, which is required for the
+	/// multi-path route.
+	bolt11_invoice_amount_msat: Option<u64>,
+	trusted_fee: Option<Amount>,
+	lightning_fee: Option<Amount>,
+	/// The self-custody fee for the lightning portion of a multi-path split.
+	lightning_partial_fee: Option<Amount>,
+}
+
+/// Selects the fee of the first route that [`Wallet::pay`] would take, in the same order as
+/// `pay`. Returns `None` if no route applies or the route that applies has no fee quote; a route
+/// with an unknown fee is never reported as free.
+fn select_fee_estimate(inputs: &FeeEstimateInputs, quotes: &[MethodFeeQuotes]) -> Option<Amount> {
+	let amount = inputs.amount;
+	let lightning = quotes.iter().filter(|quote| quote.kind == MethodKind::Lightning);
+	let onchain = quotes.iter().filter(|quote| quote.kind == MethodKind::OnChain);
+
+	// Trusted wallet over lightning. `pay` attempts this route whenever the balance covers the
+	// amount plus the quoted fee; without a quote the fee is unknown.
+	for quote in lightning.clone() {
+		if amount <= inputs.trusted_balance {
+			let fee = quote.trusted_fee?;
+			if amount.saturating_add(fee) <= inputs.trusted_balance {
+				return Some(fee);
+			}
+		}
+	}
+
+	// Self-custody wallet over lightning. `pay` attempts this route whenever the balance covers
+	// the amount; the node enforces the fee limit while routing.
+	for quote in lightning.clone() {
+		if amount <= inputs.lightning_balance.lightning {
+			return quote.lightning_fee;
+		}
+	}
+
+	// Multi-path split across both wallets.
+	if let Some(ln_portion) = inputs.mpp_lightning_portion() {
+		for quote in lightning.clone() {
+			if quote.bolt11_invoice_amount_msat != Some(amount.milli_sats()) {
+				continue;
+			}
+			if ln_portion <= inputs.lightning_balance.lightning {
+				// The trusted wallet pays a partial amount without a quote. Its full-amount quote
+				// is the closest available bound.
+				return Some(quote.trusted_fee?.saturating_add(quote.lightning_partial_fee?));
+			}
+		}
+	}
+
+	// Trusted wallet on-chain.
+	for quote in onchain.clone() {
+		if amount <= inputs.trusted_balance {
+			let fee = quote.trusted_fee?;
+			if amount.saturating_add(fee) <= inputs.trusted_balance {
+				return Some(fee);
+			}
+		}
+	}
+
+	// Self-custody wallet on-chain, either from the on-chain balance or by splicing out of a
+	// channel.
+	for quote in onchain {
+		let available = inputs.lightning_balance.onchain.max(inputs.lightning_balance.lightning);
+		if amount <= available {
+			return quote.lightning_fee;
+		}
+	}
+
+	None
+}
+
 #[cfg(test)]
 mod tests {
 	use super::*;
@@ -1818,6 +1982,110 @@ mod tests {
 		let kind = PaymentKind::Spontaneous { hash: PaymentHash([42; 32]), preimage: None };
 
 		assert!(!should_surface_lightning_payment_without_metadata(TxStatus::Pending, &kind));
+	}
+
+	fn sats(value: u64) -> Amount {
+		Amount::from_sats(value).expect("valid amount")
+	}
+
+	fn fee_inputs(amount: u64, trusted: u64, lightning: u64, onchain: u64) -> FeeEstimateInputs {
+		FeeEstimateInputs {
+			amount: sats(amount),
+			trusted_balance: sats(trusted),
+			lightning_balance: LightningWalletBalance {
+				lightning: sats(lightning),
+				onchain: sats(onchain),
+			},
+			supports_partial_payments: true,
+		}
+	}
+
+	fn bolt11_quotes(invoice_amount: u64) -> MethodFeeQuotes {
+		MethodFeeQuotes {
+			kind: MethodKind::Lightning,
+			bolt11_invoice_amount_msat: Some(sats(invoice_amount).milli_sats()),
+			trusted_fee: Some(sats(3)),
+			lightning_fee: Some(sats(60)),
+			lightning_partial_fee: Some(sats(55)),
+		}
+	}
+
+	fn onchain_quotes() -> MethodFeeQuotes {
+		MethodFeeQuotes {
+			kind: MethodKind::OnChain,
+			bolt11_invoice_amount_msat: None,
+			trusted_fee: Some(sats(200)),
+			lightning_fee: None,
+			lightning_partial_fee: None,
+		}
+	}
+
+	#[test]
+	fn fee_estimate_prefers_trusted_lightning_when_it_covers_amount_and_fee() {
+		let inputs = fee_inputs(1_000, 1_003, 5_000, 0);
+
+		assert_eq!(select_fee_estimate(&inputs, &[bolt11_quotes(1_000)]), Some(sats(3)));
+	}
+
+	#[test]
+	fn fee_estimate_falls_back_to_self_custody_lightning_limit() {
+		// The trusted balance covers the amount but not the fee.
+		let inputs = fee_inputs(1_000, 1_002, 5_000, 0);
+
+		assert_eq!(select_fee_estimate(&inputs, &[bolt11_quotes(1_000)]), Some(sats(60)));
+	}
+
+	#[test]
+	fn fee_estimate_never_reports_unknown_trusted_fee_as_free() {
+		let inputs = fee_inputs(1_000, 5_000, 0, 0);
+		let quote = MethodFeeQuotes { trusted_fee: None, ..bolt11_quotes(1_000) };
+
+		assert_eq!(select_fee_estimate(&inputs, &[quote]), None);
+	}
+
+	#[test]
+	fn fee_estimate_covers_multi_path_split() {
+		// Neither wallet covers 1_000 sats alone: 400 trusted + 600 lightning.
+		let inputs = fee_inputs(1_000, 400, 700, 0);
+
+		assert_eq!(select_fee_estimate(&inputs, &[bolt11_quotes(1_000)]), Some(sats(58)));
+	}
+
+	#[test]
+	fn fee_estimate_skips_multi_path_split_like_pay() {
+		// `pay` only splits amount-bearing BOLT 11 invoices whose amount matches...
+		let inputs = fee_inputs(1_000, 400, 700, 0);
+		let amountless = MethodFeeQuotes { bolt11_invoice_amount_msat: None, ..bolt11_quotes(1) };
+		assert_eq!(select_fee_estimate(&inputs, &[amountless]), None);
+
+		// ...when the trusted wallet supports partial payments...
+		let no_partial = FeeEstimateInputs { supports_partial_payments: false, ..inputs };
+		assert_eq!(select_fee_estimate(&no_partial, &[bolt11_quotes(1_000)]), None);
+
+		// ...and when the lightning wallet covers the remainder.
+		let short = fee_inputs(1_000, 400, 500, 0);
+		assert_eq!(select_fee_estimate(&short, &[bolt11_quotes(1_000)]), None);
+	}
+
+	#[test]
+	fn fee_estimate_uses_trusted_onchain_before_self_custody_onchain() {
+		let inputs = fee_inputs(1_000, 1_200, 0, 5_000);
+
+		assert_eq!(select_fee_estimate(&inputs, &[onchain_quotes()]), Some(sats(200)));
+	}
+
+	#[test]
+	fn fee_estimate_does_not_claim_free_self_custody_onchain_payment() {
+		let inputs = fee_inputs(1_000, 0, 0, 5_000);
+
+		assert_eq!(select_fee_estimate(&inputs, &[onchain_quotes()]), None);
+	}
+
+	#[test]
+	fn fee_estimate_reports_nothing_when_no_wallet_can_pay() {
+		let inputs = fee_inputs(10_000, 100, 100, 100);
+
+		assert_eq!(select_fee_estimate(&inputs, &[bolt11_quotes(10_000), onchain_quotes()]), None);
 	}
 
 	#[test]

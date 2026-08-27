@@ -292,11 +292,24 @@ impl LightningWallet {
 		Amount::from_milli_sats(amt.unwrap_or(0)).expect("invalid amount")
 	}
 
+	/// Estimates the fee of a payment made from the self-custody wallet.
+	///
+	/// For Lightning payments this returns the routing fee limit the node enforces for the
+	/// payment. The fee actually paid is at most this amount. ldk-node does not expose an on-chain
+	/// fee estimate, so on-chain payments return
+	/// `Err(NodeError::FeerateEstimationUpdateFailed)` instead of a fee that would be wrong.
 	pub(crate) async fn estimate_fee(
-		&self, _method: &PaymentMethod, _amount: Amount,
+		&self, method: &PaymentMethod, amount: Amount,
 	) -> Result<Amount, NodeError> {
-		// TODO: Implement this in ldk-node!
-		Ok(Amount::ZERO)
+		match method {
+			PaymentMethod::LightningBolt11(_) | PaymentMethod::LightningBolt12(_) => {
+				// `pay` passes no route parameters, so LDK's default limit of one percent of
+				// the amount plus 50 sats applies.
+				Ok(Amount::from_milli_sats(amount.milli_sats() / 100 + 50_000)
+					.unwrap_or(Amount::MAX))
+			},
+			PaymentMethod::OnChain(_) => Err(NodeError::FeerateEstimationUpdateFailed),
+		}
 	}
 
 	pub(crate) async fn pay(

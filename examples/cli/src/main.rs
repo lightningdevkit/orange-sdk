@@ -651,13 +651,18 @@ async fn execute_command(command: Commands, state: &mut WalletState) -> Result<(
 				println!("Amount: {} sats", amount.to_string().bright_green().bold());
 			}
 
-			let _amount = amount
+			let amount = amount
 				.map(|a| Amount::from_sats(a).map_err(|_| anyhow::anyhow!("Invalid amount")))
 				.transpose()?;
 
 			match wallet.parse_payment_instructions(&destination).await {
 				Ok(instructions) => {
-					let estimated_fee = wallet.estimate_fee(&instructions).await;
+					let payment_info = PaymentInfo::build(instructions, amount)
+						.map_err(|e| anyhow::anyhow!("Invalid payment amount: {e:?}"))?;
+					let estimated_fee = wallet
+						.estimate_fee(&payment_info)
+						.await
+						.map_err(|e| anyhow::anyhow!("Failed to estimate fee: {e:?}"))?;
 					println!(
 						"{} Estimated fee: {} sats",
 						"✅".bright_green(),
