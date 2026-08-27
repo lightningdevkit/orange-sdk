@@ -9,7 +9,7 @@ use ldk_node::lightning::events::{ClosureReason, PaymentFailureReason};
 use ldk_node::lightning::ln::types::ChannelId;
 use ldk_node::lightning::util::logger::Logger as _;
 use ldk_node::lightning::util::persist::KVStore;
-use ldk_node::lightning::util::ser::{Writeable, Writer};
+use ldk_node::lightning::util::ser::{Readable, Writeable, Writer};
 use ldk_node::lightning::{impl_writeable_tlv_based_enum, log_debug, log_error, log_warn};
 use ldk_node::lightning_types::payment::{PaymentHash, PaymentPreimage};
 use ldk_node::payment::{ConfirmationStatus, PaymentKind};
@@ -217,14 +217,14 @@ pub struct EventQueue {
 }
 
 impl EventQueue {
-	pub(crate) fn new(
+	pub(crate) async fn new(
 		kv_store: Arc<dyn DynStore>, tx_metadata: TxMetadataStore, logger: Arc<Logger>,
-	) -> Self {
-		let queue = Arc::new(Mutex::new(VecDeque::new()));
+	) -> Result<Self, ldk_node::lightning::io::Error> {
+		let queue = Arc::new(Mutex::new(load_queue(kv_store.as_ref()).await?));
 		let pending_mpp_events = Arc::new(Mutex::new(HashMap::new()));
 		let event_notify = Arc::new(Notify::new());
 		let rebalance_enabled = RebalanceEnabledCache::new(Arc::clone(&kv_store));
-		Self {
+		Ok(Self {
 			queue,
 			pending_mpp_events,
 			event_notify,
@@ -232,7 +232,7 @@ impl EventQueue {
 			rebalance_enabled,
 			tx_metadata,
 			logger,
-		}
+		})
 	}
 
 	pub(crate) async fn get_rebalance_enabled(&self) -> bool {
@@ -401,6 +401,51 @@ impl EventQueue {
 	}
 }
 
+async fn load_queue(
+	store: &dyn DynStore,
+) -> Result<VecDeque<Event>, ldk_node::lightning::io::Error> {
+	let data = match KVStore::read(
+		store,
+		EVENT_QUEUE_PERSISTENCE_PRIMARY_NAMESPACE,
+		EVENT_QUEUE_PERSISTENCE_SECONDARY_NAMESPACE,
+		EVENT_QUEUE_PERSISTENCE_KEY,
+	)
+	.await
+	{
+		Ok(data) => data,
+		Err(error) if error.kind() == ldk_node::lightning::io::ErrorKind::NotFound => {
+			return Ok(VecDeque::new());
+		},
+		Err(error) => return Err(error),
+	};
+
+	let mut reader = &data[..];
+	let event_count = u16::read(&mut reader).map_err(|error| {
+		ldk_node::lightning::io::Error::new(
+			ldk_node::lightning::io::ErrorKind::InvalidData,
+			format!("Invalid persisted event queue length: {error:?}"),
+		)
+	})?;
+	let mut queue = VecDeque::with_capacity(event_count as usize);
+	for _ in 0..event_count {
+		let event = Event::read(&mut reader).map_err(|error| {
+			ldk_node::lightning::io::Error::new(
+				ldk_node::lightning::io::ErrorKind::InvalidData,
+				format!("Invalid persisted event queue entry: {error:?}"),
+			)
+		})?;
+		queue.push_back(event);
+	}
+	if !reader.is_empty() {
+		return Err(ldk_node::lightning::io::Error::new(
+			ldk_node::lightning::io::ErrorKind::InvalidData,
+			"Persisted event queue has trailing bytes",
+		));
+	}
+
+	Ok(queue)
+}
+
 fn terminal_payment_hash(event: &Event) -> Option<PaymentHash> {
 	match event {
 		Event::PaymentSuccessful { payment_hash, .. } => Some(*payment_hash),
@@ -449,11 +494,15 @@ mod tests {
 	async fn asynchronous_waiter_is_woken_for_new_event() {
 		let (_path, store) = temp_sqlite_store();
 		let tx_metadata = TxMetadataStore::new(Arc::clone(&store)).await;
-		let queue = Arc::new(EventQueue::new(
-			store,
-			tx_metadata,
-			Arc::new(Logger::new(&LoggerType::LogFacade).expect("logger")),
-		));
+		let queue = Arc::new(
+			EventQueue::new(
+				store,
+				tx_metadata,
+				Arc::new(Logger::new(&LoggerType::LogFacade).expect("logger")),
+			)
+			.await
+			.expect("event queue"),
+		);
 		let expected = Event::PaymentFailed {
 			payment_id: PaymentId::Trusted([9u8; 32]),
 			payment_hash: None,
@@ -473,6 +522,26 @@ mod tests {
 	}
 
 	#[tokio::test]
+	async fn persisted_events_are_loaded_after_restart() {
+		let (_path, store) = temp_sqlite_store();
+		let tx_metadata = TxMetadataStore::new(Arc::clone(&store)).await;
+		let logger = Arc::new(Logger::new(&LoggerType::LogFacade).expect("logger"));
+		let expected = Event::PaymentFailed {
+			payment_id: PaymentId::Trusted([8u8; 32]),
+			payment_hash: None,
+			reason: None,
+		};
+		let queue = EventQueue::new(Arc::clone(&store), tx_metadata.clone(), Arc::clone(&logger))
+			.await
+			.expect("event queue");
+		queue.add_event(expected.clone()).await.expect("add event");
+
+		let restarted = EventQueue::new(store, tx_metadata, logger).await.expect("restart queue");
+
+		assert_eq!(restarted.next_event().await, Some(expected));
+	}
+
+	#[tokio::test]
 	async fn pending_mpp_setup_buffers_terminal_events_until_metadata_exists() {
 		let (_path, store) = temp_sqlite_store();
 		let tx_metadata = TxMetadataStore::new(Arc::clone(&store)).await;
@@ -480,7 +549,9 @@ mod tests {
 			store,
 			tx_metadata.clone(),
 			Arc::new(Logger::new(&LoggerType::LogFacade).expect("logger")),
-		);
+		)
+		.await
+		.expect("event queue");
 
 		let payment_hash = PaymentHash([3u8; 32]);
 		let surface_id = PaymentId::Trusted([7u8; 32]);
