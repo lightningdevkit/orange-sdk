@@ -191,10 +191,7 @@ impl LightningWallet {
 			Arc::new(builder.build_with_store(node_entropy, LdkNodeStore(Arc::clone(&store)))?);
 		let payment_receipt_notify = Arc::new(Notify::new());
 		let channel_pending_notify = Arc::new(Notify::new());
-		let splice_pending_inbox = Arc::new(SplicePendingInbox {
-			pending: Mutex::new(HashMap::new()),
-			notify: Notify::new(),
-		});
+		let splice_pending_inbox = Arc::new(SplicePendingInbox::new());
 		let ev_handler = Arc::new(LdkEventHandler {
 			event_queue,
 			ldk_node: Arc::clone(&ldk_node),
@@ -228,7 +225,9 @@ impl LightningWallet {
 		Ok(Self { inner })
 	}
 
-	pub(crate) async fn await_splice_pending(&self, channel_id: u128) -> OutPoint {
+	pub(crate) async fn await_splice_pending(
+		&self, channel_id: u128,
+	) -> Result<OutPoint, NodeError> {
 		self.inner.splice_pending_inbox.wait_for(channel_id).await
 	}
 
@@ -340,15 +339,19 @@ impl LightningWallet {
 							Err(NodeError::InsufficientFunds)
 						},
 						Some(chan) => {
-							self.inner.ldk_node.splice_out(
+							self.inner.splice_pending_inbox.begin(chan.user_channel_id.0);
+							if let Err(e) = self.inner.ldk_node.splice_out(
 								&chan.user_channel_id,
 								chan.counterparty.node_id,
 								address,
 								amount_sats,
-							)?;
+							) {
+								self.inner.splice_pending_inbox.end(chan.user_channel_id.0);
+								return Err(e);
+							}
 
 							let funding_txo =
-								self.await_splice_pending(chan.user_channel_id.0).await;
+								self.await_splice_pending(chan.user_channel_id.0).await?;
 
 							let id = PaymentId(funding_txo.txid.to_byte_array());
 							let details = PaymentDetails {
@@ -397,9 +400,17 @@ impl LightningWallet {
 
 		match channel {
 			Some(chan) => {
-				self.inner
+				// The rebalancer calls `await_splice_pending` after this returns; mark the
+				// operation active first so a fast negotiation failure is delivered to it.
+				self.inner.splice_pending_inbox.begin(chan.user_channel_id.0);
+				if let Err(e) = self
+					.inner
 					.ldk_node
-					.splice_in_with_all(&chan.user_channel_id, chan.counterparty.node_id)?;
+					.splice_in_with_all(&chan.user_channel_id, chan.counterparty.node_id)
+				{
+					self.inner.splice_pending_inbox.end(chan.user_channel_id.0);
+					return Err(e);
+				}
 				Ok(chan.user_channel_id)
 			},
 			None => {
@@ -549,7 +560,7 @@ impl graduated_rebalancer::LightningWallet for LightningWallet {
 
 	fn await_splice_pending(
 		&self, channel_id: u128,
-	) -> Pin<Box<dyn Future<Output = OutPoint> + Send + '_>> {
+	) -> Pin<Box<dyn Future<Output = Result<OutPoint, Self::Error>> + Send + '_>> {
 		// `ChannelDetails.funding_txo` from `list_channels` still reports the old funding
 		// outpoint between `SplicePending` and `SpliceLocked`, so we return the new outpoint
 		// from the event itself rather than reading it back from the channel.
@@ -602,18 +613,84 @@ impl From<&PaymentDetails> for PaymentType {
 /// `await_splice_pending`. A per-channel queue rather than a `watch` so each consumer takes its own
 /// event: `watch` would let a second splice on the same channel observe the previous splice's stale
 /// outpoint instead of waiting for the new `SplicePending`.
+///
+/// Negotiation failures are only delivered while a local splice operation is active on the
+/// channel, from [`Self::begin`] until the matching [`Self::wait_for`] returns. A failure for a
+/// splice this wallet did not start (for example one the LSP initiated) is dropped, so it cannot
+/// poison the next local wait.
 pub(crate) struct SplicePendingInbox {
-	pub(crate) pending: Mutex<HashMap<u128, VecDeque<OutPoint>>>,
+	pub(crate) pending: Mutex<HashMap<u128, VecDeque<Result<OutPoint, NodeError>>>>,
+	/// Number of local splice operations active per channel.
+	active: Mutex<HashMap<u128, usize>>,
 	pub(crate) notify: Notify,
 }
 
+/// Decrements the active operation count of a channel when dropped, so a cancelled wait does not
+/// leave the channel marked active.
+struct ActiveSpliceGuard<'a> {
+	inbox: &'a SplicePendingInbox,
+	channel_id: u128,
+}
+
+impl Drop for ActiveSpliceGuard<'_> {
+	fn drop(&mut self) {
+		self.inbox.end(self.channel_id);
+	}
+}
+
 impl SplicePendingInbox {
+	pub(crate) fn new() -> Self {
+		Self {
+			pending: Mutex::new(HashMap::new()),
+			active: Mutex::new(HashMap::new()),
+			notify: Notify::new(),
+		}
+	}
+
+	/// Marks a local splice operation as active on `channel_id`. Call this before the splice is
+	/// initiated so a failure that arrives before [`Self::wait_for`] is not lost.
+	pub(crate) fn begin(&self, channel_id: u128) {
+		*self.active.lock().unwrap().entry(channel_id).or_insert(0) += 1;
+	}
+
+	/// Ends one local splice operation on `channel_id`. Call this when the splice could not be
+	/// initiated; [`Self::wait_for`] ends its own operation.
+	pub(crate) fn end(&self, channel_id: u128) {
+		let mut active = self.active.lock().unwrap();
+		if let Some(count) = active.get_mut(&channel_id) {
+			*count = count.saturating_sub(1);
+			if *count == 0 {
+				active.remove(&channel_id);
+			}
+		}
+	}
+
 	pub(crate) fn deliver(&self, channel_id: u128, funding_txo: OutPoint) {
-		self.pending.lock().unwrap().entry(channel_id).or_default().push_back(funding_txo);
+		self.pending.lock().unwrap().entry(channel_id).or_default().push_back(Ok(funding_txo));
 		self.notify.notify_waiters();
 	}
 
-	pub(crate) async fn wait_for(&self, channel_id: u128) -> OutPoint {
+	/// Delivers a negotiation failure to the active local operation on `channel_id`. Returns
+	/// `false` and drops the failure if no local operation is active.
+	pub(crate) fn fail(&self, channel_id: u128) -> bool {
+		if !self.active.lock().unwrap().get(&channel_id).is_some_and(|count| *count > 0) {
+			return false;
+		}
+		self.pending
+			.lock()
+			.unwrap()
+			.entry(channel_id)
+			.or_default()
+			.push_back(Err(NodeError::ChannelSplicingFailed));
+		self.notify.notify_waiters();
+		true
+	}
+
+	/// Waits for the next `SplicePending` outpoint or negotiation failure on `channel_id`. The
+	/// caller must have called [`Self::begin`] before it initiated the splice; that operation ends
+	/// when this returns or is dropped.
+	pub(crate) async fn wait_for(&self, channel_id: u128) -> Result<OutPoint, NodeError> {
+		let _active = ActiveSpliceGuard { inbox: self, channel_id };
 		loop {
 			// Register interest BEFORE checking the queue so a `notify_waiters` racing with the
 			// check still wakes us up.
@@ -643,6 +720,7 @@ impl SplicePendingInbox {
 mod tests {
 	use super::*;
 	use ldk_node::bitcoin::Txid;
+	use std::time::Duration;
 
 	fn dummy_outpoint(seed: u8) -> OutPoint {
 		let bytes = [seed; 32];
@@ -651,8 +729,7 @@ mod tests {
 
 	#[test]
 	fn splice_pending_inbox_preserves_distinct_events_for_same_channel() {
-		let inbox =
-			SplicePendingInbox { pending: Mutex::new(HashMap::new()), notify: Notify::new() };
+		let inbox = SplicePendingInbox::new();
 		let channel_id = 7;
 		let first = dummy_outpoint(0xaa);
 		let second = dummy_outpoint(0xbb);
@@ -663,8 +740,87 @@ mod tests {
 		let mut pending = inbox.pending.lock().unwrap();
 		let queue = pending.get_mut(&channel_id).expect("channel should have pending events");
 
-		assert_eq!(queue.pop_front(), Some(first));
-		assert_eq!(queue.pop_front(), Some(second));
+		assert_eq!(queue.pop_front(), Some(Ok(first)));
+		assert_eq!(queue.pop_front(), Some(Ok(second)));
 		assert!(queue.is_empty());
+	}
+
+	#[tokio::test]
+	async fn splice_pending_inbox_reports_negotiation_failure() {
+		let inbox = SplicePendingInbox::new();
+
+		inbox.begin(7);
+		assert!(inbox.fail(7));
+
+		assert_eq!(inbox.wait_for(7).await, Err(NodeError::ChannelSplicingFailed));
+		assert!(!inbox.fail(7));
+	}
+
+	#[tokio::test]
+	async fn unrelated_negotiation_failure_does_not_poison_next_wait() {
+		let inbox = Arc::new(SplicePendingInbox::new());
+		let outpoint = dummy_outpoint(0xcc);
+
+		// A failure for a splice this wallet did not start is dropped.
+		assert!(!inbox.fail(7));
+
+		let waiting = Arc::clone(&inbox);
+		let waiter = tokio::spawn(async move {
+			waiting.begin(7);
+			waiting.wait_for(7).await
+		});
+		tokio::task::yield_now().await;
+		inbox.deliver(7, outpoint);
+
+		let result = tokio::time::timeout(Duration::from_secs(1), waiter)
+			.await
+			.expect("waiter must finish")
+			.expect("waiter task");
+		assert_eq!(result, Ok(outpoint));
+	}
+
+	#[tokio::test]
+	async fn failure_before_wait_is_delivered_to_active_operation() {
+		let inbox = SplicePendingInbox::new();
+
+		// `begin` runs before the splice is initiated, so a failure that arrives before
+		// `wait_for` is still delivered.
+		inbox.begin(7);
+		assert!(inbox.fail(7));
+
+		assert_eq!(inbox.wait_for(7).await, Err(NodeError::ChannelSplicingFailed));
+	}
+
+	#[tokio::test]
+	async fn failure_on_other_channel_is_not_delivered() {
+		let inbox = SplicePendingInbox::new();
+
+		inbox.begin(7);
+		assert!(!inbox.fail(8));
+		assert!(inbox.pending.lock().unwrap().is_empty());
+	}
+
+	#[tokio::test]
+	async fn cancelled_wait_ends_the_active_operation() {
+		let inbox = Arc::new(SplicePendingInbox::new());
+
+		inbox.begin(7);
+		let waiting = Arc::clone(&inbox);
+		let waiter = tokio::spawn(async move { waiting.wait_for(7).await });
+		tokio::task::yield_now().await;
+		waiter.abort();
+		let _ = waiter.await;
+
+		assert!(!inbox.fail(7));
+	}
+
+	#[test]
+	fn abandoned_initiation_ends_the_active_operation() {
+		let inbox = SplicePendingInbox::new();
+
+		inbox.begin(7);
+		inbox.end(7);
+
+		assert!(!inbox.fail(7));
 	}
 }

@@ -135,7 +135,7 @@ pub trait LightningWallet: Send + Sync {
 	/// Wait for a splice pending notification, returns the splice outpoint
 	fn await_splice_pending(
 		&self, channel_id: u128,
-	) -> Pin<Box<dyn Future<Output = OutPoint> + Send + '_>>;
+	) -> Pin<Box<dyn Future<Output = Result<OutPoint, Self::Error>> + Send + '_>>;
 }
 
 /// Represents a payment from the lightning wallet
@@ -388,7 +388,13 @@ where
 
 			log_info!(self.logger, "Initiated splice opened with LSP");
 
-			let channel_outpoint = self.ln_wallet.await_splice_pending(user_chan_id).await;
+			let channel_outpoint = match self.ln_wallet.await_splice_pending(user_chan_id).await {
+				Ok(outpoint) => outpoint,
+				Err(e) => {
+					log_error!(self.logger, "Splice negotiation failed: {e:?}");
+					return;
+				},
+			};
 
 			log_info!(self.logger, "Splice initiated at: {channel_outpoint}");
 
