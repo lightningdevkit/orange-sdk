@@ -1234,10 +1234,50 @@ impl Wallet {
 	//
 	// }
 
-	/// Estimates the fees required to pay a [`PaymentInstructions`]
-	pub async fn estimate_fee(&self, _payment_info: &PaymentInstructions) -> Amount {
-		// todo implement fee estimation
-		Amount::ZERO
+	/// Estimates the fees required to pay a [`PaymentInfo`].
+	pub async fn estimate_fee(&self, payment_info: &PaymentInfo) -> Result<Amount, WalletError> {
+		let amount = payment_info.amount;
+		let trusted_balance = self.inner.trusted.get_balance().await?;
+		let lightning_balance = self.inner.ln_wallet.get_balance();
+		let methods = self.payment_methods(payment_info).await?;
+		let mut last_error = None;
+
+		for method in methods.iter().filter(|method| !matches!(method, PaymentMethod::OnChain(_))) {
+			match self.inner.trusted.estimate_fee(method.clone(), amount).await {
+				Ok(fee) if amount.saturating_add(fee) <= trusted_balance => return Ok(fee),
+				Ok(_) => {},
+				Err(error) => last_error = Some(error.into()),
+			}
+		}
+
+		for method in methods.iter().filter(|method| !matches!(method, PaymentMethod::OnChain(_))) {
+			match self.inner.ln_wallet.estimate_fee(method, amount).await {
+				Ok(fee) if amount.saturating_add(fee) <= lightning_balance.lightning => {
+					return Ok(fee);
+				},
+				Ok(_) => {},
+				Err(error) => last_error = Some(error.into()),
+			}
+		}
+
+		for method in methods.iter().filter(|method| matches!(method, PaymentMethod::OnChain(_))) {
+			match self.inner.trusted.estimate_fee(method.clone(), amount).await {
+				Ok(fee) if amount.saturating_add(fee) <= trusted_balance => return Ok(fee),
+				Ok(_) => {},
+				Err(error) => last_error = Some(error.into()),
+			}
+		}
+
+		for method in methods.iter().filter(|method| matches!(method, PaymentMethod::OnChain(_))) {
+			let available = lightning_balance.onchain.max(lightning_balance.lightning);
+			match self.inner.ln_wallet.estimate_fee(method, amount).await {
+				Ok(fee) if amount.saturating_add(fee) <= available => return Ok(fee),
+				Ok(_) => {},
+				Err(error) => last_error = Some(error.into()),
+			}
+		}
+
+		Err(last_error.unwrap_or(WalletError::LdkNodeFailure(NodeError::InsufficientFunds)))
 	}
 
 	/// Initiates a payment using the provided [`PaymentInfo`]. This will pay from the trusted
@@ -1359,22 +1399,7 @@ impl Wallet {
 			Err(())
 		};
 
-		let methods = match &instructions.instructions {
-			PaymentInstructions::ConfigurableAmount(conf) => {
-				let res =
-					conf.clone().set_amount(instructions.amount, &HTTPHrnResolver::new()).await;
-				let fixed_instr = res.map_err(|e| {
-					log_error!(
-						self.inner.logger,
-						"Failed to set amount on payment instructions: {e}"
-					);
-					WalletError::LdkNodeFailure(NodeError::InvalidUri)
-				})?;
-
-				fixed_instr.methods().to_vec()
-			},
-			PaymentInstructions::FixedAmount(fixed) => fixed.methods().to_vec(),
-		};
+		let methods = self.payment_methods(instructions).await?;
 
 		// First try to pay via the trusted balance over lightning
 		for method in methods.clone() {
@@ -1478,6 +1503,27 @@ impl Wallet {
 			.or(last_mpp_err)
 			.or(last_trusted_err)
 			.unwrap_or(WalletError::LdkNodeFailure(NodeError::InsufficientFunds)))
+	}
+
+	async fn payment_methods(
+		&self, instructions: &PaymentInfo,
+	) -> Result<Vec<PaymentMethod>, WalletError> {
+		match &instructions.instructions {
+			PaymentInstructions::ConfigurableAmount(conf) => {
+				let res =
+					conf.clone().set_amount(instructions.amount, &HTTPHrnResolver::new()).await;
+				let fixed_instr = res.map_err(|e| {
+					log_error!(
+						self.inner.logger,
+						"Failed to set amount on payment instructions: {e}"
+					);
+					WalletError::LdkNodeFailure(NodeError::InvalidUri)
+				})?;
+
+				Ok(fixed_instr.methods().to_vec())
+			},
+			PaymentInstructions::FixedAmount(fixed) => Ok(fixed.methods().to_vec()),
+		}
 	}
 
 	/// Attempts to pay `invoice` as a multi-path payment split across the trusted wallet and the
