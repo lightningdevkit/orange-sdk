@@ -33,7 +33,7 @@ use std::fmt::Debug;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
-use tokio::sync::{Notify, watch};
+use tokio::sync::Notify;
 
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct LightningWalletBalance {
@@ -46,7 +46,7 @@ pub(crate) struct LightningWalletImpl {
 	logger: Arc<Logger>,
 	store: Arc<dyn DynStore>,
 	payment_receipt_notify: Arc<Notify>,
-	channel_pending_receipt_flag: watch::Receiver<u128>,
+	channel_pending_notify: Arc<Notify>,
 	splice_pending_inbox: Arc<SplicePendingInbox>,
 	lsp_node_id: PublicKey,
 	lsp_socket_addr: SocketAddress,
@@ -190,7 +190,7 @@ impl LightningWallet {
 		let ldk_node =
 			Arc::new(builder.build_with_store(node_entropy, LdkNodeStore(Arc::clone(&store)))?);
 		let payment_receipt_notify = Arc::new(Notify::new());
-		let (channel_pending_sender, channel_pending_receipt_flag) = watch::channel(0);
+		let channel_pending_notify = Arc::new(Notify::new());
 		let splice_pending_inbox = Arc::new(SplicePendingInbox {
 			pending: Mutex::new(HashMap::new()),
 			notify: Notify::new(),
@@ -200,7 +200,7 @@ impl LightningWallet {
 			ldk_node: Arc::clone(&ldk_node),
 			tx_metadata,
 			payment_receipt_notify: Arc::clone(&payment_receipt_notify),
-			channel_pending_sender,
+			channel_pending_notify: Arc::clone(&channel_pending_notify),
 			splice_pending_inbox: Arc::clone(&splice_pending_inbox),
 			logger: Arc::clone(&logger),
 		});
@@ -209,7 +209,7 @@ impl LightningWallet {
 			logger,
 			store,
 			payment_receipt_notify,
-			channel_pending_receipt_flag,
+			channel_pending_notify,
 			splice_pending_inbox,
 			lsp_node_id,
 			lsp_socket_addr,
@@ -226,12 +226,6 @@ impl LightningWallet {
 		});
 
 		Ok(Self { inner })
-	}
-
-	pub(crate) async fn await_channel_pending(&self, channel_id: u128) {
-		let mut flag = self.inner.channel_pending_receipt_flag.clone();
-		flag.mark_unchanged();
-		flag.wait_for(|t| t == &channel_id).await.expect("channel pending not received");
 	}
 
 	pub(crate) async fn await_splice_pending(&self, channel_id: u128) -> OutPoint {
@@ -529,6 +523,10 @@ impl graduated_rebalancer::LightningWallet for LightningWallet {
 	) -> Pin<Box<dyn Future<Output = OutPoint> + Send + '_>> {
 		Box::pin(async move {
 			loop {
+				let notified = self.inner.channel_pending_notify.notified();
+				tokio::pin!(notified);
+				notified.as_mut().enable();
+
 				let channels = self.inner.ldk_node.list_channels();
 				let chan = channels
 					.into_iter()
@@ -536,8 +534,7 @@ impl graduated_rebalancer::LightningWallet for LightningWallet {
 				match chan {
 					Some(c) => return c.funding_txo.expect("channel has no funding txo"),
 					None => {
-						self.await_channel_pending(channel_id).await;
-						// Wait for the next channel pending event
+						notified.await;
 					},
 				}
 			}

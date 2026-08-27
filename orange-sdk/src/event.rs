@@ -18,7 +18,7 @@ use ldk_node::{CustomTlvRecord, UserChannelId};
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use std::time::SystemTime;
-use tokio::sync::{Mutex, Notify, watch};
+use tokio::sync::{Mutex, Notify};
 
 /// The event queue will be persisted under this key.
 pub(crate) const EVENT_QUEUE_PERSISTENCE_PRIMARY_NAMESPACE: &str = "";
@@ -544,7 +544,7 @@ pub(crate) struct LdkEventHandler {
 	pub(crate) ldk_node: Arc<ldk_node::Node>,
 	pub(crate) tx_metadata: store::TxMetadataStore,
 	pub(crate) payment_receipt_notify: Arc<Notify>,
-	pub(crate) channel_pending_sender: watch::Sender<u128>,
+	pub(crate) channel_pending_notify: Arc<Notify>,
 	pub(crate) splice_pending_inbox: Arc<crate::lightning_wallet::SplicePendingInbox>,
 	pub(crate) logger: Arc<Logger>,
 }
@@ -659,7 +659,7 @@ impl LdkEventHandler {
 					log_error!(self.logger, "Failed to add ChannelOpened event: {e:?}");
 					return;
 				}
-				let _ = self.channel_pending_sender.send(user_channel_id.0);
+				self.channel_pending_notify.notify_waiters();
 			},
 			ldk_node::Event::ChannelClosed {
 				channel_id,
