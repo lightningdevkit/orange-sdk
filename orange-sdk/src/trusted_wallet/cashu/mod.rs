@@ -269,8 +269,12 @@ impl TrustedWalletInterface for Cashu {
 							"Failed to get active melt quotes: {e}"
 						))
 					})?;
-					let active_quote =
-						quotes.into_iter().find(|q| q.request == invoice.to_string());
+					let invoice_string = invoice.to_string();
+					let active_quote = quotes.into_iter().find(|q| {
+						q.request == invoice_string
+							&& convert_amount(q.amount, &self.unit)
+								.is_ok_and(|quote_amount| quote_amount == amount)
+					});
 
 					match active_quote {
 						Some(q) => q,
