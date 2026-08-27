@@ -51,15 +51,13 @@ impl LogWriter for Logger {
 
 		match self {
 			Logger::Facade => {
-				let mut builder = log::Record::builder();
+				let level = facade_level(record.level);
+				if level.to_level_filter() > log::max_level() {
+					return;
+				}
 
-				match record.level {
-					LogLevel::Gossip | LogLevel::Trace => builder.level(log::Level::Trace),
-					LogLevel::Debug => builder.level(log::Level::Debug),
-					LogLevel::Info => builder.level(log::Level::Info),
-					LogLevel::Warn => builder.level(log::Level::Warn),
-					LogLevel::Error => builder.level(log::Level::Error),
-				};
+				let mut builder = log::Record::builder();
+				builder.level(level);
 
 				log::logger().log(
 					&builder
@@ -83,6 +81,16 @@ impl LogWriter for Logger {
 				);
 			},
 		}
+	}
+}
+
+fn facade_level(level: LogLevel) -> log::Level {
+	match level {
+		LogLevel::Gossip | LogLevel::Trace => log::Level::Trace,
+		LogLevel::Debug => log::Level::Debug,
+		LogLevel::Info => log::Level::Info,
+		LogLevel::Warn => log::Level::Warn,
+		LogLevel::Error => log::Level::Error,
 	}
 }
 
