@@ -60,6 +60,7 @@ impl Runtime {
 		F: Future<Output = ()> + Send + 'static,
 	{
 		let mut background_tasks = self.background_tasks.lock().unwrap();
+		self.reap_completed_tasks(&mut background_tasks);
 		let runtime_handle = self.handle();
 		background_tasks.spawn_on(future, runtime_handle);
 	}
@@ -69,6 +70,7 @@ impl Runtime {
 		F: Future<Output = ()> + Send + 'static,
 	{
 		let mut cancellable_background_tasks = self.cancellable_background_tasks.lock().unwrap();
+		self.reap_completed_tasks(&mut cancellable_background_tasks);
 		let runtime_handle = self.handle();
 		cancellable_background_tasks.spawn_on(future, runtime_handle);
 	}
@@ -144,9 +146,92 @@ impl Runtime {
 			RuntimeMode::Handle(handle) => handle,
 		}
 	}
+
+	fn reap_completed_tasks(&self, tasks: &mut JoinSet<()>) {
+		while let Some(result) = tasks.try_join_next() {
+			if let Err(error) = result {
+				log_error!(self.logger, "Background task failed: {error}");
+			}
+		}
+	}
 }
 
 enum RuntimeMode {
 	Owned(tokio::runtime::Runtime),
 	Handle(tokio::runtime::Handle),
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+	use crate::logging::LoggerType;
+
+	fn test_runtime() -> Runtime {
+		let logger = Arc::new(Logger::new(&LoggerType::LogFacade).expect("logger"));
+		// Share the current-thread test runtime. Spawned tasks only run while this test awaits,
+		// and each task runs to completion inside one poll, so a task that has run is also
+		// complete from the `JoinSet`'s point of view.
+		Runtime::with_handle(tokio::runtime::Handle::current(), logger)
+	}
+
+	async fn run_spawned_tasks() {
+		// Each yield lets the scheduler run the tasks that are ready. A few rounds are enough for
+		// tasks that finish in one poll.
+		for _ in 0..8 {
+			tokio::task::yield_now().await;
+		}
+	}
+
+	#[tokio::test]
+	async fn spawning_reaps_completed_cancellable_tasks() {
+		let runtime = test_runtime();
+		let completed = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+		for _ in 0..64 {
+			let completed = Arc::clone(&completed);
+			runtime.spawn_cancellable_background_task(async move {
+				completed.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+			});
+		}
+		run_spawned_tasks().await;
+		assert_eq!(completed.load(std::sync::atomic::Ordering::SeqCst), 64);
+		assert_eq!(runtime.cancellable_background_tasks.lock().unwrap().len(), 64);
+
+		runtime.spawn_cancellable_background_task(async {});
+
+		assert_eq!(runtime.cancellable_background_tasks.lock().unwrap().len(), 1);
+	}
+
+	#[tokio::test]
+	async fn spawning_reaps_completed_background_tasks() {
+		let runtime = test_runtime();
+
+		for _ in 0..64 {
+			runtime.spawn_background_task(async {});
+		}
+		run_spawned_tasks().await;
+		assert_eq!(runtime.background_tasks.lock().unwrap().len(), 64);
+
+		runtime.spawn_background_task(async {});
+
+		assert_eq!(runtime.background_tasks.lock().unwrap().len(), 1);
+	}
+
+	#[tokio::test]
+	async fn spawning_keeps_running_tasks() {
+		let runtime = test_runtime();
+		let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+
+		runtime.spawn_cancellable_background_task(async move {
+			let _ = release_rx.await;
+		});
+		runtime.spawn_cancellable_background_task(async {});
+		run_spawned_tasks().await;
+
+		runtime.spawn_cancellable_background_task(async {});
+
+		// The blocked task stays; the completed one is reaped; the new one is registered.
+		assert_eq!(runtime.cancellable_background_tasks.lock().unwrap().len(), 2);
+		drop(release_tx);
+	}
 }
