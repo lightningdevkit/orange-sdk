@@ -3,7 +3,7 @@ use crate::bitcoin::hashes::Hash;
 use crate::bitcoin::hex::DisplayHex;
 use crate::lightning_wallet::LightningWallet;
 use crate::logging::Logger;
-use crate::store::{PaymentId, TxMetadata, TxMetadataStore, TxType};
+use crate::store::{PaymentId, TxMetadata, TxMetadataStore, TxStatus, TxType};
 use crate::trusted_wallet::DynTrustedWalletInterface;
 use crate::{Event, EventQueue, PaymentType, Tunables};
 use bitcoin_payment_instructions::amount::Amount;
@@ -69,9 +69,9 @@ impl RebalanceTrigger for OrangeTrigger {
 				let mut new_txn = Vec::new();
 				let mut latest_tx: Option<(Duration, _)> = None;
 				for payment in trusted_payments.iter() {
-					if payment.outbound {
-						// Assume it'll be tracked by the sending task.
-						// TODO: Maybe use this to backfill stuff we lost on crash?
+					if payment.outbound || payment.status != TxStatus::Completed {
+						// Outbound payments are tracked by the sending task. Pending and failed
+						// inbound payments must not create metadata or trigger a transfer.
 						continue;
 					}
 					let payment_id = PaymentId::Trusted(payment.id);
