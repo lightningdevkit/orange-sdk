@@ -205,7 +205,9 @@ pub enum Event {
 		/// A local identifier used to track the payment.
 		payment_id: PaymentId,
 		/// The hash of the payment.
-		payment_hash: Vec<u8>,
+		///
+		/// This is unavailable for a reusable BOLT 12 Cashu quote.
+		payment_hash: Option<Vec<u8>>,
 		/// The value, in msats, that has been received.
 		amount_msat: u64,
 		/// Custom TLV records received on the payment
@@ -314,7 +316,7 @@ impl From<OrangeEvent> for Event {
 				lsp_fee_msats,
 			} => Event::PaymentReceived {
 				payment_id: payment_id.into(),
-				payment_hash: payment_hash.0.to_vec(),
+				payment_hash: payment_hash.map(|hash| hash.0.to_vec()),
 				amount_msat,
 				custom_records: custom_records
 					.into_iter()

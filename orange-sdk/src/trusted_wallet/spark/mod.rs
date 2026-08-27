@@ -534,7 +534,7 @@ impl SparkEventHandler {
 						self.event_queue
 							.add_event(Event::PaymentReceived {
 								payment_id: PaymentId::Trusted(id),
-								payment_hash: PaymentHash(payment_hash),
+								payment_hash: Some(PaymentHash(payment_hash)),
 								amount_msat: (payment.amount * 1_000) as u64, // convert to msats
 								custom_records: vec![],
 								lsp_fee_msats,

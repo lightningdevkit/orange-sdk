@@ -21,7 +21,7 @@ use bitcoin_payment_instructions::amount::Amount;
 
 use cdk::amount::SplitTarget;
 use cdk::nuts::MeltOptions;
-use cdk::nuts::nut00::PaymentMethod as CdkPaymentMethod;
+use cdk::nuts::nut00::{PaymentMethod as CdkPaymentMethod, ProofsMethods};
 use cdk::nuts::nut23::Amountless;
 use cdk::nuts::{CurrencyUnit, MeltQuoteState};
 use cdk::wallet::MintQuote;
@@ -900,21 +900,24 @@ impl Cashu {
 			// Convert quote ID to a 32-byte payment ID
 			let payment_id = Self::id_to_32_byte_array(&mint_quote.id);
 
-			// Parse the invoice to get the payment hash
-			// todo this won't work for bolt12
-			let invoice = Bolt11Invoice::from_str(&mint_quote.request).map_err(|e| {
-				TrustedError::Other(format!("Failed to parse invoice from mint quote: {e}"))
+			let payment_hash = if mint_quote.payment_method == CdkPaymentMethod::BOLT11 {
+				let invoice = Bolt11Invoice::from_str(&mint_quote.request).map_err(|error| {
+					TrustedError::Other(format!("Failed to parse invoice from mint quote: {error}"))
+				})?;
+				Some(invoice.payment_hash())
+			} else {
+				None
+			};
+			let minted_amount = proofs.total_amount().map_err(|error| {
+				TrustedError::Other(format!("Failed to total mint proofs: {error}"))
 			})?;
-			let hash = invoice.payment_hash();
-			let amount_msat =
-				convert_amount(mint_quote.amount.unwrap_or_default(), &mint_quote.unit)?
-					.milli_sats();
+			let amount_msat = convert_amount(minted_amount, &mint_quote.unit)?.milli_sats();
 
 			// Send a PaymentReceived event
 			event_queue
 				.add_event(Event::PaymentReceived {
 					payment_id: PaymentId::Trusted(payment_id),
-					payment_hash: hash,
+					payment_hash,
 					amount_msat,
 					custom_records: vec![],
 					lsp_fee_msats: None,
