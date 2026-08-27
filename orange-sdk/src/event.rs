@@ -543,7 +543,7 @@ pub(crate) struct LdkEventHandler {
 	pub(crate) event_queue: Arc<EventQueue>,
 	pub(crate) ldk_node: Arc<ldk_node::Node>,
 	pub(crate) tx_metadata: store::TxMetadataStore,
-	pub(crate) payment_receipt_sender: watch::Sender<()>,
+	pub(crate) payment_receipt_notify: Arc<Notify>,
 	pub(crate) channel_pending_sender: watch::Sender<u128>,
 	pub(crate) splice_pending_inbox: Arc<crate::lightning_wallet::SplicePendingInbox>,
 	pub(crate) logger: Arc<Logger>,
@@ -622,7 +622,7 @@ impl LdkEventHandler {
 				{
 					log_error!(self.logger, "Failed to add PaymentReceived event: {e:?}");
 				}
-				let _ = self.payment_receipt_sender.send(());
+				self.payment_receipt_notify.notify_waiters();
 			},
 			ldk_node::Event::PaymentForwarded { .. } => {},
 			ldk_node::Event::PaymentClaimable { .. } => {
