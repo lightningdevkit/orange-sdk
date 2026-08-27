@@ -65,7 +65,7 @@ impl RebalanceTrigger for OrangeTrigger {
 
 			// we need to add metadata for any potential payments that will cause a rebalance
 			// to happen, so we can track them.
-			if let Ok(trusted_payments) = self.trusted.list_payments().await {
+			let candidate = if let Ok(trusted_payments) = self.trusted.list_payments().await {
 				let mut new_txn = Vec::new();
 				let mut latest_tx: Option<(Duration, _)> = None;
 				for payment in trusted_payments.iter() {
@@ -134,7 +134,9 @@ impl RebalanceTrigger for OrangeTrigger {
 				}
 			} else {
 				None
-			}
+			};
+			finalize_rebalance_candidate(candidate, || self.event_queue.get_rebalance_enabled())
+				.await
 		}
 	}
 
@@ -149,7 +151,7 @@ impl RebalanceTrigger for OrangeTrigger {
 			let new_onchain_sync_time =
 				self.ln_wallet.inner.ldk_node.status().latest_onchain_wallet_sync_timestamp;
 			let onchain_sync_time = self.onchain_sync_time.load(Ordering::Relaxed);
-			if let Some(new_onchain_sync_time) = new_onchain_sync_time
+			let candidate = if let Some(new_onchain_sync_time) = new_onchain_sync_time
 				&& onchain_sync_time != new_onchain_sync_time
 			{
 				// find all new confirmed inbound onchain payments since last sync
@@ -268,13 +270,30 @@ impl RebalanceTrigger for OrangeTrigger {
 			} else {
 				// no new onchain sync, so no need to rebalance
 				None
-			}
+			};
+			finalize_rebalance_candidate(candidate, || self.event_queue.get_rebalance_enabled())
+				.await
 		}
 	}
 
 	fn reserve_trusted_rebalance(&self, trigger_id: [u8; 32]) -> impl Future<Output = bool> + Send {
-		async move { self.tx_metadata.reserve_tx_for_rebalance(&PaymentId::Trusted(trigger_id)).await }
+		async move {
+			if !self.event_queue.get_rebalance_enabled().await {
+				return false;
+			}
+			self.tx_metadata.reserve_tx_for_rebalance(&PaymentId::Trusted(trigger_id)).await
+		}
 	}
+}
+
+async fn finalize_rebalance_candidate<F, Fut>(
+	candidate: Option<TriggerParams>, rebalance_enabled_now: F,
+) -> Option<TriggerParams>
+where
+	F: FnOnce() -> Fut,
+	Fut: Future<Output = bool>,
+{
+	if candidate.is_some() && rebalance_enabled_now().await { candidate } else { None }
 }
 
 fn is_completed_inbound(outbound: bool, status: TxStatus) -> bool {
@@ -306,6 +325,16 @@ mod tests {
 		assert!(!trigger_amount_allows_onchain_rebalance(Some(1_000), minimum));
 		assert!(!trigger_amount_allows_onchain_rebalance(Some(5_000_000), minimum));
 		assert!(trigger_amount_allows_onchain_rebalance(Some(5_001_000), minimum));
+	}
+
+	#[tokio::test]
+	async fn disabling_rebalance_revokes_uncommitted_candidate() {
+		let candidate =
+			TriggerParams { id: [7u8; 32], amount: Amount::from_sats(10_000).expect("amount") };
+
+		let committed = finalize_rebalance_candidate(Some(candidate), || async { false }).await;
+
+		assert!(committed.is_none());
 	}
 }
 
