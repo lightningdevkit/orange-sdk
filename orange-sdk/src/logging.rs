@@ -65,13 +65,19 @@ impl LogWriter for Logger {
 				let mut builder = log::Record::builder();
 				builder.level(level);
 
-				log::logger().log(
-					&builder
-						.module_path(Some(record.module_path))
-						.line(Some(record.line))
-						.args(format_args!("{}", record.args))
-						.build(),
-				);
+				let logger = log::logger();
+				let metadata =
+					log::Metadata::builder().level(level).target(record.module_path).build();
+				if logger.enabled(&metadata) {
+					logger.log(
+						&builder
+							.target(record.module_path)
+							.module_path(Some(record.module_path))
+							.line(Some(record.line))
+							.args(format_args!("{}", record.args))
+							.build(),
+					);
+				}
 			},
 			Logger::File(fs) => {
 				let mut file = fs.lock().unwrap();
