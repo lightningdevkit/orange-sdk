@@ -17,9 +17,8 @@ use ldk_node::{CustomTlvRecord, UserChannelId};
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
-use std::task::{Poll, Waker};
 use std::time::SystemTime;
-use tokio::sync::{Mutex, watch};
+use tokio::sync::{Mutex, Notify, watch};
 
 /// The event queue will be persisted under this key.
 pub(crate) const EVENT_QUEUE_PERSISTENCE_PRIMARY_NAMESPACE: &str = "";
@@ -210,7 +209,7 @@ impl_writeable_tlv_based_enum!(Event,
 pub struct EventQueue {
 	queue: Arc<Mutex<VecDeque<Event>>>,
 	pending_mpp_events: Arc<Mutex<HashMap<PaymentHash, Vec<Event>>>>,
-	waker: Arc<Mutex<Option<Waker>>>,
+	event_notify: Arc<Notify>,
 	kv_store: Arc<dyn DynStore>,
 	rebalance_enabled: RebalanceEnabledCache,
 	tx_metadata: TxMetadataStore,
@@ -223,9 +222,17 @@ impl EventQueue {
 	) -> Self {
 		let queue = Arc::new(Mutex::new(VecDeque::new()));
 		let pending_mpp_events = Arc::new(Mutex::new(HashMap::new()));
-		let waker = Arc::new(Mutex::new(None));
+		let event_notify = Arc::new(Notify::new());
 		let rebalance_enabled = RebalanceEnabledCache::new(Arc::clone(&kv_store));
-		Self { queue, pending_mpp_events, waker, kv_store, rebalance_enabled, tx_metadata, logger }
+		Self {
+			queue,
+			pending_mpp_events,
+			event_notify,
+			kv_store,
+			rebalance_enabled,
+			tx_metadata,
+			logger,
+		}
 	}
 
 	pub(crate) async fn get_rebalance_enabled(&self) -> bool {
@@ -333,9 +340,7 @@ impl EventQueue {
 			self.persist_queue(&locked_queue).await?;
 		}
 
-		if let Some(waker) = self.waker.lock().await.take() {
-			waker.wake();
-		}
+		self.event_notify.notify_waiters();
 		Ok(())
 	}
 
@@ -345,7 +350,17 @@ impl EventQueue {
 	}
 
 	pub(crate) async fn next_event_async(&self) -> Event {
-		EventFuture { event_queue: Arc::clone(&self.queue), waker: Arc::clone(&self.waker) }.await
+		loop {
+			let notified = self.event_notify.notified();
+			tokio::pin!(notified);
+			notified.as_mut().enable();
+
+			if let Some(event) = self.next_event().await {
+				return event;
+			}
+
+			notified.await;
+		}
 	}
 
 	pub(crate) async fn event_handled(&self) -> Result<(), ldk_node::lightning::io::Error> {
@@ -355,9 +370,7 @@ impl EventQueue {
 			self.persist_queue(&locked_queue).await?;
 		}
 
-		if let Some(waker) = self.waker.lock().await.take() {
-			waker.wake();
-		}
+		self.event_notify.notify_waiters();
 		Ok(())
 	}
 
@@ -433,6 +446,33 @@ mod tests {
 	}
 
 	#[tokio::test]
+	async fn asynchronous_waiter_is_woken_for_new_event() {
+		let (_path, store) = temp_sqlite_store();
+		let tx_metadata = TxMetadataStore::new(Arc::clone(&store)).await;
+		let queue = Arc::new(EventQueue::new(
+			store,
+			tx_metadata,
+			Arc::new(Logger::new(&LoggerType::LogFacade).expect("logger")),
+		));
+		let expected = Event::PaymentFailed {
+			payment_id: PaymentId::Trusted([9u8; 32]),
+			payment_hash: None,
+			reason: None,
+		};
+
+		let waiting_queue = Arc::clone(&queue);
+		let waiter = tokio::spawn(async move { waiting_queue.next_event_async().await });
+		tokio::task::yield_now().await;
+		queue.add_event(expected.clone()).await.expect("add event");
+
+		let received = tokio::time::timeout(Duration::from_secs(1), waiter)
+			.await
+			.expect("waiter timed out")
+			.expect("waiter task");
+		assert_eq!(received, expected);
+	}
+
+	#[tokio::test]
 	async fn pending_mpp_setup_buffers_terminal_events_until_metadata_exists() {
 		let (_path, store) = temp_sqlite_store();
 		let tx_metadata = TxMetadataStore::new(Arc::clone(&store)).await;
@@ -495,28 +535,6 @@ impl Writeable for EventQueueSerWrapper<'_> {
 			e.write(writer)?;
 		}
 		Ok(())
-	}
-}
-
-struct EventFuture {
-	event_queue: Arc<Mutex<VecDeque<Event>>>,
-	waker: Arc<Mutex<Option<Waker>>>,
-}
-
-impl Future for EventFuture {
-	type Output = Event;
-
-	fn poll(
-		self: core::pin::Pin<&mut Self>, cx: &mut core::task::Context<'_>,
-	) -> Poll<Self::Output> {
-		if let Some(event) = self.event_queue.try_lock().ok().and_then(|q| q.front().cloned()) {
-			Poll::Ready(event)
-		} else {
-			if let Ok(mut waker) = self.waker.try_lock() {
-				*waker = Some(cx.waker().clone());
-			}
-			Poll::Pending
-		}
 	}
 }
 
