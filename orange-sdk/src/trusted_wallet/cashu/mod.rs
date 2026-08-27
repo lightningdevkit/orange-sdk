@@ -906,13 +906,16 @@ impl Cashu {
 				TrustedError::Other(format!("Failed to parse invoice from mint quote: {e}"))
 			})?;
 			let hash = invoice.payment_hash();
+			let amount_msat =
+				convert_amount(mint_quote.amount.unwrap_or_default(), &mint_quote.unit)?
+					.milli_sats();
 
 			// Send a PaymentReceived event
 			event_queue
 				.add_event(Event::PaymentReceived {
 					payment_id: PaymentId::Trusted(payment_id),
 					payment_hash: hash,
-					amount_msat: u64::from(mint_quote.amount.unwrap_or_default()) * 1_000, /* convert to msats */
+					amount_msat,
 					custom_records: vec![],
 					lsp_fee_msats: None,
 				})
