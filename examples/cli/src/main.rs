@@ -20,7 +20,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::signal;
 
-const NETWORK: Network = Network::Bitcoin; // Supports Bitcoin and Regtest
+const NETWORK: Network = Network::Signet;
 
 #[derive(Parser)]
 #[command(author, version, about, long_about = None)]
@@ -145,6 +145,33 @@ fn get_config(network: Network, cli: &Cli) -> Result<WalletConfig> {
 	};
 
 	match network {
+		Network::Signet => {
+			let lsp_address = "64.23.192.68:9736"
+				.parse()
+				.map_err(|_| anyhow::anyhow!("Failed to parse LSP address"))?;
+			let lsp_pubkey = "03e30fda71887a916ef5548a4d02b06fe04aaa1a8de9e24134ce7f139cf79d7579"
+				.parse()
+				.context("Failed to parse LSP public key")?;
+
+			Ok(WalletConfig {
+				storage_config,
+				logger_type: LoggerType::File {
+					path: PathBuf::from(format!("{storage_path}/wallet.log")),
+				},
+				chain_source: ChainSource::Esplora {
+					url: "https://mutinynet.com/api".to_string(),
+					username: None,
+					password: None,
+				},
+				lsp: (lsp_address, lsp_pubkey, None),
+				scorer_url: None,
+				rgs_url: Some("https://rgs.mutinynet.com/snapshot".to_string()),
+				network,
+				seed,
+				tunables: Tunables::default(),
+				extra_config,
+			})
+		},
 		Network::Regtest => {
 			let lsp_address = "185.150.162.100:3551"
 				.parse()
@@ -298,6 +325,10 @@ impl WalletState {
 
 #[tokio::main(flavor = "multi_thread")]
 async fn main() -> Result<()> {
+	rustls::crypto::ring::default_provider()
+		.install_default()
+		.map_err(|_| anyhow::anyhow!("Failed to install the Rustls Ring crypto provider"))?;
+
 	let cli = Cli::parse();
 
 	println!("{}", "🟠 Orange CLI Wallet".bright_yellow().bold());

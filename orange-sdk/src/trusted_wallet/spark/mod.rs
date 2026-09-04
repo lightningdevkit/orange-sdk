@@ -19,10 +19,10 @@ use bitcoin_payment_instructions::PaymentMethod;
 use bitcoin_payment_instructions::amount::Amount;
 
 use breez_sdk_spark::{
-	BreezSdk, EventListener, GetInfoRequest, ListPaymentsRequest, OptimizationConfig,
+	BreezSdk, ChainApiType, EventListener, GetInfoRequest, ListPaymentsRequest, OptimizationConfig,
 	PaymentDetails, PaymentStatus, PaymentType, PrepareSendPaymentRequest, ReceivePaymentMethod,
 	ReceivePaymentRequest, RegisterLightningAddressRequest, SdkBuilder, SdkError, SdkEvent,
-	SendPaymentMethod, SendPaymentRequest,
+	SendPaymentMethod, SendPaymentRequest, SparkConfig, SparkSigningOperator, SparkSspConfig,
 };
 
 use graduated_rebalancer::ReceivedLightningPayment;
@@ -65,11 +65,60 @@ impl Default for SparkWalletConfig {
 /// but the SDK requires a valid API key to function.
 const BREEZ_API_KEY: &str = "MIIBajCCARygAwIBAgIHPnfOjAhBgzAFBgMrZXAwEDEOMAwGA1UEAxMFQnJlZXowHhcNMjUwOTE5MjEzNTU1WhcNMzUwOTE3MjEzNTU1WjAqMRMwEQYDVQQKEwpvcmFuZ2Utc2RrMRMwEQYDVQQDEwpvcmFuZ2Utc2RrMCowBQYDK2VwAyEA0IP1y98gPByiIMoph1P0G6cctLb864rNXw1LRLOpXXejezB5MA4GA1UdDwEB/wQEAwIFoDAMBgNVHRMBAf8EAjAAMB0GA1UdDgQWBBTaOaPuXmtLDTJVv++VYBiQr9gHCTAfBgNVHSMEGDAWgBTeqtaSVvON53SSFvxMtiCyayiYazAZBgNVHREEEjAQgQ5iZW5Ac3BpcmFsLnh5ejAFBgMrZXADQQCry+1LkA3nrYa1sovS5iFI1Tkpmr/R0nM/4gJtsO93vFOkm3vBEGwjKAV7lrGzFcFbbuyM1wEJPi4Po1XCEG0D";
 
+const MUTINYNET_ESPLORA_URL: &str = "https://mutinynet.com/api";
+
+fn mutinynet_spark_config() -> SparkConfig {
+	let coordinator_identifier = "0000000000000000000000000000000000000000000000000000000000000001";
+
+	SparkConfig {
+		coordinator_identifier: coordinator_identifier.to_string(),
+		threshold: 2,
+		signing_operators: vec![
+			SparkSigningOperator {
+				id: 0,
+				identifier: coordinator_identifier.to_string(),
+				address: "https://0.spark.mutinynet.com".to_string(),
+				identity_public_key:
+					"02d446dcd16eef9814d6491f64898f96e70061ed06e01393e2801a2bae8d9582e5".to_string(),
+			},
+			SparkSigningOperator {
+				id: 1,
+				identifier: "0000000000000000000000000000000000000000000000000000000000000002"
+					.to_string(),
+				address: "https://1.spark.mutinynet.com".to_string(),
+				identity_public_key:
+					"026ee53806c9c8323d79f11b4980af3002e30040ced8c4adc34b684454121b5764".to_string(),
+			},
+		],
+		ssp_config: SparkSspConfig {
+			base_url: "https://ssp.mutinynet.com".to_string(),
+			identity_public_key:
+				"0306e597d556f83e3b6f4a524c7cd84630b14ce323252d9cc1f8444a9b00a46756".to_string(),
+			schema_endpoint: Some("graphql/spark/rc".to_string()),
+		},
+		expected_withdraw_bond_sats: 10_000,
+		expected_withdraw_relative_block_locktime: 1_000,
+	}
+}
+
 impl SparkWalletConfig {
 	fn into_breez_config(self, network: Network) -> Result<breez_sdk_spark::Config, TrustedError> {
-		let network = match network {
-			Network::Bitcoin => breez_sdk_spark::Network::Mainnet,
-			Network::Regtest => breez_sdk_spark::Network::Regtest,
+		let (network, spark_config, optimization_config) = match network {
+			Network::Bitcoin => (
+				breez_sdk_spark::Network::Mainnet,
+				None,
+				OptimizationConfig { auto_enabled: true, multiplicity: 1 },
+			),
+			Network::Regtest => (
+				breez_sdk_spark::Network::Regtest,
+				None,
+				OptimizationConfig { auto_enabled: true, multiplicity: 1 },
+			),
+			Network::Signet => (
+				breez_sdk_spark::Network::Signet,
+				Some(mutinynet_spark_config()),
+				OptimizationConfig { auto_enabled: false, multiplicity: 0 },
+			),
 			_ => return Err(TrustedError::InvalidNetwork),
 		};
 
@@ -84,10 +133,10 @@ impl SparkWalletConfig {
 			max_deposit_claim_fee: None,
 			lnurl_domain: self.lnurl_domain,
 			private_enabled_default: true,
-			optimization_config: OptimizationConfig { auto_enabled: true, multiplicity: 1 },
+			optimization_config,
 			stable_balance_config: None,
 			max_concurrent_claims: 4,
-			spark_config: None,
+			spark_config,
 		})
 	}
 }
@@ -350,7 +399,14 @@ impl Spark {
 		};
 
 		let spark_store = Arc::new(spark_store::SparkStore::new(store));
-		let builder = SdkBuilder::new(spark_config, seed).with_storage(spark_store);
+		let mut builder = SdkBuilder::new(spark_config, seed).with_storage(spark_store);
+		if config.network == Network::Signet {
+			builder = builder.with_rest_chain_service(
+				MUTINYNET_ESPLORA_URL.to_string(),
+				ChainApiType::Esplora,
+				None,
+			);
+		}
 
 		let spark_wallet = Arc::new(builder.build().await.map_err(|e| {
 			log_error!(logger, "Failed to initialize Spark wallet: {e:?}");
@@ -648,5 +704,56 @@ impl TryFrom<breez_sdk_spark::Payment> for Payment {
 			outbound: value.payment_type == PaymentType::Send,
 			time_since_epoch: Duration::from_secs(value.timestamp),
 		})
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	#[test]
+	fn signet_uses_mutinynet_spark_config() {
+		let config = SparkWalletConfig::default().into_breez_config(Network::Signet).unwrap();
+
+		assert!(matches!(config.network, breez_sdk_spark::Network::Signet));
+		assert!(!config.optimization_config.auto_enabled);
+		assert_eq!(config.optimization_config.multiplicity, 0);
+
+		let spark_config = config.spark_config.unwrap();
+		assert_eq!(
+			spark_config.coordinator_identifier,
+			"0000000000000000000000000000000000000000000000000000000000000001"
+		);
+		assert_eq!(spark_config.threshold, 2);
+		assert_eq!(spark_config.signing_operators.len(), 2);
+		assert_eq!(spark_config.signing_operators[0].id, 0);
+		assert_eq!(
+			spark_config.signing_operators[0].identifier,
+			"0000000000000000000000000000000000000000000000000000000000000001"
+		);
+		assert_eq!(spark_config.signing_operators[0].address, "https://0.spark.mutinynet.com");
+		assert_eq!(
+			spark_config.signing_operators[0].identity_public_key,
+			"02d446dcd16eef9814d6491f64898f96e70061ed06e01393e2801a2bae8d9582e5"
+		);
+		assert_eq!(spark_config.signing_operators[1].id, 1);
+		assert_eq!(
+			spark_config.signing_operators[1].identifier,
+			"0000000000000000000000000000000000000000000000000000000000000002"
+		);
+		assert_eq!(spark_config.signing_operators[1].address, "https://1.spark.mutinynet.com");
+		assert_eq!(
+			spark_config.signing_operators[1].identity_public_key,
+			"026ee53806c9c8323d79f11b4980af3002e30040ced8c4adc34b684454121b5764"
+		);
+		assert_eq!(spark_config.ssp_config.base_url, "https://ssp.mutinynet.com");
+		assert_eq!(
+			spark_config.ssp_config.identity_public_key,
+			"0306e597d556f83e3b6f4a524c7cd84630b14ce323252d9cc1f8444a9b00a46756"
+		);
+		assert_eq!(spark_config.ssp_config.schema_endpoint.as_deref(), Some("graphql/spark/rc"));
+		assert_eq!(spark_config.expected_withdraw_bond_sats, 10_000);
+		assert_eq!(spark_config.expected_withdraw_relative_block_locktime, 1_000);
+		assert_eq!(MUTINYNET_ESPLORA_URL, "https://mutinynet.com/api");
 	}
 }

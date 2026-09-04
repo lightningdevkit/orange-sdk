@@ -20,7 +20,7 @@ cli-cashu *args:
     cd examples/cli && cargo run -- --cashu --npubcash-url https://npubx.cash --mint-url {{ args }}
 
 cli-logs:
-    tail -n 50 -f examples/cli/wallet_data/bitcoin/wallet.log
+    tail -n 50 -f examples/cli/wallet_data/signet/wallet.log
 
 # Run the CLI against a local VSS server on http://127.0.0.1:8080/vss.
 cli-vss:
