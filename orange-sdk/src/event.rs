@@ -991,7 +991,11 @@ impl LdkEventHandler {
 			.upsert(
 				payment_id,
 				store::TxMetadata {
-					ty: store::TxType::PendingRebalance {},
+					ty: store::TxType::PendingRebalance {
+						payment_hash: None,
+						trigger: None,
+						amount_msat: None,
+					},
 					time: SystemTime::now()
 						.duration_since(SystemTime::UNIX_EPOCH)
 						.unwrap_or_default(),

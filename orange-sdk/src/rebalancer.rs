@@ -3,14 +3,16 @@ use crate::bitcoin::hashes::Hash;
 use crate::bitcoin::hex::DisplayHex;
 use crate::lightning_wallet::LightningWallet;
 use crate::logging::Logger;
-use crate::store::{PaymentId, TxMetadata, TxMetadataStore, TxType};
-use crate::trusted_wallet::DynTrustedWalletInterface;
+use crate::store::{PaymentId, TxMetadata, TxMetadataStore, TxStatus, TxType};
+use crate::trusted_wallet::{DynTrustedWalletInterface, Payment};
 use crate::{Event, EventQueue, PaymentType, Tunables};
 use bitcoin_payment_instructions::amount::Amount;
-use graduated_rebalancer::{RebalanceTrigger, RebalancerEvent, TriggerParams};
+use graduated_rebalancer::{EventHandler as _, RebalanceTrigger, RebalancerEvent, TriggerParams};
 use ldk_node::lightning::util::logger::Logger as _;
 use ldk_node::lightning::{log_error, log_info, log_trace, log_warn};
-use ldk_node::payment::{ConfirmationStatus, PaymentDirection, PaymentKind, PaymentStatus};
+use ldk_node::payment::{
+	ConfirmationStatus, PaymentDetails, PaymentDirection, PaymentKind, PaymentStatus,
+};
 use std::cmp;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -330,6 +332,120 @@ impl OrangeRebalanceEventHandler {
 	) -> Self {
 		Self { tx_metadata, event_queue, logger }
 	}
+
+	/// Finishes trusted rebalances whose Lightning receipt arrived but was never matched,
+	/// for example after a crash or shutdown while a slow trusted payment was settling.
+	/// Without this, the trusted send stays hidden and the receipt shows as ordinary income.
+	pub(crate) async fn reconcile_pending_rebalances(
+		&self, trusted: &DynTrustedWalletInterface, ln_wallet: &LightningWallet,
+	) {
+		let pending: Vec<_> = {
+			let metadata = self.tx_metadata.read();
+			metadata
+				.iter()
+				.filter_map(|(id, entry)| match (id, entry.ty) {
+					(
+						PaymentId::Trusted(trusted_id),
+						TxType::PendingRebalance {
+							payment_hash: Some(payment_hash),
+							trigger: Some(trigger),
+							amount_msat: Some(amount_msat),
+						},
+					) => {
+						// `RebalanceSuccessful` promotes the trigger, which must be a payment.
+						let trigger_is_payment = matches!(
+							metadata.get(&PaymentId::Trusted(trigger)).map(|t| t.ty),
+							Some(
+								TxType::Payment { .. }
+									| TxType::PaymentTriggeringTransferLightning { .. }
+							)
+						);
+						trigger_is_payment.then_some(PendingTrustedRebalance {
+							trusted_id: *trusted_id,
+							payment_hash,
+							trigger,
+							amount_msat,
+						})
+					},
+					_ => None,
+				})
+				.collect()
+		};
+		if pending.is_empty() {
+			return;
+		}
+
+		let trusted_payments = match trusted.list_payments().await {
+			Ok(payments) => payments,
+			Err(e) => {
+				log_error!(self.logger, "Failed to list trusted payments for reconciliation: {e}");
+				return;
+			},
+		};
+		let lightning_payments = match ln_wallet.list_payments() {
+			Ok(payments) => payments,
+			Err(e) => {
+				log_error!(self.logger, "Failed to list LN payments for reconciliation: {e}");
+				return;
+			},
+		};
+
+		for (trusted_id, event) in
+			completed_pending_rebalances(&pending, &trusted_payments, &lightning_payments)
+		{
+			log_info!(
+				self.logger,
+				"Finishing rebalance {} that completed before the last shutdown",
+				trusted_id.as_hex()
+			);
+			self.handle_event(event).await;
+		}
+	}
+}
+
+/// A trusted rebalance whose receipt has not been matched, with what is needed to finish it.
+struct PendingTrustedRebalance {
+	trusted_id: [u8; 32],
+	payment_hash: [u8; 32],
+	trigger: [u8; 32],
+	amount_msat: u64,
+}
+
+/// Pending rebalances whose trusted leg completed and whose Lightning receipt is recorded,
+/// as the trusted payment ID and the `RebalanceSuccessful` event that finishes each one.
+fn completed_pending_rebalances(
+	pending: &[PendingTrustedRebalance], trusted: &[Payment], lightning: &[PaymentDetails],
+) -> Vec<([u8; 32], RebalancerEvent)> {
+	pending
+		.iter()
+		.filter_map(|rebalance| {
+			let trusted_payment = trusted
+				.iter()
+				.find(|payment| payment.outbound && payment.id == rebalance.trusted_id)?;
+			if trusted_payment.status != TxStatus::Completed {
+				return None;
+			}
+			let (ln_id, lsp_fee_msat) =
+				lightning.iter().find_map(|payment| match payment.kind {
+					PaymentKind::Bolt11 { hash, counterparty_skimmed_fee_msat, .. }
+						if hash.0 == rebalance.payment_hash
+							&& payment.direction == PaymentDirection::Inbound
+							&& payment.status == PaymentStatus::Succeeded =>
+					{
+						Some((payment.id.0, counterparty_skimmed_fee_msat))
+					},
+					_ => None,
+				})?;
+			let event = RebalancerEvent::RebalanceSuccessful {
+				trigger_id: rebalance.trigger,
+				trusted_rebalance_payment_id: rebalance.trusted_id,
+				ln_rebalance_payment_id: ln_id,
+				amount_msat: rebalance.amount_msat,
+				fee_msat: lsp_fee_msat.unwrap_or_default() + trusted_payment.fee.milli_sats(),
+			};
+			Some((rebalance.trusted_id, event))
+		})
+		.collect()
 }
 
 impl graduated_rebalancer::EventHandler for OrangeRebalanceEventHandler {
@@ -341,10 +457,15 @@ impl graduated_rebalancer::EventHandler for OrangeRebalanceEventHandler {
 				RebalancerEvent::RebalanceInitiated {
 					trigger_id,
 					trusted_rebalance_payment_id,
+					payment_hash,
 					amount_msat,
 				} => {
 					let metadata = TxMetadata {
-						ty: TxType::PendingRebalance {},
+						ty: TxType::PendingRebalance {
+							payment_hash: Some(payment_hash),
+							trigger: Some(trigger_id),
+							amount_msat: Some(amount_msat),
+						},
 						time: SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap(),
 					};
 					self.tx_metadata
@@ -430,10 +551,94 @@ impl graduated_rebalancer::EventHandler for OrangeRebalanceEventHandler {
 
 #[cfg(test)]
 mod tests {
-	use super::RebalanceScheduler;
-	use std::sync::Arc;
-	use std::time::Duration;
+	use super::*;
+	use ldk_node::lightning::ln::channelmanager::PaymentId as LdkPaymentId;
+	use ldk_node::lightning_types::payment::PaymentHash;
 	use tokio::sync::{Semaphore, mpsc};
+
+	const TRUSTED_ID: [u8; 32] = [1; 32];
+	const HASH: [u8; 32] = [2; 32];
+	const TRIGGER: [u8; 32] = [3; 32];
+	const LN_ID: [u8; 32] = [4; 32];
+
+	fn pending() -> PendingTrustedRebalance {
+		PendingTrustedRebalance {
+			trusted_id: TRUSTED_ID,
+			payment_hash: HASH,
+			trigger: TRIGGER,
+			amount_msat: 50_000_000,
+		}
+	}
+
+	fn trusted(status: TxStatus) -> Payment {
+		Payment {
+			id: TRUSTED_ID,
+			amount: Amount::from_milli_sats(50_000_000).unwrap(),
+			fee: Amount::from_milli_sats(1_000).unwrap(),
+			status,
+			outbound: true,
+			time_since_epoch: Duration::from_secs(1),
+		}
+	}
+
+	fn receipt(hash: [u8; 32], status: PaymentStatus) -> PaymentDetails {
+		PaymentDetails {
+			id: LdkPaymentId(LN_ID),
+			kind: PaymentKind::Bolt11 {
+				hash: PaymentHash(hash),
+				preimage: None,
+				secret: None,
+				counterparty_skimmed_fee_msat: Some(2_000),
+			},
+			amount_msat: Some(50_000_000),
+			fee_paid_msat: None,
+			direction: PaymentDirection::Inbound,
+			status,
+			latest_update_timestamp: 1,
+		}
+	}
+
+	#[test]
+	fn reconciliation_finishes_only_settled_and_received_rebalances() {
+		let completed = trusted(TxStatus::Completed);
+		let received = receipt(HASH, PaymentStatus::Succeeded);
+
+		let events =
+			completed_pending_rebalances(&[pending()], &[completed.clone()], &[received.clone()]);
+		assert_eq!(events.len(), 1);
+		assert_eq!(events[0].0, TRUSTED_ID);
+		match &events[0].1 {
+			RebalancerEvent::RebalanceSuccessful {
+				trigger_id,
+				trusted_rebalance_payment_id,
+				ln_rebalance_payment_id,
+				amount_msat,
+				fee_msat,
+			} => {
+				assert_eq!(*trigger_id, TRIGGER);
+				assert_eq!(*trusted_rebalance_payment_id, TRUSTED_ID);
+				assert_eq!(*ln_rebalance_payment_id, LN_ID);
+				assert_eq!(*amount_msat, 50_000_000);
+				assert_eq!(*fee_msat, 3_000);
+			},
+			other => panic!("unexpected event {other:?}"),
+		}
+
+		// Anything unsettled or unmatched is left alone for a later run.
+		let unsettled = [
+			(trusted(TxStatus::Pending), received.clone()),
+			(trusted(TxStatus::Failed), received.clone()),
+			(completed.clone(), receipt(HASH, PaymentStatus::Pending)),
+			(completed.clone(), receipt([9; 32], PaymentStatus::Succeeded)),
+		];
+		for (trusted_payment, ln_payment) in unsettled {
+			assert!(
+				completed_pending_rebalances(&[pending()], &[trusted_payment], &[ln_payment])
+					.is_empty()
+			);
+		}
+		assert!(completed_pending_rebalances(&[pending()], &[], &[received]).is_empty());
+	}
 
 	#[tokio::test]
 	async fn requests_are_combined_without_losing_changes_during_a_check() {
