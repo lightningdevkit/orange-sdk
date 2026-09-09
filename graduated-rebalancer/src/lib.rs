@@ -107,8 +107,9 @@ pub trait LightningWallet: Send + Sync {
 		&self, method: PaymentMethod, amount: Amount,
 	) -> Pin<Box<dyn Future<Output = Result<[u8; 32], Self::Error>> + Send + '_>>;
 
-	/// Wait for a payment receipt notification
-	fn await_payment_receipt(
+	/// Register a payment receipt wait immediately, before initiating the payment.
+	/// The returned future must retain a receipt that arrives before it is polled.
+	fn register_payment_receipt(
 		&self, payment_hash: [u8; 32],
 	) -> Pin<Box<dyn Future<Output = Option<ReceivedLightningPayment>> + Send + '_>>;
 
@@ -314,6 +315,7 @@ where
 				"Attempting to pay invoice {inv} to rebalance for {transfer_amt:?}",
 			);
 			let expected_hash = inv.payment_hash();
+			let receipt_wait = self.ln_wallet.register_payment_receipt(expected_hash.0);
 			match self.trusted.pay(PaymentMethod::LightningBolt11(inv), transfer_amt).await {
 				Ok(rebalance_id) => {
 					log_debug!(
@@ -330,14 +332,13 @@ where
 						})
 						.await;
 
-					let ln_payment =
-						match self.ln_wallet.await_payment_receipt(expected_hash.0).await {
-							Some(receipt) => receipt,
-							None => {
-								log_error!(self.logger, "Failed to receive rebalance payment!");
-								return;
-							},
-						};
+					let ln_payment = match receipt_wait.await {
+						Some(receipt) => receipt,
+						None => {
+							log_error!(self.logger, "Failed to receive rebalance payment!");
+							return;
+						},
+					};
 
 					let trusted_payment =
 						match self.trusted.await_payment_success(expected_hash.0).await {

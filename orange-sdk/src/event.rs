@@ -1,7 +1,8 @@
+use crate::dyn_store::DynStore;
+use crate::lightning_wallet::{PaymentReceiptInbox, SplicePendingInbox};
 use crate::logging::Logger;
 use crate::store::{self, MppOutcome, PaymentId, RebalanceEnabledCache, TxMetadataStore, TxType};
-
-use crate::dyn_store::DynStore;
+use graduated_rebalancer::ReceivedLightningPayment;
 use ldk_node::bitcoin::hashes::Hash;
 use ldk_node::bitcoin::secp256k1::PublicKey;
 use ldk_node::bitcoin::{OutPoint, Txid};
@@ -415,11 +416,14 @@ mod tests {
 		(path, Arc::new(store))
 	}
 
-	fn mpp_metadata(surface_id: PaymentId, lightning_leg: [u8; 32]) -> TxMetadata {
+	fn mpp_metadata(
+		surface_id: PaymentId, lightning_leg: [u8; 32], payment_hash: [u8; 32],
+	) -> TxMetadata {
 		TxMetadata {
 			ty: TxType::MppPayment {
 				surface_id,
 				lightning_leg,
+				payment_hash: Some(payment_hash),
 				total_amount_msat: 200_000,
 				ty: PaymentType::OutgoingLightningBolt11 { payment_preimage: None },
 				trusted_fee_msat: None,
@@ -444,7 +448,8 @@ mod tests {
 
 		let payment_hash = PaymentHash([3u8; 32]);
 		let surface_id = PaymentId::Trusted([7u8; 32]);
-		let lightning_id = PaymentId::SelfCustodial(payment_hash.0);
+		let lightning_leg = [4; 32];
+		let lightning_id = PaymentId::SelfCustodial(lightning_leg);
 		let preimage = PaymentPreimage([1u8; 32]);
 
 		queue.begin_mpp_setup(payment_hash).await;
@@ -459,8 +464,12 @@ mod tests {
 			.expect("buffer event");
 		assert_eq!(queue.next_event().await, None);
 
-		tx_metadata.insert(surface_id, mpp_metadata(surface_id, payment_hash.0)).await;
-		tx_metadata.upsert(lightning_id, mpp_metadata(surface_id, payment_hash.0)).await;
+		tx_metadata
+			.insert(surface_id, mpp_metadata(surface_id, lightning_leg, payment_hash.0))
+			.await;
+		tx_metadata
+			.upsert(lightning_id, mpp_metadata(surface_id, lightning_leg, payment_hash.0))
+			.await;
 		queue.finish_mpp_setup(payment_hash).await.expect("replay buffered events");
 		assert_eq!(queue.next_event().await, None);
 
@@ -525,9 +534,9 @@ pub(crate) struct LdkEventHandler {
 	pub(crate) event_queue: Arc<EventQueue>,
 	pub(crate) ldk_node: Arc<ldk_node::Node>,
 	pub(crate) tx_metadata: store::TxMetadataStore,
-	pub(crate) payment_receipt_sender: watch::Sender<()>,
+	pub(crate) payment_receipt_inbox: Arc<PaymentReceiptInbox>,
 	pub(crate) channel_pending_sender: watch::Sender<u128>,
-	pub(crate) splice_pending_inbox: Arc<crate::lightning_wallet::SplicePendingInbox>,
+	pub(crate) splice_pending_inbox: Arc<SplicePendingInbox>,
 	pub(crate) logger: Arc<Logger>,
 }
 
@@ -542,7 +551,7 @@ impl LdkEventHandler {
 				bolt12_invoice: _,
 			} => {
 				let preimage = payment_preimage.unwrap(); // safe
-				let payment_id = PaymentId::SelfCustodial(payment_id.unwrap().0); // safe
+				let payment_id = PaymentId::SelfCustodial(payment_id.0);
 
 				if self.tx_metadata.set_preimage(payment_id, preimage.0).await.is_err() {
 					log_error!(self.logger, "Failed to set preimage for payment {payment_id:?}");
@@ -566,7 +575,7 @@ impl LdkEventHandler {
 				if let Err(e) = self
 					.event_queue
 					.add_event(Event::PaymentFailed {
-						payment_id: PaymentId::SelfCustodial(payment_id.unwrap().0), // safe
+						payment_id: PaymentId::SelfCustodial(payment_id.0),
 						payment_hash,
 						reason,
 					})
@@ -582,8 +591,14 @@ impl LdkEventHandler {
 				amount_msat,
 				custom_records,
 			} => {
-				let payment_id = payment_id.expect("this is safe");
-				let lsp_fee_msats = self.ldk_node.payment(&payment_id).and_then(|p| {
+				let payment = match self.ldk_node.payment(&payment_id) {
+					Ok(payment) => payment,
+					Err(e) => {
+						log_error!(self.logger, "Failed to read received payment: {e}");
+						return;
+					},
+				};
+				let lsp_fee_msats = payment.and_then(|p| {
 					if let PaymentKind::Bolt11 { counterparty_skimmed_fee_msat, .. } = p.kind {
 						counterparty_skimmed_fee_msat
 					} else {
@@ -604,7 +619,10 @@ impl LdkEventHandler {
 				{
 					log_error!(self.logger, "Failed to add PaymentReceived event: {e:?}");
 				}
-				let _ = self.payment_receipt_sender.send(());
+				self.payment_receipt_inbox.deliver(
+					payment_hash.0,
+					ReceivedLightningPayment { id: payment_id.0, fee_paid_msat: lsp_fee_msats },
+				);
 			},
 			ldk_node::Event::PaymentForwarded { .. } => {},
 			ldk_node::Event::PaymentClaimable { .. } => {

@@ -29,6 +29,8 @@ use ldk_node::lightning::{log_debug, log_error, log_info, log_trace, log_warn};
 use ldk_node::lightning_invoice::Bolt11Invoice;
 use ldk_node::payment::{PaymentDetails, PaymentDirection, PaymentKind};
 use ldk_node::{BuildError, ChannelDetails, NodeError};
+#[cfg(feature = "_test-utils")]
+pub use lightning_wallet::list_node_payments;
 
 use crate::dyn_store::DynStore;
 
@@ -806,7 +808,7 @@ impl Wallet {
 			store::read_splice_outs(self.inner.store.as_ref())
 		);
 		let trusted_payments = trusted_payments?;
-		let mut lightning_payments = self.inner.ln_wallet.list_payments();
+		let mut lightning_payments = self.inner.ln_wallet.list_payments()?;
 		lightning_payments.sort_by_key(|l| l.latest_update_timestamp);
 
 		let mut res = Vec::with_capacity(
@@ -1589,6 +1591,7 @@ impl Wallet {
 			ty: TxType::MppPayment {
 				surface_id,
 				lightning_leg: ln_id.0,
+				payment_hash: Some(payment_hash.0),
 				total_amount_msat: amount.milli_sats(),
 				ty: PaymentType::OutgoingLightningBolt11 { payment_preimage: None },
 				trusted_fee_msat: None,

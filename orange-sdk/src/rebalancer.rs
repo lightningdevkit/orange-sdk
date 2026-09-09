@@ -153,7 +153,14 @@ impl RebalanceTrigger for OrangeTrigger {
 				&& onchain_sync_time != new_onchain_sync_time
 			{
 				// find all new confirmed inbound onchain payments since last sync
-				let new_recvs = self.ln_wallet.inner.ldk_node.list_payments_with_filter(|p| {
+				let payments = match self.ln_wallet.list_payments() {
+					Ok(payments) => payments,
+					Err(e) => {
+						log_error!(self.logger, "Failed to list onchain payments: {e}");
+						return None;
+					},
+				};
+				let new_recvs = payments.iter().filter(|p| {
 					p.direction == PaymentDirection::Inbound
 						&& p.status == PaymentStatus::Succeeded
 						&& p.latest_update_timestamp > onchain_sync_time
@@ -198,8 +205,7 @@ impl RebalanceTrigger for OrangeTrigger {
 				if spendable > self.tunables.rebalance_min.sats_rounding_up() {
 					// find the new onchain receives since last sync
 					// if we have multiple, select the largest one as the one to mark as triggering the rebalance
-					let txs = self.ln_wallet.list_payments();
-					let new = txs
+					let new = payments
 						.into_iter()
 						.filter_map(|t| {
 							if t.status != PaymentStatus::Succeeded

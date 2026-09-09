@@ -101,7 +101,7 @@ impl DummyTrustedWallet {
 						bolt12_invoice: _,
 					} => {
 						// convert id
-						let id = mangle_payment_id(payment_id.unwrap().0);
+						let id = mangle_payment_id(payment_id.0);
 
 						let mut payments = pays.write().await;
 						let item = payments.iter_mut().find(|p| p.id == id);
@@ -142,7 +142,7 @@ impl DummyTrustedWallet {
 					},
 					Event::PaymentFailed { payment_id, payment_hash, reason } => {
 						// convert id
-						let id = mangle_payment_id(payment_id.unwrap().0);
+						let id = mangle_payment_id(payment_id.0);
 
 						let mut payments = pays.write().await;
 						let item = payments.iter().cloned().enumerate().find(|(_, p)| p.id == id);
@@ -174,7 +174,7 @@ impl DummyTrustedWallet {
 					},
 					Event::PaymentReceived { payment_id, amount_msat, payment_hash, .. } => {
 						// convert id
-						let id = mangle_payment_id(payment_id.unwrap().0);
+						let id = mangle_payment_id(payment_id.0);
 
 						let mut payments = pays.write().await;
 						// We create invoices on the fly without adding the payment to our list
@@ -503,7 +503,14 @@ impl TrustedWalletInterface for DummyTrustedWallet {
 			let mut flag = self.payment_success_flag.clone();
 			flag.mark_unchanged();
 			loop {
-				if let Some(payment) = self.ldk_node.payment(&id) {
+				let payment = match self.ldk_node.payment(&id) {
+					Ok(payment) => payment,
+					Err(e) => {
+						log::error!("Failed to read payment receipt: {e}");
+						return None;
+					},
+				};
+				if let Some(payment) = payment {
 					let counterparty_skimmed_fee_msat = match payment.kind {
 						PaymentKind::Bolt11 { hash, counterparty_skimmed_fee_msat, .. } => {
 							debug_assert!(hash.0 == payment_hash, "Payment Hash mismatch");

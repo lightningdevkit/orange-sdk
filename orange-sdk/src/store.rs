@@ -264,8 +264,10 @@ pub(crate) enum TxType {
 	MppPayment {
 		/// The id under which the combined payment is surfaced to the user (the trusted leg id).
 		surface_id: PaymentId,
-		/// The lightning leg's payment id (equal to the BOLT 11 payment hash).
+		/// The lightning leg's payment id.
 		lightning_leg: [u8; 32],
+		/// The invoice hash. Absent in legacy records where it equalled the lightning ID.
+		payment_hash: Option<[u8; 32]>,
 		/// The total amount, in msats, of the combined payment (i.e. the invoice amount).
 		total_amount_msat: u64,
 		/// The payment type of the combined transaction.
@@ -429,6 +431,7 @@ impl_writeable_tlv_based_enum!(TxType,
 		(12, trusted_fee_msat, option),
 		(14, lightning_fee_msat, option),
 		(16, preimage, option),
+		(17, payment_hash, option),
 	},
 );
 
@@ -674,6 +677,7 @@ impl TxMetadataStore {
 				};
 				let TxType::MppPayment {
 					lightning_leg,
+					payment_hash,
 					trusted_fee_msat,
 					lightning_fee_msat,
 					preimage,
@@ -700,7 +704,7 @@ impl TxMetadataStore {
 					None => *failed = true,
 				}
 
-				let payment_hash = *lightning_leg;
+				let payment_hash = payment_hash.unwrap_or(*lightning_leg);
 				if *failed {
 					*finalized = true;
 					Some(MppOutcome::Failed { payment_hash })
@@ -867,6 +871,7 @@ mod tests {
 			ty: TxType::MppPayment {
 				surface_id: surface_id(),
 				lightning_leg: LIGHTNING_LEG,
+				payment_hash: Some([7; 32]),
 				total_amount_msat: 200_000,
 				ty: PaymentType::OutgoingLightningBolt11 { payment_preimage: None },
 				trusted_fee_msat: None,
@@ -901,7 +906,7 @@ mod tests {
 			Some((
 				surface_id(),
 				MppOutcome::Succeeded {
-					payment_hash: LIGHTNING_LEG,
+					payment_hash: [7; 32],
 					preimage: [1u8; 32],
 					fee_msat: 3_000,
 				}
@@ -968,7 +973,7 @@ mod tests {
 		// A failed leg fails the whole payment immediately, exactly once.
 		assert_eq!(
 			tx_metadata.record_mpp_leg(surface_id(), None).await,
-			Some((surface_id(), MppOutcome::Failed { payment_hash: LIGHTNING_LEG }))
+			Some((surface_id(), MppOutcome::Failed { payment_hash: [7; 32] }))
 		);
 		assert_eq!(
 			tx_metadata.record_mpp_leg(lightning_id(), Some((2_000, [1u8; 32]))).await,
@@ -990,6 +995,24 @@ mod tests {
 			)
 			.await;
 		assert_eq!(tx_metadata.record_mpp_leg(plain, Some((1, [0u8; 32]))).await, None);
+	}
+
+	#[tokio::test]
+	async fn legacy_mpp_metadata_uses_lightning_id_as_hash() {
+		let (_path, store) = temp_sqlite_store();
+		let tx_metadata = TxMetadataStore::new(store).await;
+		let mut legacy = mpp_metadata();
+		if let TxType::MppPayment { payment_hash, .. } = &mut legacy.ty {
+			*payment_hash = None;
+		}
+		// None omits the new TLV, reproducing the old metadata encoding.
+		let encoded = legacy.encode();
+		let decoded = TxMetadata::read(&mut &encoded[..]).unwrap();
+		tx_metadata.insert(surface_id(), decoded).await;
+		assert_eq!(
+			tx_metadata.record_mpp_leg(surface_id(), None).await,
+			Some((surface_id(), MppOutcome::Failed { payment_hash: LIGHTNING_LEG }))
+		);
 	}
 
 	#[test]
