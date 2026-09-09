@@ -19,8 +19,8 @@ use ldk_node::lightning::util::persist::{
 	KVStore, PageToken, PaginatedKVStore, PaginatedListResponse,
 };
 
-/// Matches the connection capacity used by the VSS HTTP client. Keeping the
-/// limit here also prevents large wallets from spawning one task per record.
+/// Bounds in-flight reads so large wallets do not spawn one task per record.
+/// VSS can pipeline reads, but this is not a count of connections to one server.
 const MAX_CONCURRENT_READS: usize = 10;
 
 /// Object-safe view of a `KVStore` backend. Async methods return boxed futures so the trait
@@ -158,8 +158,8 @@ impl PaginatedKVStore for LdkNodeStore {
 ///
 /// Storage formats expose record collections as a list followed by individual
 /// reads. For a remote store, performing those reads serially adds one network
-/// round trip per record. This helper bounds that fan-out to the VSS connection
-/// pool size and retains the same fail-fast I/O behavior as a serial loop.
+/// round trip per record. This helper bounds the number of in-flight reads and
+/// retains the same fail-fast I/O behavior as a serial loop.
 pub(crate) async fn read_keys_bounded(
 	store: Arc<dyn DynStore>, primary_namespace: &str, secondary_namespace: &str, keys: Vec<String>,
 ) -> Result<Vec<(String, Vec<u8>)>, io::Error> {
