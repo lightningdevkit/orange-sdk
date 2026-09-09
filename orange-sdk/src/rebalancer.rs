@@ -13,8 +13,8 @@ use ldk_node::lightning::{log_error, log_info, log_trace, log_warn};
 use ldk_node::payment::{ConfirmationStatus, PaymentDirection, PaymentKind, PaymentStatus};
 use std::cmp;
 use std::pin::Pin;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
 pub(crate) struct OrangeTrigger {
@@ -30,6 +30,9 @@ pub(crate) struct OrangeTrigger {
 	event_queue: Arc<EventQueue>,
 	/// Time of the last on-chain sync, used to determine when to trigger rebalances.
 	onchain_sync_time: AtomicU64,
+	/// Total and spendable balances at the last scan. Unchanged balances defer history
+	/// reads only until the periodic fallback, since they can hide offsetting transactions.
+	scanned_onchain_balances: Mutex<Option<(u64, u64)>>,
 	/// Logger for logging events and errors.
 	logger: Arc<Logger>,
 }
@@ -50,9 +53,22 @@ impl OrangeTrigger {
 			tx_metadata,
 			event_queue,
 			onchain_sync_time: AtomicU64::new(start),
+			scanned_onchain_balances: Mutex::new(None),
 			logger,
 		}
 	}
+}
+
+/// Balances can stay unchanged when transactions offset one another. Bound how long
+/// the balance shortcut can defer discovering those receipts.
+const MAX_IDLE_ONCHAIN_SCAN_SECS: u64 = 60;
+
+fn onchain_scan_due(
+	last_balances: Option<(u64, u64)>, balances: (u64, u64), last_scan: u64, sync: u64,
+) -> bool {
+	last_balances != Some(balances)
+		|| sync < last_scan
+		|| sync.saturating_sub(last_scan) >= MAX_IDLE_ONCHAIN_SCAN_SECS
 }
 
 impl RebalanceTrigger for OrangeTrigger {
@@ -152,6 +168,19 @@ impl RebalanceTrigger for OrangeTrigger {
 			if let Some(new_onchain_sync_time) = new_onchain_sync_time
 				&& onchain_sync_time != new_onchain_sync_time
 			{
+				let balances = self.ln_wallet.inner.ldk_node.list_balances();
+				let onchain_balances =
+					(balances.total_onchain_balance_sats, balances.spendable_onchain_balance_sats);
+				// Keep the scan cursor unchanged when deferring a scan, so the fallback
+				// still includes receipts from every skipped sync.
+				if !onchain_scan_due(
+					*self.scanned_onchain_balances.lock().unwrap(),
+					onchain_balances,
+					onchain_sync_time,
+					new_onchain_sync_time,
+				) {
+					return None;
+				}
 				// find all new confirmed inbound onchain payments since last sync
 				let payments = match self.ln_wallet.list_payments() {
 					Ok(payments) => payments,
@@ -173,8 +202,6 @@ impl RebalanceTrigger for OrangeTrigger {
 						)
 				});
 
-				self.onchain_sync_time.swap(new_onchain_sync_time, Ordering::Relaxed);
-
 				// now create events for these payments
 				for payment in new_recvs {
 					let payment_id = PaymentId::SelfCustodial(payment.id.0);
@@ -195,12 +222,15 @@ impl RebalanceTrigger for OrangeTrigger {
 							self.logger,
 							"Failed to add OnchainPaymentReceived event: {e:?}"
 						);
+						return None;
 					}
 				}
 
+				self.onchain_sync_time.store(new_onchain_sync_time, Ordering::Relaxed);
+				*self.scanned_onchain_balances.lock().unwrap() = Some(onchain_balances);
+
 				// check if we have funds that aren't anchor reserve && greater than rebalance_min
-				let spendable =
-					self.ln_wallet.inner.ldk_node.list_balances().spendable_onchain_balance_sats;
+				let spendable = balances.spendable_onchain_balance_sats;
 
 				if spendable > self.tunables.rebalance_min.sats_rounding_up() {
 					// find the new onchain receives since last sync
@@ -387,5 +417,26 @@ impl graduated_rebalancer::EventHandler for OrangeRebalanceEventHandler {
 				},
 			}
 		})
+	}
+}
+
+#[cfg(test)]
+mod onchain_scan_tests {
+	use super::*;
+
+	#[test]
+	fn unchanged_balances_only_defer_onchain_scans_for_a_bounded_time() {
+		let balances = (50_000, 40_000);
+		let last_scan = 100;
+		assert!(onchain_scan_due(None, balances, last_scan, 101));
+		assert!(onchain_scan_due(Some(balances), (51_000, 41_000), last_scan, 101));
+		// Offset receives/spends can leave both balances unchanged. Their update
+		// timestamps must remain within the fallback scan's window.
+		for sync in 101..160 {
+			assert!(!onchain_scan_due(Some(balances), balances, last_scan, sync));
+		}
+		assert!(onchain_scan_due(Some(balances), balances, last_scan, 160));
+		assert!(!onchain_scan_due(Some(balances), balances, 160, 161));
+		assert!(onchain_scan_due(Some(balances), balances, 160, 99));
 	}
 }
