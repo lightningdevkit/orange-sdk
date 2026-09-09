@@ -48,6 +48,8 @@ pub(crate) mod logging;
 mod rebalancer;
 mod runtime;
 mod store;
+#[cfg(test)]
+mod test_store;
 pub mod trusted_wallet;
 
 use lightning_wallet::LightningWallet;
@@ -640,10 +642,18 @@ impl Wallet {
 			},
 		};
 
-		let tx_metadata = TxMetadataStore::new(Arc::clone(&store)).await;
-
-		let event_queue =
-			Arc::new(EventQueue::new(Arc::clone(&store), tx_metadata.clone(), Arc::clone(&logger)));
+		// Independent startup reads; a remote store can serve them in one round trip.
+		let (tx_metadata, restored_events) = tokio::join!(
+			TxMetadataStore::new(Arc::clone(&store)),
+			EventQueue::load_events(store.as_ref()),
+		);
+		let event_queue = Arc::new(EventQueue::new(
+			Arc::clone(&store),
+			restored_events?,
+			tx_metadata.clone(),
+			Arc::clone(&logger),
+			Arc::clone(&runtime),
+		));
 
 		// Cashu must init before LDK Node because CashuKvDatabase does
 		// synchronous SQLite reads that deadlock with LDK Node's background
@@ -1651,7 +1661,7 @@ impl Wallet {
 	/// **Caution:** Users must handle events as quickly as possible to prevent a large event backlog,
 	/// which can increase the memory footprint of [`Wallet`].
 	pub fn next_event(&self) -> Option<Event> {
-		self.inner.runtime.block_on(self.inner.event_queue.next_event())
+		self.inner.event_queue.next_event()
 	}
 
 	/// Returns the next event in the event queue.
@@ -1685,21 +1695,27 @@ impl Wallet {
 	///
 	/// **Note:** This **MUST** be called after each event has been handled.
 	pub fn event_handled(&self) -> Result<(), ()> {
-		let res =
-			self.inner.runtime.block_on(self.inner.event_queue.event_handled()).map_err(|e| {
-				log_error!(
-					self.inner.logger,
-					"Couldn't mark event handled due to persistence failure: {e}"
-				);
-			});
-		if res.is_ok() {
-			// If an event was handled, probably our balances changed and we may need to rebalance.
-			let inner_ref = Arc::clone(&self.inner);
-			self.inner.runtime.spawn_cancellable_background_task(async move {
-				inner_ref.rebalancer.do_rebalance_if_needed().await;
-			});
-		}
-		res
+		self.inner.runtime.block_on(self.event_handled_async())
+	}
+
+	/// Confirms the last retrieved event handled without blocking the calling thread.
+	///
+	/// Await this before retrieving and acknowledging the next event. If persistence fails,
+	/// the same event remains queued and acknowledgement can be retried. Once a write
+	/// starts, it continues if the caller cancels the wait. Call [`Wallet::stop`] to wait
+	/// for pending writes, up to the runtime shutdown timeout.
+	pub async fn event_handled_async(&self) -> Result<(), ()> {
+		self.inner.event_queue.event_handled().await.map_err(|e| {
+			log_error!(
+				self.inner.logger,
+				"Couldn't mark event handled due to persistence failure: {e}"
+			);
+		})?;
+		let inner_ref = Arc::clone(&self.inner);
+		self.inner.runtime.spawn_cancellable_background_task(async move {
+			inner_ref.rebalancer.do_rebalance_if_needed().await;
+		});
+		Ok(())
 	}
 
 	/// Gets the lightning address for this wallet, if one is set.
