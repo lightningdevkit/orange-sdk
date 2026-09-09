@@ -19,6 +19,18 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 
+/// A registered rebalance result. Resolves after both payments succeed, or `None` on failure.
+pub type RebalanceWait = Pin<Box<dyn Future<Output = Option<RebalanceReceipt>> + Send + 'static>>;
+
+/// The payment receipts for a completed trusted-to-Lightning rebalance.
+#[derive(Debug)]
+pub struct RebalanceReceipt {
+	/// The incoming Lightning payment.
+	pub lightning: ReceivedLightningPayment,
+	/// The outgoing trusted payment.
+	pub trusted: ReceivedLightningPayment,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 /// Parameters for doing a rebalance
 pub struct TriggerParams {
@@ -82,11 +94,6 @@ pub trait TrustedWallet: Send + Sync {
 	fn estimate_fee(
 		&self, method: PaymentMethod, amount: Amount,
 	) -> Pin<Box<dyn Future<Output = Result<Amount, Self::Error>> + Send + '_>>;
-
-	/// Wait for a payment success notification
-	fn await_payment_success(
-		&self, payment_hash: [u8; 32],
-	) -> Pin<Box<dyn Future<Output = Option<ReceivedLightningPayment>> + Send + '_>>;
 }
 
 /// Trait representing a lightning wallet backend
@@ -107,11 +114,10 @@ pub trait LightningWallet: Send + Sync {
 		&self, method: PaymentMethod, amount: Amount,
 	) -> Pin<Box<dyn Future<Output = Result<[u8; 32], Self::Error>> + Send + '_>>;
 
-	/// Register a payment receipt wait immediately, before initiating the payment.
-	/// The returned future must retain a receipt that arrives before it is polled.
-	fn register_payment_receipt(
-		&self, payment_hash: [u8; 32],
-	) -> Pin<Box<dyn Future<Output = Option<ReceivedLightningPayment>> + Send + '_>>;
+	/// Watch both payments before the rebalance starts.
+	/// Retain results that arrive before the future is polled. Resolve only after both
+	/// payments succeed, or return `None` if either fails or tracking stops.
+	fn watch_rebalance(&self, payment_hash: [u8; 32]) -> RebalanceWait;
 
 	/// Check if we already have a channel with the LSP
 	fn has_channel_with_lsp(&self) -> bool;
@@ -317,7 +323,7 @@ where
 				"Attempting to pay invoice {inv} to rebalance for {transfer_amt:?}",
 			);
 			let expected_hash = inv.payment_hash();
-			let receipt_wait = self.ln_wallet.register_payment_receipt(expected_hash.0);
+			let result = self.ln_wallet.watch_rebalance(expected_hash.0);
 			match self.trusted.pay(PaymentMethod::LightningBolt11(inv), transfer_amt).await {
 				Ok(rebalance_id) => {
 					log_debug!(
@@ -335,38 +341,26 @@ where
 						})
 						.await;
 
-					let ln_payment = match receipt_wait.await {
-						Some(receipt) => receipt,
-						None => {
-							log_error!(self.logger, "Failed to receive rebalance payment!");
-							return;
-						},
+					let Some(receipt) = result.await else {
+						log_error!(self.logger, "Failed to complete rebalance payment!");
+						return;
 					};
-
-					let trusted_payment =
-						match self.trusted.await_payment_success(expected_hash.0).await {
-							Some(success) => success,
-							None => {
-								log_error!(self.logger, "Failed to send rebalance payment!");
-								return;
-							},
-						};
 
 					log_info!(
 						self.logger,
 						"Rebalance succeeded. Sent trusted tx {} to lightning tx {}",
 						rebalance_id.as_hex(),
-						ln_payment.id.as_hex(),
+						receipt.lightning.id.as_hex(),
 					);
 
 					self.event_handler
 						.handle_event(RebalancerEvent::RebalanceSuccessful {
 							trigger_id: params.id,
 							trusted_rebalance_payment_id: rebalance_id,
-							ln_rebalance_payment_id: ln_payment.id,
+							ln_rebalance_payment_id: receipt.lightning.id,
 							amount_msat: transfer_amt.milli_sats(),
-							fee_msat: ln_payment.fee_paid_msat.unwrap_or_default()
-								+ trusted_payment.fee_paid_msat.unwrap_or_default(),
+							fee_msat: receipt.lightning.fee_paid_msat.unwrap_or_default()
+								+ receipt.trusted.fee_paid_msat.unwrap_or_default(),
 						})
 						.await;
 				},
@@ -430,5 +424,237 @@ where
 	pub async fn stop(&self) {
 		log_debug!(self.logger, "Waiting for balance mutex...");
 		let _ = self.balance_mutex.lock().await;
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+	use lightning::bitcoin::secp256k1::{Secp256k1, SecretKey};
+	use lightning::util::logger::Record;
+	use lightning_invoice::{Currency, InvoiceBuilder, PaymentHash, PaymentSecret};
+	use std::future::ready;
+	use std::sync::atomic::{AtomicBool, Ordering};
+	use std::time::Duration;
+	use tokio::sync::{mpsc, watch};
+
+	const HASH: [u8; 32] = [3; 32];
+	const TRUSTED_ID: [u8; 32] = [1; 32];
+	const LN_ID: [u8; 32] = [2; 32];
+	const TRIGGER_ID: [u8; 32] = [9; 32];
+
+	struct NoopLogger;
+	impl Logger for NoopLogger {
+		fn log(&self, _record: Record) {}
+	}
+
+	fn invoice(amount: Amount) -> Bolt11Invoice {
+		let key = SecretKey::from_slice(&[0xcd; 32]).unwrap();
+		InvoiceBuilder::new(Currency::Regtest)
+			.description("rebalance".into())
+			.payment_hash(PaymentHash(HASH))
+			.payment_secret(PaymentSecret([0; 32]))
+			.duration_since_epoch(Duration::from_secs(1_700_000_000))
+			.min_final_cltv_expiry_delta(144)
+			.amount_milli_satoshis(amount.milli_sats())
+			.build_signed(|hash| Secp256k1::new().sign_ecdsa_recoverable(hash, &key))
+			.unwrap()
+	}
+
+	/// Trusted leg whose outcome the test decides after `pay` returned.
+	struct Trusted {
+		outcome: watch::Sender<Option<bool>>,
+		outcome_on_pay: Option<bool>,
+	}
+
+	impl TrustedWallet for Trusted {
+		type Error = String;
+		fn get_balance(
+			&self,
+		) -> Pin<Box<dyn Future<Output = Result<Amount, Self::Error>> + Send + '_>> {
+			Box::pin(ready(Ok(Amount::from_sats(1_000_000).unwrap())))
+		}
+		fn get_bolt11_invoice(
+			&self, _amount: Option<Amount>,
+		) -> Pin<Box<dyn Future<Output = Result<Bolt11Invoice, Self::Error>> + Send + '_>> {
+			Box::pin(ready(Err("unused".into())))
+		}
+		fn pay(
+			&self, _method: PaymentMethod, _amount: Amount,
+		) -> Pin<Box<dyn Future<Output = Result<[u8; 32], Self::Error>> + Send + '_>> {
+			assert!(self.outcome.receiver_count() > 0, "register the result before sending");
+			if let Some(outcome) = self.outcome_on_pay {
+				self.outcome.send_replace(Some(outcome));
+			}
+			Box::pin(ready(Ok(TRUSTED_ID)))
+		}
+		fn estimate_fee(
+			&self, _method: PaymentMethod, _amount: Amount,
+		) -> Pin<Box<dyn Future<Output = Result<Amount, Self::Error>> + Send + '_>> {
+			Box::pin(ready(Ok(Amount::from_sats(1).unwrap())))
+		}
+	}
+
+	struct Lightning {
+		outcome: watch::Sender<Option<bool>>,
+	}
+
+	impl LightningWallet for Lightning {
+		type Error = String;
+		fn get_balance(&self) -> LightningBalance {
+			LightningBalance { lightning: Amount::ZERO, onchain: Amount::ZERO }
+		}
+		fn get_bolt11_invoice(
+			&self, amount: Option<Amount>,
+		) -> Pin<Box<dyn Future<Output = Result<Bolt11Invoice, Self::Error>> + Send + '_>> {
+			Box::pin(ready(Ok(invoice(amount.unwrap()))))
+		}
+		fn pay(
+			&self, _method: PaymentMethod, _amount: Amount,
+		) -> Pin<Box<dyn Future<Output = Result<[u8; 32], Self::Error>> + Send + '_>> {
+			Box::pin(ready(Err("unused".into())))
+		}
+		fn watch_rebalance(&self, payment_hash: [u8; 32]) -> RebalanceWait {
+			assert_eq!(payment_hash, HASH);
+			let mut outcome = self.outcome.subscribe();
+			Box::pin(async move {
+				let succeeded = *outcome.wait_for(|o| o.is_some()).await.unwrap();
+				succeeded.unwrap().then_some(RebalanceReceipt {
+					lightning: ReceivedLightningPayment { id: LN_ID, fee_paid_msat: Some(2) },
+					trusted: ReceivedLightningPayment { id: TRUSTED_ID, fee_paid_msat: Some(1) },
+				})
+			})
+		}
+		fn has_channel_with_lsp(&self) -> bool {
+			false
+		}
+		fn open_channel_with_lsp(
+			&self,
+		) -> Pin<Box<dyn Future<Output = Result<u128, Self::Error>> + Send + '_>> {
+			Box::pin(ready(Err("unused".into())))
+		}
+		fn await_channel_pending(
+			&self, _channel_id: u128,
+		) -> Pin<Box<dyn Future<Output = OutPoint> + Send + '_>> {
+			Box::pin(std::future::pending())
+		}
+		fn splice_to_lsp_channel(
+			&self,
+		) -> Pin<Box<dyn Future<Output = Result<u128, Self::Error>> + Send + '_>> {
+			Box::pin(ready(Err("unused".into())))
+		}
+		fn await_splice_pending(
+			&self, _channel_id: u128,
+		) -> Pin<Box<dyn Future<Output = OutPoint> + Send + '_>> {
+			Box::pin(std::future::pending())
+		}
+	}
+
+	struct OneTrustedRebalance {
+		triggered: AtomicBool,
+	}
+
+	impl RebalanceTrigger for OneTrustedRebalance {
+		fn needs_trusted_rebalance(&self) -> impl Future<Output = Option<TriggerParams>> + Send {
+			let first = !self.triggered.swap(true, Ordering::SeqCst);
+			ready(first.then_some(TriggerParams {
+				id: TRIGGER_ID,
+				amount: Amount::from_sats(10_000).unwrap(),
+			}))
+		}
+		fn needs_onchain_rebalance(&self) -> impl Future<Output = Option<TriggerParams>> + Send {
+			ready(None)
+		}
+	}
+
+	struct Events(mpsc::UnboundedSender<RebalancerEvent>);
+
+	impl EventHandler for Events {
+		fn handle_event(
+			&self, event: RebalancerEvent,
+		) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
+			self.0.send(event).unwrap();
+			Box::pin(ready(()))
+		}
+	}
+
+	type TestRebalancer =
+		GraduatedRebalancer<Trusted, Lightning, OneTrustedRebalance, Events, NoopLogger>;
+
+	fn rebalancer(
+		trusted_outcome: watch::Sender<Option<bool>>, outcome_on_pay: Option<bool>,
+	) -> (Arc<TestRebalancer>, mpsc::UnboundedReceiver<RebalancerEvent>) {
+		let (events, received) = mpsc::unbounded_channel();
+		let rebalancer = GraduatedRebalancer::new(
+			Arc::new(Trusted { outcome: trusted_outcome.clone(), outcome_on_pay }),
+			Arc::new(Lightning { outcome: trusted_outcome }),
+			Arc::new(OneTrustedRebalance { triggered: AtomicBool::new(false) }),
+			Arc::new(Events(events)),
+			Arc::new(NoopLogger),
+		);
+		(Arc::new(rebalancer), received)
+	}
+
+	async fn next_event(events: &mut mpsc::UnboundedReceiver<RebalancerEvent>) -> RebalancerEvent {
+		tokio::time::timeout(Duration::from_secs(2), events.recv()).await.unwrap().unwrap()
+	}
+
+	#[tokio::test]
+	async fn combined_result_is_registered_before_pay_and_reports_success() {
+		for immediate in [false, true] {
+			let (outcome, _) = watch::channel(None);
+			let (rebalancer, mut events) = rebalancer(outcome.clone(), immediate.then_some(true));
+			let rb = Arc::clone(&rebalancer);
+			let task = tokio::spawn(async move { rb.do_trusted_rebalance_if_needed().await });
+			assert!(matches!(
+				next_event(&mut events).await,
+				RebalancerEvent::RebalanceInitiated { .. }
+			));
+			if !immediate {
+				assert!(rebalancer.balance_mutex.try_lock().is_err());
+				assert!(!task.is_finished());
+				outcome.send_replace(Some(true));
+			}
+			tokio::time::timeout(Duration::from_secs(2), task).await.unwrap().unwrap();
+			assert!(rebalancer.balance_mutex.try_lock().is_ok());
+			match next_event(&mut events).await {
+				RebalancerEvent::RebalanceSuccessful {
+					trigger_id,
+					trusted_rebalance_payment_id,
+					ln_rebalance_payment_id,
+					fee_msat,
+					..
+				} => {
+					assert_eq!(trigger_id, TRIGGER_ID);
+					assert_eq!(trusted_rebalance_payment_id, TRUSTED_ID);
+					assert_eq!(ln_rebalance_payment_id, LN_ID);
+					assert_eq!(fee_msat, 3);
+				},
+				other => panic!("unexpected event {other:?}"),
+			}
+			assert!(events.try_recv().is_err());
+			assert_eq!(outcome.receiver_count(), 0);
+		}
+	}
+
+	#[tokio::test]
+	async fn combined_failure_releases_the_rebalance_lock() {
+		for immediate in [false, true] {
+			let (outcome, _) = watch::channel(None);
+			let (rebalancer, mut events) = rebalancer(outcome.clone(), immediate.then_some(false));
+			let rb = Arc::clone(&rebalancer);
+			let task = tokio::spawn(async move { rb.do_trusted_rebalance_if_needed().await });
+			assert!(matches!(
+				next_event(&mut events).await,
+				RebalancerEvent::RebalanceInitiated { .. }
+			));
+			if !immediate {
+				outcome.send_replace(Some(false));
+			}
+			tokio::time::timeout(Duration::from_secs(2), task).await.unwrap().unwrap();
+			assert!(rebalancer.balance_mutex.try_lock().is_ok());
+			assert!(events.try_recv().is_err());
+			assert_eq!(outcome.receiver_count(), 0);
+		}
 	}
 }
