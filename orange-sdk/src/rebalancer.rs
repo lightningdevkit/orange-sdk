@@ -13,8 +13,8 @@ use ldk_node::lightning::{log_error, log_info, log_trace, log_warn};
 use ldk_node::payment::{ConfirmationStatus, PaymentDirection, PaymentKind, PaymentStatus};
 use std::cmp;
 use std::pin::Pin;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
 pub(crate) struct OrangeTrigger {
@@ -30,6 +30,10 @@ pub(crate) struct OrangeTrigger {
 	event_queue: Arc<EventQueue>,
 	/// Time of the last on-chain sync, used to determine when to trigger rebalances.
 	onchain_sync_time: AtomicU64,
+	/// Total and spendable on-chain balances at the last payment history scan. An inbound
+	/// transaction moves the total when it arrives and the spendable amount when it confirms,
+	/// so a sync that changed neither has no new on-chain payments to scan for.
+	scanned_onchain_balances: Mutex<Option<(u64, u64)>>,
 	/// Logger for logging events and errors.
 	logger: Arc<Logger>,
 }
@@ -50,6 +54,7 @@ impl OrangeTrigger {
 			tx_metadata,
 			event_queue,
 			onchain_sync_time: AtomicU64::new(start),
+			scanned_onchain_balances: Mutex::new(None),
 			logger,
 		}
 	}
@@ -152,6 +157,13 @@ impl RebalanceTrigger for OrangeTrigger {
 			if let Some(new_onchain_sync_time) = new_onchain_sync_time
 				&& onchain_sync_time != new_onchain_sync_time
 			{
+				let balances = self.ln_wallet.inner.ldk_node.list_balances();
+				let onchain_balances =
+					(balances.total_onchain_balance_sats, balances.spendable_onchain_balance_sats);
+				// Reading payment history can hit a remote store, so skip it on idle syncs.
+				if *self.scanned_onchain_balances.lock().unwrap() == Some(onchain_balances) {
+					return None;
+				}
 				// find all new confirmed inbound onchain payments since last sync
 				let payments = match self.ln_wallet.list_payments() {
 					Ok(payments) => payments,
@@ -173,8 +185,6 @@ impl RebalanceTrigger for OrangeTrigger {
 						)
 				});
 
-				self.onchain_sync_time.swap(new_onchain_sync_time, Ordering::Relaxed);
-
 				// now create events for these payments
 				for payment in new_recvs {
 					let payment_id = PaymentId::SelfCustodial(payment.id.0);
@@ -195,12 +205,15 @@ impl RebalanceTrigger for OrangeTrigger {
 							self.logger,
 							"Failed to add OnchainPaymentReceived event: {e:?}"
 						);
+						return None;
 					}
 				}
 
+				self.onchain_sync_time.store(new_onchain_sync_time, Ordering::Relaxed);
+				*self.scanned_onchain_balances.lock().unwrap() = Some(onchain_balances);
+
 				// check if we have funds that aren't anchor reserve && greater than rebalance_min
-				let spendable =
-					self.ln_wallet.inner.ldk_node.list_balances().spendable_onchain_balance_sats;
+				let spendable = balances.spendable_onchain_balance_sats;
 
 				if spendable > self.tunables.rebalance_min.sats_rounding_up() {
 					// find the new onchain receives since last sync
