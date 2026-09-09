@@ -242,6 +242,9 @@ pub(crate) enum TxType {
 		trusted_payment: [u8; 32],
 		lightning_payment: [u8; 32],
 		payment_triggering_transfer: PaymentId,
+		/// Only present on the trusted record while its links and completion event
+		/// still need to be committed. This record is the recovery journal.
+		completion: Option<RebalanceCompletion>,
 	},
 	OnchainToLightning {
 		/// The transaction ID of the tx that opens the channel.
@@ -255,7 +258,16 @@ pub(crate) enum TxType {
 	Payment {
 		ty: PaymentType,
 	},
-	PendingRebalance {},
+	/// A rebalance leg that is not yet matched to its counterpart, or a funding transaction
+	/// placeholder. Hidden from the transaction list.
+	PendingRebalance {
+		/// Hash of the rebalance invoice. Absent for legacy records and funding placeholders.
+		payment_hash: Option<[u8; 32]>,
+		/// The trusted payment that triggered the rebalance.
+		trigger: Option<[u8; 32]>,
+		/// The amount being rebalanced in millisatoshis.
+		amount_msat: Option<u64>,
+	},
 	/// A single leg of a multi-path payment that is split across the trusted and lightning
 	/// wallets. Both legs carry the same `surface_id`; the entry stored under that id additionally
 	/// accumulates each leg's terminal result so the two can be coalesced into a single event. The
@@ -401,7 +413,7 @@ impl TxType {
 	pub(crate) fn is_rebalance(&self) -> bool {
 		matches!(
 			self,
-			TxType::PendingRebalance {}
+			TxType::PendingRebalance { .. }
 				| TxType::TrustedToLightning { .. }
 				| TxType::OnchainToLightning { .. }
 		)
@@ -413,6 +425,7 @@ impl_writeable_tlv_based_enum!(TxType,
 		(0, trusted_payment, required),
 		(2, lightning_payment, required),
 		(4, payment_triggering_transfer, required),
+		(5, completion, option),
 	},
 	(1, OnchainToLightning) => {
 		(0, channel_txid, required),
@@ -420,7 +433,11 @@ impl_writeable_tlv_based_enum!(TxType,
 	},
 	(2, PaymentTriggeringTransferLightning) => { (0, ty, required), },
 	(3, Payment) => { (0, ty, required), },
-	(4, PendingRebalance) => {},
+	(4, PendingRebalance) => {
+		(1, payment_hash, option),
+		(3, trigger, option),
+		(5, amount_msat, option),
+	},
 	(5, MppPayment) => {
 		(0, surface_id, required),
 		(2, total_amount_msat, required),
@@ -435,6 +452,17 @@ impl_writeable_tlv_based_enum!(TxType,
 	},
 );
 
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub(crate) struct RebalanceCompletion {
+	pub amount_msat: u64,
+	pub fee_msat: u64,
+}
+
+impl_writeable_tlv_based!(RebalanceCompletion, {
+	(0, amount_msat, required),
+	(2, fee_msat, required),
+});
+
 #[derive(Debug, Copy, Clone)]
 pub(crate) struct TxMetadata {
 	// TODO: We should remove `time` once we get the info we need from the trusted end
@@ -443,6 +471,44 @@ pub(crate) struct TxMetadata {
 }
 
 impl_writeable_tlv_based!(TxMetadata, { (0, ty, required), (2, time, required) });
+
+fn rebalance_links(
+	metadata: &HashMap<PaymentId, TxMetadata>, journal: TxMetadata,
+) -> Result<[(PaymentId, TxMetadata); 3], io::Error> {
+	let TxType::TrustedToLightning {
+		trusted_payment,
+		lightning_payment,
+		payment_triggering_transfer,
+		completion: _,
+	} = journal.ty
+	else {
+		return Err(io::Error::new(io::ErrorKind::InvalidData, "Not a trusted rebalance"));
+	};
+	let mut trigger = metadata
+		.get(&payment_triggering_transfer)
+		.copied()
+		.ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "Missing rebalance trigger"))?;
+	let ty = match trigger.ty {
+		TxType::Payment { ty } | TxType::PaymentTriggeringTransferLightning { ty } => ty,
+		_ => return Err(io::Error::new(io::ErrorKind::InvalidData, "Invalid rebalance trigger")),
+	};
+	trigger.ty = TxType::PaymentTriggeringTransferLightning { ty };
+	let mut lightning = journal;
+	if let TxType::TrustedToLightning {
+		trusted_payment: _,
+		lightning_payment: _,
+		payment_triggering_transfer: _,
+		ref mut completion,
+	} = lightning.ty
+	{
+		*completion = None;
+	}
+	Ok([
+		(PaymentId::Trusted(trusted_payment), journal),
+		(payment_triggering_transfer, trigger),
+		(PaymentId::SelfCustodial(lightning_payment), lightning),
+	])
+}
 
 #[derive(Clone)]
 pub(crate) struct TxMetadataStore {
@@ -461,7 +527,7 @@ impl TxMetadataStore {
 		let keys = KVStore::list(store.as_ref(), STORE_PRIMARY_KEY, STORE_SECONDARY_KEY)
 			.await
 			.expect("We do not allow reads to fail");
-		let mut tx_metadata = HashMap::with_capacity(keys.len());
+		let mut tx_metadata: HashMap<PaymentId, TxMetadata> = HashMap::with_capacity(keys.len());
 		let records =
 			read_keys_bounded(Arc::clone(&store), STORE_PRIMARY_KEY, STORE_SECONDARY_KEY, keys)
 				.await
@@ -473,6 +539,28 @@ impl TxMetadataStore {
 				.expect("Invalid data in transaction metadata storage");
 			tx_metadata.insert(key, data);
 		}
+		// A completion journal is authoritative even if the process stopped before
+		// writing the other two links. Restore a coherent view before exposing history.
+		let journals: Vec<_> = tx_metadata
+			.values()
+			.copied()
+			.filter(|metadata| {
+				matches!(
+					metadata.ty,
+					TxType::TrustedToLightning {
+						trusted_payment: _,
+						lightning_payment: _,
+						payment_triggering_transfer: _,
+						completion: Some(_)
+					}
+				)
+			})
+			.collect();
+		for journal in journals {
+			if let Ok(links) = rebalance_links(&tx_metadata, journal) {
+				tx_metadata.extend(links);
+			}
+		}
 		TxMetadataStore {
 			store,
 			tx_metadata: Arc::new(RwLock::new(tx_metadata)),
@@ -482,6 +570,52 @@ impl TxMetadataStore {
 
 	pub fn read(&self) -> RwLockReadGuard<'_, HashMap<PaymentId, TxMetadata>> {
 		self.tx_metadata.read().unwrap()
+	}
+
+	/// Persist the recovery record before either dependent link. Publish all three
+	/// links together so history readers never see a half-promoted transfer.
+	pub(crate) async fn stage_rebalance_completion(
+		&self, metadata: TxMetadata,
+	) -> Result<(), io::Error> {
+		let links = rebalance_links(&self.read(), metadata)?;
+		let (trusted_id, _) = links[0];
+		self.persist_metadata(trusted_id, metadata).await?;
+		self.tx_metadata.write().unwrap().extend(links);
+		for (id, link) in &links[1..] {
+			self.persist_metadata(*id, *link).await?;
+		}
+		Ok(())
+	}
+
+	/// Clear the journal only after the completion event is durably queued.
+	pub(crate) async fn finish_rebalance_completion(
+		&self, mut metadata: TxMetadata,
+	) -> Result<(), io::Error> {
+		let TxType::TrustedToLightning {
+			trusted_payment,
+			lightning_payment: _,
+			payment_triggering_transfer: _,
+			ref mut completion,
+		} = metadata.ty
+		else {
+			return Err(io::Error::new(io::ErrorKind::InvalidData, "Not a trusted rebalance"));
+		};
+		*completion = None;
+		let id = PaymentId::Trusted(trusted_payment);
+		self.persist_metadata(id, metadata).await?;
+		self.tx_metadata.write().unwrap().insert(id, metadata);
+		Ok(())
+	}
+
+	async fn persist_metadata(&self, id: PaymentId, metadata: TxMetadata) -> Result<(), io::Error> {
+		KVStore::write(
+			self.store.as_ref(),
+			STORE_PRIMARY_KEY,
+			STORE_SECONDARY_KEY,
+			&id.to_string(),
+			metadata.encode(),
+		)
+		.await
 	}
 
 	async fn do_set(&self, key: PaymentId, value: TxMetadata) -> bool {
@@ -504,30 +638,6 @@ impl TxMetadataStore {
 	pub async fn insert(&self, key: PaymentId, value: TxMetadata) {
 		let had_old = self.do_set(key, value).await;
 		debug_assert!(!had_old);
-	}
-
-	pub async fn set_tx_caused_rebalance(&self, payment_id: &PaymentId) -> Result<(), ()> {
-		let (key_str, ser) = {
-			let mut tx_metadata = self.tx_metadata.write().unwrap();
-			if let Some(metadata) = tx_metadata.get_mut(payment_id) {
-				if let TxType::Payment { ty } = &mut metadata.ty {
-					metadata.ty = TxType::PaymentTriggeringTransferLightning { ty: *ty };
-					let key_str = payment_id.to_string();
-					let ser = metadata.encode();
-					(key_str, ser)
-				} else {
-					eprintln!("payment_id {payment_id} is not a payment, cannot set rebalance");
-					return Err(());
-				}
-			} else {
-				eprintln!("doesn't exist in metadata store: {payment_id}");
-				return Err(());
-			}
-		};
-		KVStore::write(self.store.as_ref(), STORE_PRIMARY_KEY, STORE_SECONDARY_KEY, &key_str, ser)
-			.await
-			.expect("We do not allow writes to fail");
-		Ok(())
 	}
 
 	/// Atomically marks `trigger_id` as a rebalance trigger and writes `splice_metadata` for
@@ -824,6 +934,39 @@ mod tests {
 	use ldk_node::bitcoin::hex::DisplayHex;
 	use std::str::FromStr;
 
+	#[test]
+	fn old_trusted_rebalance_records_decode_without_a_journal() {
+		enum LegacyTxType {
+			TrustedToLightning {
+				trusted_payment: [u8; 32],
+				lightning_payment: [u8; 32],
+				payment_triggering_transfer: PaymentId,
+			},
+		}
+		impl_writeable_tlv_based_enum!(LegacyTxType,
+			(0, TrustedToLightning) => {
+				(0, trusted_payment, required),
+				(2, lightning_payment, required),
+				(4, payment_triggering_transfer, required),
+			},
+		);
+		let bytes = LegacyTxType::TrustedToLightning {
+			trusted_payment: [1; 32],
+			lightning_payment: [2; 32],
+			payment_triggering_transfer: PaymentId::Trusted([3; 32]),
+		}
+		.encode();
+		assert_eq!(
+			TxType::read(&mut &bytes[..]).unwrap(),
+			TxType::TrustedToLightning {
+				trusted_payment: [1; 32],
+				lightning_payment: [2; 32],
+				payment_triggering_transfer: PaymentId::Trusted([3; 32]),
+				completion: None,
+			}
+		);
+	}
+
 	const TRUSTED_LEG: [u8; 32] = [7u8; 32];
 	const LIGHTNING_LEG: [u8; 32] = [9u8; 32];
 
@@ -974,6 +1117,32 @@ mod tests {
 			)
 			.await;
 		assert_eq!(tx_metadata.record_mpp_leg(plain, Some((1, [0u8; 32]))).await, None);
+	}
+
+	#[test]
+	fn pending_rebalance_details_round_trip_and_legacy_records_decode() {
+		let time = Duration::from_secs(7);
+		let detailed = TxMetadata {
+			ty: TxType::PendingRebalance {
+				payment_hash: Some([1; 32]),
+				trigger: Some([2; 32]),
+				amount_msat: Some(3),
+			},
+			time,
+		};
+		let encoded = detailed.encode();
+		let decoded = TxMetadata::read(&mut &encoded[..]).unwrap();
+		assert_eq!((decoded.ty, decoded.time), (detailed.ty, time));
+
+		// Records written before the details existed carry no optional TLVs.
+		let legacy = TxMetadata {
+			ty: TxType::PendingRebalance { payment_hash: None, trigger: None, amount_msat: None },
+			time,
+		};
+		let encoded = legacy.encode();
+		let decoded = TxMetadata::read(&mut &encoded[..]).unwrap();
+		assert_eq!((decoded.ty, decoded.time), (legacy.ty, time));
+		assert!(legacy.ty.is_rebalance());
 	}
 
 	#[tokio::test]

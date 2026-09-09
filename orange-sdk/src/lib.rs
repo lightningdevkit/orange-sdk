@@ -749,7 +749,7 @@ impl Wallet {
 			wt,
 			Arc::clone(&ln_wallet),
 			trigger,
-			rebalance_events,
+			Arc::clone(&rebalance_events),
 			Arc::clone(&logger),
 		));
 
@@ -765,8 +765,16 @@ impl Wallet {
 		// `Event`s which indicated our balance has changed.
 		let rb = Arc::clone(&rebalancer);
 		let requests = Arc::clone(&rebalance_scheduler);
+		let startup_events = Arc::clone(&rebalance_events);
+		let startup_trusted = Arc::clone(&trusted);
+		let startup_ln_wallet = Arc::clone(&ln_wallet);
 		runtime.spawn_cancellable_background_task(async move {
-			// Wait a second to get caught up, then try to rebalance.
+			rebalancer::run_rebalance_recovery(|| {
+				startup_events.reconcile_pending_rebalances(&**startup_trusted, &startup_ln_wallet)
+			})
+			.await;
+		});
+		runtime.spawn_cancellable_background_task(async move {
 			tokio::time::sleep(Duration::from_secs(1)).await;
 			requests.request();
 
@@ -857,6 +865,7 @@ impl Wallet {
 						trusted_payment,
 						lightning_payment: _,
 						payment_triggering_transfer,
+						completion: _,
 					} => {
 						let entry = internal_transfers
 							.entry(*payment_triggering_transfer)
@@ -997,6 +1006,7 @@ impl Wallet {
 						trusted_payment: _,
 						lightning_payment,
 						payment_triggering_transfer,
+						completion: _,
 					} => {
 						let entry = internal_transfers
 							.entry(*payment_triggering_transfer)

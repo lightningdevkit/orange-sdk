@@ -50,3 +50,4 @@ pin-project-lite = { version = "0.2", default-features = false, optional = true 
 
 [dev-dependencies]
 test-log = "0.2.18"
+tokio = { version = "1.0", features = ["test-util"] }

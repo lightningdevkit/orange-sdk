@@ -43,6 +43,10 @@ impl TestStore {
 		rx
 	}
 
+	pub fn release_writes(&self) {
+		*self.gate.lock().unwrap() = None;
+	}
+
 	async fn mutate(&self, key: Key, value: Option<Vec<u8>>) -> Result<(), io::Error> {
 		self.writes.fetch_add(1, Ordering::SeqCst);
 		let gate = self.gate.lock().unwrap().clone();

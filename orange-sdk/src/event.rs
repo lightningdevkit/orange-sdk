@@ -380,8 +380,23 @@ impl EventQueue {
 			// Only events restored from storage can be a replay of an event whose source
 			// acknowledgement was lost in a crash. Later duplicates are new occurrences,
 			// such as a retried BOLT 11 payment that fails again under the same ID.
-			let mut restored = queue.events.iter().take(queue.restored);
-			if restored.any(|queued| same_event(queued, &event)) {
+			// A rebalance has only one successful outcome. Retrying journal cleanup
+			// must not append it again, including before this process has restarted.
+			let dedup_count = if matches!(
+				event,
+				Event::RebalanceSuccessful {
+					trigger_payment_id: _,
+					trusted_rebalance_payment_id: _,
+					ln_rebalance_payment_id: _,
+					amount_msat: _,
+					fee_msat: _
+				}
+			) {
+				queue.events.len()
+			} else {
+				queue.restored
+			};
+			if queue.events.iter().take(dedup_count).any(|queued| same_event(queued, &event)) {
 				return Ok(());
 			}
 			if queue.events.len() == u16::MAX as usize {
@@ -481,6 +496,22 @@ fn same_event(left: &Event, right: &Event) -> bool {
 		| (
 			Event::PaymentFailed { payment_id: a, .. },
 			Event::PaymentFailed { payment_id: b, .. },
+		) => a == b,
+		(
+			Event::RebalanceSuccessful {
+				trigger_payment_id: _,
+				trusted_rebalance_payment_id: a,
+				ln_rebalance_payment_id: _,
+				amount_msat: _,
+				fee_msat: _,
+			},
+			Event::RebalanceSuccessful {
+				trigger_payment_id: _,
+				trusted_rebalance_payment_id: b,
+				ln_rebalance_payment_id: _,
+				amount_msat: _,
+				fee_msat: _,
+			},
 		) => a == b,
 		_ => left == right,
 	}
@@ -991,7 +1022,11 @@ impl LdkEventHandler {
 			.upsert(
 				payment_id,
 				store::TxMetadata {
-					ty: store::TxType::PendingRebalance {},
+					ty: store::TxType::PendingRebalance {
+						payment_hash: None,
+						trigger: None,
+						amount_msat: None,
+					},
 					time: SystemTime::now()
 						.duration_since(SystemTime::UNIX_EPOCH)
 						.unwrap_or_default(),

@@ -166,6 +166,8 @@ pub enum RebalancerEvent {
 		trigger_id: [u8; 32],
 		/// Trusted wallet payment ID for the rebalance
 		trusted_rebalance_payment_id: [u8; 32],
+		/// Hash of the invoice the trusted wallet pays, which identifies the Lightning receipt
+		payment_hash: [u8; 32],
 		/// Amount being rebalanced in millisatoshis
 		amount_msat: u64,
 	},
@@ -328,6 +330,7 @@ where
 						.handle_event(RebalancerEvent::RebalanceInitiated {
 							trigger_id: params.id,
 							trusted_rebalance_payment_id: rebalance_id,
+							payment_hash: expected_hash.0,
 							amount_msat: transfer_amt.milli_sats(),
 						})
 						.await;
