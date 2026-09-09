@@ -462,11 +462,13 @@ impl Cashu {
 			},
 		};
 
-		let db = Arc::new(CashuKvDatabase::new(Arc::clone(&store)).await.map_err(|e| {
-			InitFailure::TrustedFailure(TrustedError::Other(format!(
-				"Failed to create Cashu database: {e}"
-			)))
-		})?);
+		let db = Arc::new(
+			CashuKvDatabase::new(Arc::clone(&store), Arc::clone(&runtime)).await.map_err(|e| {
+				InitFailure::TrustedFailure(TrustedError::Other(format!(
+					"Failed to create Cashu database: {e}"
+				)))
+			})?,
+		);
 
 		// Create the Cashu wallet
 		let cashu_wallet = Arc::new(
