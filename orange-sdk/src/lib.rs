@@ -7,7 +7,7 @@ use bitcoin_payment_instructions::{PaymentInstructions, http_resolver::HTTPHrnRe
 pub use bitcoin_payment_instructions::PaymentMethod;
 use bitcoin_payment_instructions::amount::Amount;
 
-use crate::rebalancer::{OrangeRebalanceEventHandler, OrangeTrigger};
+use crate::rebalancer::{OrangeRebalanceEventHandler, OrangeTrigger, RebalanceScheduler};
 use crate::store::{MppLegKind, MppMerge, TxMetadata, TxMetadataStore, TxType};
 #[cfg(feature = "cashu")]
 use crate::trusted_wallet::cashu::Cashu;
@@ -116,6 +116,8 @@ struct WalletImpl {
 	tunables: Tunables,
 	/// The rebalancer for managing the transfer of funds between the trusted and lightning wallets.
 	rebalancer: Arc<Rebalancer>,
+	/// Combines pending balance checks into one background worker.
+	rebalance_scheduler: Arc<RebalanceScheduler>,
 	/// The Bitcoin network the wallet operates on (e.g., Mainnet, Testnet).
 	network: Network,
 	/// Metadata store for tracking transactions.
@@ -751,14 +753,22 @@ impl Wallet {
 			Arc::clone(&logger),
 		));
 
+		let rebalance_scheduler = Arc::new(RebalanceScheduler::default());
+		let requests = Arc::clone(&rebalance_scheduler);
+		let rb = Arc::clone(&rebalancer);
+		runtime.spawn_cancellable_background_task(async move {
+			requests.run(|| rb.do_rebalance_if_needed()).await;
+		});
+
 		// Spawn a background thread to initiate a rebalance if needed.
 		// We only do this once as we generally rebalance in response to
 		// `Event`s which indicated our balance has changed.
 		let rb = Arc::clone(&rebalancer);
+		let requests = Arc::clone(&rebalance_scheduler);
 		runtime.spawn_cancellable_background_task(async move {
 			// Wait a second to get caught up, then try to rebalance.
 			tokio::time::sleep(Duration::from_secs(1)).await;
-			rb.do_rebalance_if_needed().await;
+			requests.request();
 
 			// create loop for onchain rebalancing.
 			// we only do onchain rebalancing here as trusted rebalancing is
@@ -777,6 +787,7 @@ impl Wallet {
 			network,
 			tunables,
 			rebalancer,
+			rebalance_scheduler,
 			tx_metadata,
 			store,
 			logger,
@@ -1353,10 +1364,7 @@ impl Wallet {
 										},
 									)
 									.await;
-								let inner_ref = Arc::clone(&self.inner);
-								self.inner.runtime.spawn_cancellable_background_task(async move {
-									inner_ref.rebalancer.do_rebalance_if_needed().await;
-								});
+								self.inner.rebalance_scheduler.request();
 								return Ok(PaymentId::SelfCustodial(id.0));
 							},
 							Err(e) => {
@@ -1618,10 +1626,7 @@ impl Wallet {
 			log_error!(self.inner.logger, "Failed to replay pending MPP events: {queue_err}");
 		}
 
-		let inner_ref = Arc::clone(&self.inner);
-		self.inner.runtime.spawn_cancellable_background_task(async move {
-			inner_ref.rebalancer.do_rebalance_if_needed().await;
-		});
+		self.inner.rebalance_scheduler.request();
 
 		Ok(surface_id)
 	}
@@ -1711,10 +1716,7 @@ impl Wallet {
 				"Couldn't mark event handled due to persistence failure: {e}"
 			);
 		})?;
-		let inner_ref = Arc::clone(&self.inner);
-		self.inner.runtime.spawn_cancellable_background_task(async move {
-			inner_ref.rebalancer.do_rebalance_if_needed().await;
-		});
+		self.inner.rebalance_scheduler.request();
 		Ok(())
 	}
 

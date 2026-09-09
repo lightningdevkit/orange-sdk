@@ -16,6 +16,31 @@ use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
+use tokio::sync::Notify;
+
+/// Combines pending requests while preserving a follow-up check for changes
+/// observed during a running rebalance.
+#[derive(Default)]
+pub(crate) struct RebalanceScheduler {
+	requested: Notify,
+}
+
+impl RebalanceScheduler {
+	pub fn request(&self) {
+		self.requested.notify_one();
+	}
+
+	pub async fn run<F, Fut>(&self, mut check: F)
+	where
+		F: FnMut() -> Fut,
+		Fut: Future<Output = ()>,
+	{
+		loop {
+			self.requested.notified().await;
+			check().await;
+		}
+	}
+}
 
 pub(crate) struct OrangeTrigger {
 	/// The main implementation of the wallet, containing both trusted and lightning wallet components.
@@ -400,5 +425,50 @@ impl graduated_rebalancer::EventHandler for OrangeRebalanceEventHandler {
 				},
 			}
 		})
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::RebalanceScheduler;
+	use std::sync::Arc;
+	use std::time::Duration;
+	use tokio::sync::{Semaphore, mpsc};
+
+	#[tokio::test]
+	async fn requests_are_combined_without_losing_changes_during_a_check() {
+		let scheduler = Arc::new(RebalanceScheduler::default());
+		for _ in 0..8 {
+			scheduler.request();
+		}
+		let (started, mut checks) = mpsc::unbounded_channel();
+		let release = Arc::new(Semaphore::new(0));
+		let worker_scheduler = Arc::clone(&scheduler);
+		let worker_release = Arc::clone(&release);
+		let worker = tokio::spawn(async move {
+			worker_scheduler
+				.run(|| {
+					let started = started.clone();
+					let release = Arc::clone(&worker_release);
+					async move {
+						started.send(()).unwrap();
+						release.acquire().await.unwrap().forget();
+					}
+				})
+				.await;
+		});
+		tokio::time::timeout(Duration::from_secs(1), checks.recv()).await.unwrap().unwrap();
+		for _ in 0..8 {
+			scheduler.request();
+		}
+		release.add_permits(1);
+		tokio::time::timeout(Duration::from_secs(1), checks.recv()).await.unwrap().unwrap();
+		release.add_permits(1);
+		assert!(tokio::time::timeout(Duration::from_millis(30), checks.recv()).await.is_err());
+		// A fresh request after the worker becomes idle must still wake it.
+		scheduler.request();
+		tokio::time::timeout(Duration::from_secs(1), checks.recv()).await.unwrap().unwrap();
+		worker.abort();
+		assert!(worker.await.unwrap_err().is_cancelled());
 	}
 }
