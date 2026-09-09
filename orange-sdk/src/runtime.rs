@@ -5,11 +5,13 @@
 // http://opensource.org/licenses/MIT>, at your option. You may not use this file except in
 // accordance with one or both of these licenses.
 
+use ldk_node::lightning::io;
 use ldk_node::lightning::util::logger::Logger as _;
 use ldk_node::lightning::{log_debug, log_error, log_trace, log_warn};
 use std::future::Future;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
+use tokio::sync::{OwnedMutexGuard, oneshot};
 use tokio::task::{JoinHandle, JoinSet};
 
 use crate::logging::Logger;
@@ -60,8 +62,34 @@ impl Runtime {
 		F: Future<Output = ()> + Send + 'static,
 	{
 		let mut background_tasks = self.background_tasks.lock().unwrap();
+		while let Some(result) = background_tasks.try_join_next() {
+			if let Err(e) = result {
+				log_error!(self.logger, "Background task failed: {e}");
+			}
+		}
 		let runtime_handle = self.handle();
 		background_tasks.spawn_on(future, runtime_handle);
+	}
+
+	/// Keeps a storage write, its cache update, and the writer lock together on
+	/// the wallet runtime. Caller cancellation does not cancel an accepted write.
+	pub(crate) async fn persist<F>(
+		&self, writer: OwnedMutexGuard<()>, write: F,
+	) -> Result<(), io::Error>
+	where
+		F: Future<Output = Result<(), io::Error>> + Send + 'static,
+	{
+		let (result, completion) = oneshot::channel();
+		self.spawn_background_task(async move {
+			let _writer = writer;
+			let _ = result.send(write.await);
+		});
+		completion.await.map_err(|e| {
+			io::Error::new(
+				io::ErrorKind::Other,
+				format!("Persistence task stopped before completion: {e}"),
+			)
+		})?
 	}
 
 	pub fn spawn_cancellable_background_task<F>(&self, future: F)

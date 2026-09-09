@@ -820,21 +820,9 @@ pub(crate) async fn read_splice_outs(store: &dyn DynStore) -> Vec<PaymentDetails
 #[cfg(test)]
 mod tests {
 	use super::*;
+	use crate::test_store::{open_sqlite_store, temp_sqlite_store};
 	use ldk_node::bitcoin::hex::DisplayHex;
-	use ldk_node::io::sqlite_store::SqliteStore;
-	use std::path::PathBuf;
 	use std::str::FromStr;
-	use std::time::{SystemTime, UNIX_EPOCH};
-
-	fn temp_sqlite_store() -> (PathBuf, Arc<dyn DynStore>) {
-		let path = std::env::temp_dir().join(format!(
-			"orange-sdk-mpp-finalize-test-{}",
-			SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()
-		));
-		let store = SqliteStore::new(path.clone(), Some("orange.sqlite".to_string()), None)
-			.expect("sqlite store");
-		(path, Arc::new(store))
-	}
 
 	const TRUSTED_LEG: [u8; 32] = [7u8; 32];
 	const LIGHTNING_LEG: [u8; 32] = [9u8; 32];
@@ -926,19 +914,10 @@ mod tests {
 	// crash/restart by dropping the `TxMetadataStore` and rebuilding it from the same on-disk store.
 	#[tokio::test]
 	async fn record_mpp_leg_persists_across_restart() {
-		let path = std::env::temp_dir().join(format!(
-			"orange-sdk-mpp-record-test-{}",
-			SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()
-		));
-		let open = |path: PathBuf| -> Arc<dyn DynStore> {
-			Arc::new(
-				SqliteStore::new(path, Some("orange.sqlite".to_string()), None)
-					.expect("sqlite store"),
-			)
-		};
+		let (path, store) = temp_sqlite_store();
 
 		{
-			let tx_metadata = TxMetadataStore::new(open(path.clone())).await;
+			let tx_metadata = TxMetadataStore::new(store).await;
 			insert_legs(&tx_metadata).await;
 			assert_eq!(
 				tx_metadata.record_mpp_leg(surface_id(), Some((1_000, [1u8; 32]))).await,
@@ -954,7 +933,7 @@ mod tests {
 
 		// Simulate a crash/restart: reload from the same on-disk store.
 		{
-			let tx_metadata = TxMetadataStore::new(open(path.clone())).await;
+			let tx_metadata = TxMetadataStore::new(open_sqlite_store(&path)).await;
 			// Both the recorded legs and the finalized flag survived, so a replayed event after the
 			// restart does not surface a duplicate combined event.
 			assert_eq!(

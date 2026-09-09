@@ -32,7 +32,7 @@ use std::collections::{HashMap, VecDeque};
 use std::fmt::Debug;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 use tokio::sync::{Notify, oneshot, watch};
 
 #[derive(Debug, Clone, Copy)]
@@ -238,7 +238,10 @@ impl LightningWallet {
 			loop {
 				let event = ev_handler.ldk_node.next_event_async().await;
 				log_debug!(ev_handler.logger, "Got ldk-node event {event:?}");
-				ev_handler.handle_ldk_node_event(event).await;
+				if !ev_handler.handle_ldk_node_event(event).await {
+					// LDK replays unacknowledged events immediately. Bound retries on store errors.
+					tokio::time::sleep(Duration::from_secs(1)).await;
+				}
 			}
 		});
 
@@ -665,12 +668,11 @@ impl PaymentReceiptInbox {
 #[cfg(test)]
 mod tests {
 	use super::*;
+	use crate::test_store::temp_sqlite_store;
 	use ldk_node::bitcoin::Txid;
 	use ldk_node::entropy::NodeEntropy;
-	use ldk_node::io::sqlite_store::SqliteStore;
 	use ldk_node::lightning::util::persist::KVStore;
 	use ldk_node::lightning::util::ser::Writeable;
-	use std::time::UNIX_EPOCH;
 
 	#[tokio::test]
 	async fn receipt_inbox_routes_actual_ids_before_waiting() {
@@ -701,11 +703,7 @@ mod tests {
 
 	#[tokio::test(flavor = "multi_thread")]
 	async fn payment_history_includes_every_sqlite_page() {
-		let path = std::env::temp_dir().join(format!(
-			"orange-payment-pages-{}",
-			SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos(),
-		));
-		let store = SqliteStore::new(path.clone(), None, None).unwrap();
+		let (path, store) = temp_sqlite_store();
 		// SQLite pages contain 50 entries; use two full pages and one short page.
 		for id in 0..101u8 {
 			let payment = PaymentDetails {
@@ -722,13 +720,15 @@ mod tests {
 				latest_update_timestamp: id as u64,
 			};
 			let key = format!("{id:02x}").repeat(32);
-			KVStore::write(&store, "payments", "", &key, payment.encode()).await.unwrap();
+			KVStore::write(store.as_ref(), "payments", "", &key, payment.encode()).await.unwrap();
 		}
 		let mut builder = ldk_node::Builder::new();
 		builder.set_network(Network::Regtest);
 		builder.set_storage_dir_path(path.to_str().unwrap().to_owned());
 		builder.set_gossip_source_p2p();
-		let node = builder.build_with_store(NodeEntropy::from_seed_bytes([42; 64]), store).unwrap();
+		let node = builder
+			.build_with_store(NodeEntropy::from_seed_bytes([42; 64]), LdkNodeStore(store))
+			.unwrap();
 		assert!(node.list_payments(None).unwrap().next_page_token.is_some());
 		let mut payments = list_node_payments(&node).unwrap();
 		payments.sort_by_key(|payment| payment.id.0);
