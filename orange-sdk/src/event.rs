@@ -1,6 +1,7 @@
 use crate::dyn_store::DynStore;
-use crate::lightning_wallet::{PaymentReceiptInbox, SplicePendingInbox};
+use crate::lightning_wallet::SplicePendingInbox;
 use crate::logging::Logger;
+use crate::rebalance_watcher::RebalanceWatchers;
 use crate::runtime::Runtime;
 use crate::store::{self, MppOutcome, PaymentId, RebalanceEnabledCache, TxMetadataStore, TxType};
 use graduated_rebalancer::ReceivedLightningPayment;
@@ -213,6 +214,7 @@ impl_writeable_tlv_based_enum!(Event,
 ///
 /// [`Wallet`]: [`crate::Wallet`]
 pub struct EventQueue {
+	pub(crate) rebalance_watchers: RebalanceWatchers,
 	queue: Arc<StdMutex<QueueState>>,
 	mutation_lock: Arc<Mutex<()>>,
 	pending_mpp_events: Arc<Mutex<HashMap<PaymentHash, Vec<Event>>>>,
@@ -265,6 +267,7 @@ impl EventQueue {
 		let rebalance_enabled = RebalanceEnabledCache::new(Arc::clone(&kv_store));
 		let queue = QueueState { restored: restored.len(), events: restored };
 		Self {
+			rebalance_watchers: RebalanceWatchers::default(),
 			queue: Arc::new(StdMutex::new(queue)),
 			mutation_lock: Arc::new(Mutex::new(())),
 			pending_mpp_events: Arc::new(Mutex::new(HashMap::new())),
@@ -789,7 +792,6 @@ pub(crate) struct LdkEventHandler {
 	pub(crate) event_queue: Arc<EventQueue>,
 	pub(crate) ldk_node: Arc<ldk_node::Node>,
 	pub(crate) tx_metadata: store::TxMetadataStore,
-	pub(crate) payment_receipt_inbox: Arc<PaymentReceiptInbox>,
 	pub(crate) channel_pending_sender: watch::Sender<u128>,
 	pub(crate) splice_pending_inbox: Arc<SplicePendingInbox>,
 	pub(crate) logger: Arc<Logger>,
@@ -872,9 +874,12 @@ impl LdkEventHandler {
 					log_error!(self.logger, "Failed to add PaymentReceived event: {e:?}");
 					return false;
 				}
-				self.payment_receipt_inbox.deliver(
+				self.event_queue.rebalance_watchers.received(
 					payment_hash.0,
-					ReceivedLightningPayment { id: payment_id.0, fee_paid_msat: lsp_fee_msats },
+					Some(ReceivedLightningPayment {
+						id: payment_id.0,
+						fee_paid_msat: lsp_fee_msats,
+					}),
 				);
 			},
 			ldk_node::Event::PaymentForwarded { .. } => {},

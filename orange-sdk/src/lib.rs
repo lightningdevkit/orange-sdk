@@ -45,6 +45,7 @@ mod event;
 mod ffi;
 mod lightning_wallet;
 pub(crate) mod logging;
+mod rebalance_watcher;
 mod rebalancer;
 mod runtime;
 mod store;

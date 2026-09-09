@@ -26,14 +26,14 @@ use ldk_node::payment::{
 };
 use ldk_node::{Node, NodeError, UserChannelId};
 
-use graduated_rebalancer::{LightningBalance, ReceivedLightningPayment};
+use graduated_rebalancer::{LightningBalance, RebalanceWait};
 
 use std::collections::{HashMap, VecDeque};
 use std::fmt::Debug;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
-use tokio::sync::{Notify, oneshot, watch};
+use tokio::sync::{Notify, watch};
 
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct LightningWalletBalance {
@@ -42,10 +42,10 @@ pub(crate) struct LightningWalletBalance {
 }
 
 pub(crate) struct LightningWalletImpl {
+	event_queue: Arc<EventQueue>,
 	pub(crate) ldk_node: Arc<ldk_node::Node>,
 	logger: Arc<Logger>,
 	store: Arc<dyn DynStore>,
-	payment_receipt_inbox: Arc<PaymentReceiptInbox>,
 	channel_pending_receipt_flag: watch::Receiver<u128>,
 	splice_pending_inbox: Arc<SplicePendingInbox>,
 	lsp_node_id: PublicKey,
@@ -206,26 +206,24 @@ impl LightningWallet {
 
 		let ldk_node =
 			Arc::new(builder.build_with_store(node_entropy, LdkNodeStore(Arc::clone(&store)))?);
-		let payment_receipt_inbox = Arc::new(PaymentReceiptInbox::default());
 		let (channel_pending_sender, channel_pending_receipt_flag) = watch::channel(0);
 		let splice_pending_inbox = Arc::new(SplicePendingInbox {
 			pending: Mutex::new(HashMap::new()),
 			notify: Notify::new(),
 		});
 		let ev_handler = Arc::new(LdkEventHandler {
-			event_queue,
+			event_queue: Arc::clone(&event_queue),
 			ldk_node: Arc::clone(&ldk_node),
 			tx_metadata,
-			payment_receipt_inbox: Arc::clone(&payment_receipt_inbox),
 			channel_pending_sender,
 			splice_pending_inbox: Arc::clone(&splice_pending_inbox),
 			logger: Arc::clone(&logger),
 		});
 		let inner = Arc::new(LightningWalletImpl {
+			event_queue,
 			ldk_node,
 			logger,
 			store,
-			payment_receipt_inbox,
 			channel_pending_receipt_flag,
 			splice_pending_inbox,
 			lsp_node_id,
@@ -499,12 +497,8 @@ impl graduated_rebalancer::LightningWallet for LightningWallet {
 		Box::pin(async move { self.pay(&method, amount).await.map(|p| p.0) })
 	}
 
-	fn register_payment_receipt(
-		&self, payment_hash: [u8; 32],
-	) -> Pin<Box<dyn Future<Output = Option<ReceivedLightningPayment>> + Send + '_>> {
-		// Register now so receipts that arrive before this future is polled are retained.
-		let receipt = self.inner.payment_receipt_inbox.register(payment_hash);
-		Box::pin(async move { receipt.await.ok() })
+	fn watch_rebalance(&self, payment_hash: [u8; 32]) -> RebalanceWait {
+		self.inner.event_queue.rebalance_watchers.register(payment_hash)
 	}
 
 	fn has_channel_with_lsp(&self) -> bool {
@@ -636,35 +630,6 @@ impl SplicePendingInbox {
 	}
 }
 
-/// Routes expected rebalance receipts by hash while preserving LDK's actual payment ID.
-#[derive(Default)]
-pub(crate) struct PaymentReceiptInbox {
-	pending: Mutex<HashMap<[u8; 32], Vec<oneshot::Sender<ReceivedLightningPayment>>>>,
-}
-
-impl PaymentReceiptInbox {
-	fn register(&self, payment_hash: [u8; 32]) -> oneshot::Receiver<ReceivedLightningPayment> {
-		let (sender, receiver) = oneshot::channel();
-		let mut pending = self.pending.lock().unwrap();
-		// A failed send or cancelled rebalance drops its receiver.
-		pending.retain(|_, senders| {
-			senders.retain(|sender| !sender.is_closed());
-			!senders.is_empty()
-		});
-		pending.entry(payment_hash).or_default().push(sender);
-		receiver
-	}
-
-	pub(crate) fn deliver(&self, payment_hash: [u8; 32], receipt: ReceivedLightningPayment) {
-		let senders = self.pending.lock().unwrap().remove(&payment_hash);
-		if let Some(senders) = senders {
-			for sender in senders {
-				let _ = sender.send(receipt.clone());
-			}
-		}
-	}
-}
-
 #[cfg(test)]
 mod tests {
 	use super::*;
@@ -673,33 +638,6 @@ mod tests {
 	use ldk_node::entropy::NodeEntropy;
 	use ldk_node::lightning::util::persist::KVStore;
 	use ldk_node::lightning::util::ser::Writeable;
-
-	#[tokio::test]
-	async fn receipt_inbox_routes_actual_ids_before_waiting() {
-		let inbox = PaymentReceiptInbox::default();
-		let first = inbox.register([1; 32]);
-		let second = inbox.register([2; 32]);
-		let duplicate = inbox.register([1; 32]);
-		inbox.deliver([2; 32], ReceivedLightningPayment { id: [22; 32], fee_paid_msat: None });
-		inbox.deliver([1; 32], ReceivedLightningPayment { id: [11; 32], fee_paid_msat: Some(42) });
-		let received = first.await.unwrap();
-		assert_eq!(received.id, [11; 32]);
-		assert_eq!(received.fee_paid_msat, Some(42));
-		assert_eq!(second.await.unwrap().id, [22; 32]);
-		assert_eq!(duplicate.await.unwrap().id, [11; 32]);
-		assert!(inbox.pending.lock().unwrap().is_empty());
-	}
-
-	#[test]
-	fn receipt_inbox_discards_cancelled_and_unrequested_receipts() {
-		let inbox = PaymentReceiptInbox::default();
-		drop(inbox.register([1; 32]));
-		let _active = inbox.register([2; 32]);
-		inbox.deliver([3; 32], ReceivedLightningPayment { id: [33; 32], fee_paid_msat: None });
-		let pending = inbox.pending.lock().unwrap();
-		assert_eq!(pending.len(), 1);
-		assert!(pending.contains_key(&[2; 32]));
-	}
 
 	#[tokio::test(flavor = "multi_thread")]
 	async fn payment_history_includes_every_sqlite_page() {
