@@ -27,7 +27,7 @@ use ldk_node::lightning::ln::msgs::SocketAddress;
 use ldk_node::lightning::util::logger::Logger as _;
 use ldk_node::lightning::{log_debug, log_error, log_info, log_trace, log_warn};
 use ldk_node::lightning_invoice::Bolt11Invoice;
-use ldk_node::payment::{PaymentDetails, PaymentDirection, PaymentKind};
+use ldk_node::payment::{PaymentDetails, PaymentDirection, PaymentKind, PaymentStatus};
 use ldk_node::{BuildError, ChannelDetails, NodeError};
 #[cfg(feature = "_test-utils")]
 pub use lightning_wallet::list_node_payments;
@@ -536,15 +536,24 @@ impl From<NodeError> for WalletError {
 	}
 }
 
-fn should_surface_lightning_payment_without_metadata(status: TxStatus, kind: &PaymentKind) -> bool {
-	status == TxStatus::Completed || matches!(kind, PaymentKind::Onchain { .. })
+fn should_surface_lightning_payment_without_metadata(
+	status: TxStatus, kind: &PaymentKind, direction: PaymentDirection,
+) -> bool {
+	// Hide only non-completed *inbound* Lightning records (issued-but-unpaid
+	// invoices are noise). Outbound attempts always surface: a failed or
+	// still-pending send the user made must appear in their history —
+	// otherwise a failed payment leaves no record at all.
+	status == TxStatus::Completed
+		|| matches!(kind, PaymentKind::Onchain { .. })
+		|| direction == PaymentDirection::Outbound
 }
 
 fn lightning_payment_without_metadata_to_transaction(
 	payment: &PaymentDetails, fee: Option<Amount>,
 ) -> Option<Transaction> {
 	let status = payment.status.into();
-	if !should_surface_lightning_payment_without_metadata(status, &payment.kind) {
+	if !should_surface_lightning_payment_without_metadata(status, &payment.kind, payment.direction)
+	{
 		return None;
 	}
 
@@ -1080,12 +1089,28 @@ impl Wallet {
 					},
 				}
 			} else {
-				debug_assert_ne!(
-					payment.direction,
-					PaymentDirection::Outbound,
-					"Missing outbound lightning payment metadata entry on {}",
-					payment.id
-				);
+				// Only a *successful* outbound payment is expected to have a metadata entry
+				// (`pay()` writes one whenever the send returns `Ok`). Outbound records can
+				// legitimately lack metadata when a send fails synchronously — ldk-node
+				// inserts a `Failed` record before returning `Err`, so `pay()` never
+				// observes an id — or briefly while a `Pending` record awaits the upsert.
+				// Even `Succeeded` is only a should-never-happen: a crash between
+				// ldk-node persisting the payment and the metadata write leaves one.
+				if payment.direction == PaymentDirection::Outbound
+					&& payment.status == PaymentStatus::Succeeded
+				{
+					log_warn!(
+						self.inner.logger,
+						"Missing outbound lightning payment metadata entry on {}",
+						payment.id
+					);
+					#[cfg(feature = "_test-utils")]
+					debug_assert!(
+						false,
+						"Missing outbound lightning payment metadata entry on {}",
+						payment.id
+					);
+				}
 
 				if let Some(transaction) =
 					lightning_payment_without_metadata_to_transaction(&payment, fee)
@@ -1582,6 +1607,24 @@ impl Wallet {
 			Ok(id) => id,
 			Err(e) => {
 				log_error!(self.inner.logger, "Failed to send lightning MPP portion: {e:?}");
+				// The lightning leg failed synchronously, so nothing is in flight — but
+				// ldk-node has still recorded a failed outbound payment for it, keyed by
+				// the invoice's payment hash. Remove that record: it is an internal MPP
+				// leg, not an independent payment, and the attempt is surfaced through
+				// the trusted leg below.
+				use ldk_node::lightning::ln::channelmanager::PaymentId as LdkPaymentId;
+				if let Err(remove_err) = self
+					.inner
+					.ln_wallet
+					.inner
+					.ldk_node
+					.remove_payment(&LdkPaymentId(payment_hash.0))
+				{
+					log_error!(
+						self.inner.logger,
+						"Failed to remove failed MPP lightning leg record: {remove_err:?}"
+					);
+				}
 				// The trusted leg is already in flight but there will be no lightning leg to
 				// complete the MPP. Record it as a plain payment so its eventual (failed) terminal
 				// event surfaces normally rather than waiting on a sibling leg that never comes.
@@ -1807,7 +1850,11 @@ mod tests {
 			tx_type: None,
 		};
 
-		assert!(should_surface_lightning_payment_without_metadata(TxStatus::Pending, &kind));
+		assert!(should_surface_lightning_payment_without_metadata(
+			TxStatus::Pending,
+			&kind,
+			PaymentDirection::Inbound
+		));
 	}
 
 	#[test]
@@ -1841,16 +1888,54 @@ mod tests {
 	}
 
 	#[test]
-	fn pending_non_onchain_lightning_payments_without_metadata_are_hidden() {
+	fn pending_inbound_non_onchain_lightning_payments_without_metadata_are_hidden() {
 		let kind = PaymentKind::Spontaneous { hash: PaymentHash([42; 32]), preimage: None };
 
-		assert!(!should_surface_lightning_payment_without_metadata(TxStatus::Pending, &kind));
+		assert!(!should_surface_lightning_payment_without_metadata(
+			TxStatus::Pending,
+			&kind,
+			PaymentDirection::Inbound
+		));
 	}
 
 	#[test]
 	fn completed_lightning_payments_without_metadata_are_listed() {
 		let kind = PaymentKind::Spontaneous { hash: PaymentHash([42; 32]), preimage: None };
 
-		assert!(should_surface_lightning_payment_without_metadata(TxStatus::Completed, &kind));
+		assert!(should_surface_lightning_payment_without_metadata(
+			TxStatus::Completed,
+			&kind,
+			PaymentDirection::Inbound
+		));
+	}
+
+	#[test]
+	fn failed_and_pending_outbound_payments_are_listed() {
+		// A failed or in-flight send the user made must appear in their
+		// history — a failed payment that leaves no record erodes trust
+		// in the send flow (the wallet UI can't show what it never sees).
+		let kind = PaymentKind::Bolt11 {
+			hash: PaymentHash([42; 32]),
+			preimage: None,
+			secret: None,
+			counterparty_skimmed_fee_msat: None,
+		};
+
+		assert!(should_surface_lightning_payment_without_metadata(
+			TxStatus::Failed,
+			&kind,
+			PaymentDirection::Outbound
+		));
+		assert!(should_surface_lightning_payment_without_metadata(
+			TxStatus::Pending,
+			&kind,
+			PaymentDirection::Outbound
+		));
+		// Inbound failures (expired unpaid invoices) stay hidden.
+		assert!(!should_surface_lightning_payment_without_metadata(
+			TxStatus::Failed,
+			&kind,
+			PaymentDirection::Inbound
+		));
 	}
 }
