@@ -6,10 +6,13 @@ use bitcoin_payment_instructions::http_resolver::HTTPHrnResolver;
 use bitcoin_payment_instructions::{ParseError, PaymentInstructions};
 use ldk_node::NodeError;
 use ldk_node::bitcoin::Network;
-use ldk_node::lightning_invoice::{Bolt11InvoiceDescription, Description};
+use ldk_node::bitcoin::secp256k1::{Secp256k1, SecretKey};
+use ldk_node::lightning_invoice::{
+	Bolt11InvoiceDescription, Currency, Description, InvoiceBuilder, PaymentHash, PaymentSecret,
+};
 use ldk_node::payment::{ConfirmationStatus, PaymentDirection, PaymentStatus};
 use log::info;
-use orange_sdk::{Event, PaymentInfo, PaymentType, TxStatus, WalletError};
+use orange_sdk::{Event, PaymentId, PaymentInfo, PaymentType, TxStatus, WalletError};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -1999,6 +2002,156 @@ async fn test_invalid_payment_instructions() {
 		// Test 6: Verify no failed transactions are recorded
 		let txs = wallet.list_transactions().await.unwrap();
 		assert_eq!(txs.len(), 0, "Failed payments should not be recorded in transaction list");
+	})
+	.await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[test_log::test]
+async fn test_failed_lightning_send_is_surfaced() {
+	test_utils::run_test(|params| async move {
+		let wallet = Arc::clone(&params.wallet);
+		let bitcoind = Arc::clone(&params.bitcoind);
+		let electrsd = Arc::clone(&params.electrsd);
+		let third_party = Arc::clone(&params.third_party);
+
+		// Give the wallet a spendable lightning balance.
+		open_channel_from_lsp(&wallet, Arc::clone(&third_party)).await;
+		generate_blocks(&bitcoind, &electrsd, 6).await;
+		test_utils::wait_for_condition("wallet sync after channel open", || async {
+			wallet.channels().iter().any(|c| c.confirmations.is_some_and(|n| n > 0) && c.is_usable)
+		})
+		.await;
+
+		// An invoice signed by a key no node ever announced: route-finding fails
+		// synchronously, and ldk-node records the attempt as a failed outbound payment.
+		// Unlike the rejected payments above (which never reach the node and leave no
+		// record), this attempt must show up in the transaction list.
+		let pay_amt = Amount::from_sats(10_000).unwrap();
+		let secp = Secp256k1::new();
+		let no_such_node = SecretKey::from_slice(&[99; 32]).unwrap();
+		let invoice = InvoiceBuilder::new(Currency::Regtest)
+			.description("no route to this payee".to_string())
+			.payment_hash(PaymentHash([43; 32]))
+			.payment_secret(PaymentSecret([44; 32]))
+			.current_timestamp()
+			.min_final_cltv_expiry_delta(144)
+			.amount_milli_satoshis(pay_amt.milli_sats())
+			.build_signed(|hash| secp.sign_ecdsa_recoverable(hash, &no_such_node))
+			.unwrap();
+
+		let instr = wallet.parse_payment_instructions(invoice.to_string().as_str()).await.unwrap();
+		let info = PaymentInfo::build(instr, None).unwrap();
+		let res = wallet.pay(&info).await;
+		assert!(
+			matches!(res, Err(WalletError::LdkNodeFailure(NodeError::PaymentSendingFailed))),
+			"send to an unroutable payee must fail synchronously, got {res:?}"
+		);
+
+		let txs = wallet.list_transactions().await.unwrap();
+		let outbound: Vec<_> = txs.iter().filter(|t| t.outbound).collect();
+		assert_eq!(outbound.len(), 1, "the failed send should surface exactly once: {txs:?}");
+		let failed = outbound[0];
+		assert_eq!(failed.status, TxStatus::Failed);
+		assert_eq!(failed.amount, Some(pay_amt));
+		match &failed.payment_type {
+			PaymentType::OutgoingLightningBolt11 { payment_preimage } => {
+				assert!(payment_preimage.is_none(), "a failed payment has no preimage");
+			},
+			pt => panic!("Payment type should be OutgoingLightningBolt11, got {pt:?}"),
+		}
+	})
+	.await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[test_log::test]
+#[cfg_attr(
+	feature = "_cashu-tests",
+	ignore = "CDK's test mint/payment processor does not support partial MPP melts"
+)]
+async fn test_failed_mpp_lightning_leg_is_not_listed_separately() {
+	test_utils::run_test(|params| async move {
+		let wallet = Arc::clone(&params.wallet);
+		let bitcoind = Arc::clone(&params.bitcoind);
+		let third_party = Arc::clone(&params.third_party);
+		let electrsd = Arc::clone(&params.electrsd);
+		let lsp = Arc::clone(&params.lsp);
+		let desc = Bolt11InvoiceDescription::Direct(Description::empty());
+
+		// Fund the trusted wallet with 100 sats before a channel exists (once inbound
+		// liquidity exists, small receives route to the lightning wallet instead).
+		let trusted_amt = Amount::from_sats(100).unwrap();
+		let uri = wallet.get_single_use_receive_uri(Some(trusted_amt)).await.unwrap();
+		assert!(uri.from_trusted);
+		third_party.bolt11_payment().send(&uri.invoice, None).unwrap();
+		test_utils::wait_for_condition("trusted balance funded", || async {
+			wallet.get_balance().await.unwrap().trusted == trusted_amt
+		})
+		.await;
+		assert!(matches!(wait_next_event(&wallet).await, Event::PaymentReceived { .. }));
+
+		// Open a lightning channel.
+		open_channel_from_lsp(&wallet, Arc::clone(&third_party)).await;
+		generate_blocks(&bitcoind, &electrsd, 6).await;
+		test_utils::wait_for_condition("wallet sync after channel open", || async {
+			wallet.channels().iter().any(|c| c.confirmations.is_some_and(|n| n > 0) && c.is_usable)
+		})
+		.await;
+
+		// Drain spendable lightning liquidity down to ~150 sats. The channel reserve
+		// keeps the *total* lightning balance well above that, which is exactly the
+		// gap this test needs: the MPP split passes the balance check, but the
+		// lightning leg exceeds what a route can actually carry and fails
+		// synchronously with RouteNotFound after the trusted leg is already in
+		// flight.
+		let sendable =
+			wallet.channels().iter().find(|c| c.is_usable).unwrap().next_outbound_htlc_limit_msat;
+		let drain = lsp.bolt11_payment().receive(sendable - 150_000, &desc, 300).unwrap();
+		let drain_info = PaymentInfo::build(
+			wallet.parse_payment_instructions(&drain.to_string()).await.unwrap(),
+			None,
+		)
+		.unwrap();
+		wallet.pay(&drain_info).await.unwrap();
+		assert!(matches!(wait_next_event(&wallet).await, Event::PaymentSuccessful { .. }));
+		test_utils::wait_for_condition("lightning balance drained below 200 sats", || async {
+			wallet
+				.channels()
+				.iter()
+				.find(|c| c.is_usable)
+				.is_some_and(|c| c.next_outbound_htlc_limit_msat < 200_000)
+		})
+		.await;
+
+		// 350 sats = 100 trusted + 250 lightning. The 250 sat lightning leg exceeds
+		// the ~150 sats of usable outbound liquidity, so it fails synchronously.
+		let pay_amt = Amount::from_sats(350).unwrap();
+		let invoice =
+			third_party.bolt11_payment().receive(pay_amt.milli_sats(), &desc, 300).unwrap();
+		let info = PaymentInfo::build(
+			wallet.parse_payment_instructions(&invoice.to_string()).await.unwrap(),
+			Some(pay_amt),
+		)
+		.unwrap();
+		assert!(wallet.pay(&info).await.is_err(), "MPP with an unroutable lightning leg must fail");
+
+		// The failed lightning leg is internal bookkeeping of the MPP attempt, which
+		// is surfaced through the trusted leg. It must not appear as an additional,
+		// standalone failed payment (the only other outbound row is the drain above).
+		let txs = wallet.list_transactions().await.unwrap();
+		let failed_outbound =
+			txs.iter().filter(|t| t.outbound && t.status == TxStatus::Failed).count();
+		assert_eq!(
+			failed_outbound, 0,
+			"the failed MPP lightning leg must not list on its own, got {txs:?}"
+		);
+		let trusted_legs =
+			txs.iter().filter(|t| t.outbound && matches!(t.id, PaymentId::Trusted(_))).count();
+		assert_eq!(
+			trusted_legs, 1,
+			"the MPP attempt should surface via the trusted leg, got {txs:?}"
+		);
 	})
 	.await;
 }
