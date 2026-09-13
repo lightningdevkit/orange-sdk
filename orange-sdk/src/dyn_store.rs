@@ -9,6 +9,7 @@
 //! value ldk-node accepts happens at the call site through a thin newtype that delegates back to
 //! `DynStore`.
 
+use futures_util::{StreamExt, TryStreamExt, stream};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -17,10 +18,9 @@ use ldk_node::lightning::io;
 use ldk_node::lightning::util::persist::{
 	KVStore, PageToken, PaginatedKVStore, PaginatedListResponse,
 };
-use tokio::task::JoinSet;
 
-/// Matches the connection capacity used by the VSS HTTP client. Keeping the
-/// limit here also prevents large wallets from spawning one task per record.
+/// Bounds in-flight reads so large wallets do not spawn one task per record.
+/// VSS can pipeline reads, but this is not a count of connections to one server.
 const MAX_CONCURRENT_READS: usize = 10;
 
 /// Object-safe view of a `KVStore` backend. Async methods return boxed futures so the trait
@@ -158,57 +158,22 @@ impl PaginatedKVStore for LdkNodeStore {
 ///
 /// Storage formats expose record collections as a list followed by individual
 /// reads. For a remote store, performing those reads serially adds one network
-/// round trip per record. This helper bounds that fan-out to the VSS connection
-/// pool size and retains the same fail-fast I/O behavior as a serial loop.
+/// round trip per record. This helper bounds the number of in-flight reads and
+/// retains the same fail-fast I/O behavior as a serial loop.
 pub(crate) async fn read_keys_bounded(
 	store: Arc<dyn DynStore>, primary_namespace: &str, secondary_namespace: &str, keys: Vec<String>,
 ) -> Result<Vec<(String, Vec<u8>)>, io::Error> {
-	if keys.is_empty() {
-		return Ok(Vec::new());
-	}
-
-	type ReadResult = (usize, String, Result<Vec<u8>, io::Error>);
-
-	let primary_namespace = primary_namespace.to_owned();
-	let secondary_namespace = secondary_namespace.to_owned();
-	let mut pending = keys.into_iter().enumerate();
-	let mut reads: JoinSet<ReadResult> = JoinSet::new();
-	let mut results = Vec::with_capacity(pending.len());
-	results.resize_with(pending.len(), || None);
-
-	let spawn_read = |reads: &mut JoinSet<ReadResult>, index, key: String| {
-		let store = Arc::clone(&store);
-		let primary_namespace = primary_namespace.clone();
-		let secondary_namespace = secondary_namespace.clone();
-		reads.spawn(async move {
-			let data = store.read_async(&primary_namespace, &secondary_namespace, &key).await;
-			(index, key, data)
-		});
-	};
-
-	for _ in 0..MAX_CONCURRENT_READS {
-		if let Some((index, key)) = pending.next() {
-			spawn_read(&mut reads, index, key);
-		} else {
-			break;
-		}
-	}
-
-	while let Some(result) = reads.join_next().await {
-		let (index, key, data) = result.map_err(|e| {
-			io::Error::new(io::ErrorKind::Other, format!("store read task failed: {e}"))
-		})?;
-		results[index] = Some((key, data?));
-
-		if let Some((index, key)) = pending.next() {
-			spawn_read(&mut reads, index, key);
-		}
-	}
-
-	Ok(results
-		.into_iter()
-		.map(|result| result.expect("every bounded store read must complete"))
-		.collect())
+	stream::iter(keys)
+		.map(|key| {
+			let store = Arc::clone(&store);
+			async move {
+				let data = store.read_async(primary_namespace, secondary_namespace, &key).await?;
+				Ok((key, data))
+			}
+		})
+		.buffered(MAX_CONCURRENT_READS)
+		.try_collect()
+		.await
 }
 
 #[cfg(test)]

@@ -49,7 +49,10 @@ async fn test_receive_to_trusted() {
 		// wait for payment success from payer side
 		let p = Arc::clone(&third_party);
 		test_utils::wait_for_condition("payer payment success", || {
-			let res = p.payment(&payment_id).is_some_and(|p| p.status == PaymentStatus::Succeeded);
+			let res = p
+				.payment(&payment_id)
+				.unwrap()
+				.is_some_and(|p| p.status == PaymentStatus::Succeeded);
 			async move { res }
 		})
 		.await;
@@ -105,7 +108,10 @@ async fn test_trusted_receive_keeps_backend_settle_time() {
 
 		let p = Arc::clone(&third_party);
 		test_utils::wait_for_condition("payer payment success", || {
-			let res = p.payment(&payment_id).is_some_and(|p| p.status == PaymentStatus::Succeeded);
+			let res = p
+				.payment(&payment_id)
+				.unwrap()
+				.is_some_and(|p| p.status == PaymentStatus::Succeeded);
 			async move { res }
 		})
 		.await;
@@ -169,7 +175,10 @@ async fn test_pay_from_trusted() {
 		// wait for payment success from payer side
 		let p = Arc::clone(&third_party);
 		test_utils::wait_for_condition("payer payment success", || {
-			let res = p.payment(&payment_id).is_some_and(|p| p.status == PaymentStatus::Succeeded);
+			let res = p
+				.payment(&payment_id)
+				.unwrap()
+				.is_some_and(|p| p.status == PaymentStatus::Succeeded);
 			async move { res }
 		})
 		.await;
@@ -319,7 +328,7 @@ async fn test_pay_mpp_trusted_and_lightning() {
 		test_utils::wait_for_condition("third party received full amount", || {
 			let tp = Arc::clone(&third_party);
 			async move {
-				tp.list_payments().iter().any(|p| {
+				orange_sdk::list_node_payments(&tp).unwrap().iter().any(|p| {
 					p.direction == PaymentDirection::Inbound
 						&& p.status == PaymentStatus::Succeeded
 						&& p.amount_msat == Some(pay_amt.milli_sats())
@@ -452,8 +461,13 @@ async fn test_sweep_to_ln() {
 		let expect_amt = intermediate_amt.saturating_add(recv_amt);
 
 		let received_rebalance_amount = match wait_next_event(&wallet).await {
-			Event::PaymentReceived { payment_id, amount_msat, lsp_fee_msats, .. } => {
-				assert!(matches!(payment_id, orange_sdk::PaymentId::SelfCustodial(_)));
+			Event::PaymentReceived {
+				payment_id, payment_hash, amount_msat, lsp_fee_msats, ..
+			} => {
+				let orange_sdk::PaymentId::SelfCustodial(id) = payment_id else {
+					panic!("Expected self-custodial rebalance receipt");
+				};
+				assert_ne!(id, payment_hash.0, "Inbound LDK IDs must not be treated as hashes");
 				let lsp_fee_msats = lsp_fee_msats.expect("rebalance receive should pay LSP fee");
 				assert!(
 					amount_msat + lsp_fee_msats <= expect_amt.milli_sats(),
@@ -1219,7 +1233,7 @@ async fn run_test_pay_lightning_from_self_custody(amountless: bool) {
 		assert!(bal.available_balance() <= starting_bal.available_balance().saturating_sub(amount));
 
 		// make sure 3rd party node got payment
-		let payments = third_party.list_payments();
+		let payments = orange_sdk::list_node_payments(&third_party).unwrap();
 		assert!(payments.iter().any(|p| p.status == PaymentStatus::Succeeded
 			&& p.direction == PaymentDirection::Inbound
 			&& p.amount_msat == Some(amount.milli_sats())));
@@ -1314,7 +1328,7 @@ async fn run_test_pay_bolt12_from_self_custody(amountless: bool) {
 		assert!(bal.available_balance() <= starting_bal.available_balance().saturating_sub(amount));
 
 		// make sure 3rd party node got payment
-		let payments = third_party.list_payments();
+		let payments = orange_sdk::list_node_payments(&third_party).unwrap();
 		assert!(payments.iter().any(|p| p.status == PaymentStatus::Succeeded
 			&& p.direction == PaymentDirection::Inbound
 			&& p.amount_msat == Some(amount.milli_sats())));
@@ -1428,7 +1442,7 @@ async fn test_pay_onchain_from_self_custody() {
 
 		// Wait for third party node to receive it
 		test_utils::wait_for_condition("on-chain payment received", || async {
-			let payments = third_party.list_payments();
+			let payments = orange_sdk::list_node_payments(&third_party).unwrap();
 			payments.iter().any(|p| {
 				p.status == PaymentStatus::Succeeded
 					&& p.direction == PaymentDirection::Inbound
@@ -1533,7 +1547,7 @@ async fn test_pay_onchain_from_channel() {
 
 		// Wait for third party node to receive it
 		test_utils::wait_for_condition("on-chain payment received", || async {
-			let payments = third_party.list_payments();
+			let payments = orange_sdk::list_node_payments(&third_party).unwrap();
 			payments.iter().any(|p| {
 				p.status == PaymentStatus::Succeeded
 					&& p.direction == PaymentDirection::Inbound
@@ -2228,7 +2242,7 @@ async fn test_concurrent_payments() {
 
 		// Verify all payments reached the third party
 		test_utils::wait_for_condition("third party to receive all payments", || async {
-			let current_payments = third_party.list_payments();
+			let current_payments = orange_sdk::list_node_payments(&third_party).unwrap();
 			let successful_payments = current_payments
 				.iter()
 				.filter(|p| {
@@ -2326,7 +2340,10 @@ async fn test_concurrent_receive_operations() {
 
 		// Wait for first payment to complete
 		test_utils::wait_for_condition("first payment to succeed", || async {
-			third_party.payment(&payment_id_1).is_some_and(|p| p.status == PaymentStatus::Succeeded)
+			third_party
+				.payment(&payment_id_1)
+				.unwrap()
+				.is_some_and(|p| p.status == PaymentStatus::Succeeded)
 		})
 		.await;
 
@@ -2335,7 +2352,10 @@ async fn test_concurrent_receive_operations() {
 
 		// Wait for second payment to complete
 		test_utils::wait_for_condition("second payment to succeed", || async {
-			third_party.payment(&payment_id_2).is_some_and(|p| p.status == PaymentStatus::Succeeded)
+			third_party
+				.payment(&payment_id_2)
+				.unwrap()
+				.is_some_and(|p| p.status == PaymentStatus::Succeeded)
 		})
 		.await;
 

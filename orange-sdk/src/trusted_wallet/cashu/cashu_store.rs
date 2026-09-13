@@ -4,6 +4,7 @@ use std::str::FromStr;
 use std::sync::{Arc, RwLock};
 
 use crate::dyn_store::{DynStore, read_keys_bounded};
+use crate::runtime::Runtime;
 use async_trait::async_trait;
 use cdk::cdk_database::WalletDatabase;
 use cdk::wallet::types::WalletSaga;
@@ -23,7 +24,7 @@ use cdk::wallet::{
 };
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, OwnedMutexGuard};
 
 // Constants for organizing data in the KV store
 const CASHU_PRIMARY_KEY: &str = "cashu_wallet";
@@ -129,10 +130,15 @@ impl From<DatabaseError> for cdk::cdk_database::Error {
 /// A KV store-based implementation of the Cashu WalletDatabase trait
 pub struct CashuKvDatabase {
 	store: Arc<dyn DynStore>,
+	runtime: Arc<Runtime>,
+	transactions_mutation_lock: Arc<Mutex<()>>,
 	keyset_counter_lock: Mutex<()>,
 	// This only serializes writers in this process. The whole-snapshot storage
 	// format requires a single active wallet instance for a given store.
-	proofs_mutation_lock: Mutex<()>,
+	proofs_mutation_lock: Arc<Mutex<()>>,
+	// Like ldk-node DataStore, readers use typed objects while writers persist
+	// under a separate mutation lock and then publish the committed update.
+	transactions_cache: Arc<RwLock<HashMap<String, Transaction>>>,
 	// In-memory caches for frequently accessed data
 	mints_cache: Arc<RwLock<HashMap<MintUrl, Option<MintInfo>>>>,
 	proofs_cache: Arc<RwLock<Vec<ProofInfo>>>,
@@ -142,6 +148,8 @@ impl Debug for CashuKvDatabase {
 	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
 		f.debug_struct("CashuKvDatabase")
 			.field("store", &"<KVStore>")
+			.field("transactions_mutation_lock", &self.transactions_mutation_lock)
+			.field("transactions_cache", &self.transactions_cache)
 			.field("keyset_counter_lock", &self.keyset_counter_lock)
 			.field("proofs_mutation_lock", &self.proofs_mutation_lock)
 			.field("mints_cache", &self.mints_cache)
@@ -164,11 +172,16 @@ impl CashuKvDatabase {
 	///
 	/// Returns a `Result` containing the initialized database or a `DatabaseError` if
 	/// initialization fails.
-	pub(crate) async fn new(store: Arc<dyn DynStore>) -> Result<Self, DatabaseError> {
+	pub(crate) async fn new(
+		store: Arc<dyn DynStore>, runtime: Arc<Runtime>,
+	) -> Result<Self, DatabaseError> {
 		let database = Self {
+			transactions_mutation_lock: Arc::new(Mutex::new(())),
+			transactions_cache: Arc::new(RwLock::new(HashMap::new())),
 			store,
+			runtime,
 			keyset_counter_lock: Mutex::new(()),
-			proofs_mutation_lock: Mutex::new(()),
+			proofs_mutation_lock: Arc::new(Mutex::new(())),
 			mints_cache: Arc::new(RwLock::new(HashMap::new())),
 			proofs_cache: Arc::new(RwLock::new(Vec::new())),
 		};
@@ -183,8 +196,11 @@ impl CashuKvDatabase {
 		// These use independent namespaces and can be restored concurrently. This
 		// lets remote stores pipeline the requests while synchronous stores retain
 		// their existing behavior.
-		let (mints, proofs) =
-			tokio::join!(self.load_mints_from_store(), self.load_proofs_from_store());
+		let (mints, proofs, transactions) = tokio::join!(
+			self.load_mints_from_store(),
+			self.load_proofs_from_store(),
+			self.load_transactions_from_store(),
+		);
 
 		if let Ok(mints) = mints {
 			let mut cache = self.mints_cache.write().unwrap();
@@ -196,7 +212,65 @@ impl CashuKvDatabase {
 		let proofs = proofs?;
 		let mut cache = self.proofs_cache.write().unwrap();
 		*cache = proofs;
+		// An unreadable history must fail initialization rather than appear empty.
+		*self.transactions_cache.write().unwrap() = transactions?;
 
+		Ok(())
+	}
+
+	async fn load_transactions_from_store(
+		&self,
+	) -> Result<HashMap<String, Transaction>, DatabaseError> {
+		let keys = KVStore::list(self.store.as_ref(), CASHU_PRIMARY_KEY, TRANSACTIONS_KEY).await?;
+		let records =
+			read_keys_bounded(Arc::clone(&self.store), CASHU_PRIMARY_KEY, TRANSACTIONS_KEY, keys)
+				.await?;
+		let mut transactions = HashMap::with_capacity(records.len());
+		for (key, data) in records {
+			if !data.is_empty() {
+				let transaction = serde_json::from_slice(&data)
+					.map_err(|e| DatabaseError::Serialization(e.to_string()))?;
+				transactions.insert(key, transaction);
+			}
+		}
+		Ok(transactions)
+	}
+
+	async fn persist_transaction(
+		&self, key: String, transaction: Option<Transaction>,
+	) -> Result<(), DatabaseError> {
+		let data = transaction
+			.as_ref()
+			.map(serde_json::to_vec)
+			.transpose()
+			.map_err(|e| DatabaseError::Serialization(e.to_string()))?;
+		let writer = Arc::clone(&self.transactions_mutation_lock).lock_owned().await;
+		let store = Arc::clone(&self.store);
+		let cache = Arc::clone(&self.transactions_cache);
+		self.runtime
+			.persist(writer, async move {
+				if let Some(data) = data {
+					KVStore::write(store.as_ref(), CASHU_PRIMARY_KEY, TRANSACTIONS_KEY, &key, data)
+						.await?;
+				} else {
+					KVStore::remove(
+						store.as_ref(),
+						CASHU_PRIMARY_KEY,
+						TRANSACTIONS_KEY,
+						&key,
+						false,
+					)
+					.await?;
+				}
+				let mut cache = cache.write().unwrap();
+				if let Some(transaction) = transaction {
+					cache.insert(key, transaction);
+				} else {
+					cache.remove(&key);
+				}
+				Ok(())
+			})
+			.await?;
 		Ok(())
 	}
 
@@ -251,15 +325,30 @@ impl CashuKvDatabase {
 		Ok(blob.proofs)
 	}
 
-	async fn persist_proofs(&self, proofs: &[ProofInfo]) -> Result<(), DatabaseError> {
-		Self::ensure_unique_proof_ys(proofs)?;
-		let blob = ProofsBlobRef { schema_version: PROOFS_SCHEMA_VERSION, proofs };
+	async fn persist_proofs(
+		&self, proofs: Vec<ProofInfo>, writer: OwnedMutexGuard<()>,
+	) -> Result<(), DatabaseError> {
+		Self::ensure_unique_proof_ys(&proofs)?;
+		let blob = ProofsBlobRef { schema_version: PROOFS_SCHEMA_VERSION, proofs: &proofs };
 		let data =
 			serde_json::to_vec(&blob).map_err(|e| DatabaseError::Serialization(e.to_string()))?;
-
-		KVStore::write(self.store.as_ref(), CASHU_PRIMARY_KEY, PROOFS_KEY, PROOFS_BLOB_KEY, data)
-			.await
-			.map_err(DatabaseError::Io)
+		let store = Arc::clone(&self.store);
+		let cache = Arc::clone(&self.proofs_cache);
+		self.runtime
+			.persist(writer, async move {
+				KVStore::write(
+					store.as_ref(),
+					CASHU_PRIMARY_KEY,
+					PROOFS_KEY,
+					PROOFS_BLOB_KEY,
+					data,
+				)
+				.await?;
+				*cache.write().unwrap() = proofs;
+				Ok(())
+			})
+			.await?;
+		Ok(())
 	}
 
 	fn ensure_unique_proof_ys(proofs: &[ProofInfo]) -> Result<(), DatabaseError> {
@@ -778,7 +867,7 @@ impl WalletDatabase<cdk::cdk_database::Error> for CashuKvDatabase {
 	async fn update_proofs(
 		&self, added: Vec<ProofInfo>, removed_ys: Vec<PublicKey>,
 	) -> Result<(), cdk::cdk_database::Error> {
-		let _guard = self.proofs_mutation_lock.lock().await;
+		let writer = Arc::clone(&self.proofs_mutation_lock).lock_owned().await;
 		let (updated_proofs, changed) = {
 			let committed_proofs = self.proofs_cache.read().unwrap();
 			let mut updated_proofs = committed_proofs.clone();
@@ -788,8 +877,7 @@ impl WalletDatabase<cdk::cdk_database::Error> for CashuKvDatabase {
 		};
 
 		if changed {
-			self.persist_proofs(&updated_proofs).await?;
-			*self.proofs_cache.write().unwrap() = updated_proofs;
+			self.persist_proofs(updated_proofs, writer).await?;
 		}
 
 		Ok(())
@@ -838,7 +926,7 @@ impl WalletDatabase<cdk::cdk_database::Error> for CashuKvDatabase {
 	async fn update_proofs_state(
 		&self, ys: Vec<PublicKey>, state: State,
 	) -> Result<(), cdk::cdk_database::Error> {
-		let _guard = self.proofs_mutation_lock.lock().await;
+		let writer = Arc::clone(&self.proofs_mutation_lock).lock_owned().await;
 		let ys: HashSet<_> = ys.into_iter().collect();
 		let mut updated_proofs = self.proofs_cache.read().unwrap().clone();
 		let mut changed = false;
@@ -850,8 +938,7 @@ impl WalletDatabase<cdk::cdk_database::Error> for CashuKvDatabase {
 		}
 
 		if changed {
-			self.persist_proofs(&updated_proofs).await?;
-			*self.proofs_cache.write().unwrap() = updated_proofs;
+			self.persist_proofs(updated_proofs, writer).await?;
 		}
 
 		Ok(())
@@ -890,12 +977,7 @@ impl WalletDatabase<cdk::cdk_database::Error> for CashuKvDatabase {
 		&self, transaction: Transaction,
 	) -> Result<(), cdk::cdk_database::Error> {
 		let key = transaction.id().to_string();
-		let data = serde_json::to_vec(&transaction)
-			.map_err(|e| DatabaseError::Serialization(e.to_string()))?;
-
-		KVStore::write(self.store.as_ref(), CASHU_PRIMARY_KEY, TRANSACTIONS_KEY, &key, data)
-			.await
-			.map_err(DatabaseError::Io)?;
+		self.persist_transaction(key, Some(transaction)).await?;
 
 		Ok(())
 	}
@@ -903,69 +985,25 @@ impl WalletDatabase<cdk::cdk_database::Error> for CashuKvDatabase {
 	async fn get_transaction(
 		&self, transaction_id: TransactionId,
 	) -> Result<Option<Transaction>, cdk::cdk_database::Error> {
-		let key = transaction_id.to_string();
-
-		match KVStore::read(self.store.as_ref(), CASHU_PRIMARY_KEY, TRANSACTIONS_KEY, &key).await {
-			Ok(data) => {
-				if data.is_empty() {
-					return Ok(None);
-				}
-				let transaction: Transaction = serde_json::from_slice(&data)
-					.map_err(|e| DatabaseError::Serialization(e.to_string()))?;
-				Ok(Some(transaction))
-			},
-			Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
-			Err(e) => Err(DatabaseError::Io(e).into()),
-		}
+		Ok(self.transactions_cache.read().unwrap().get(&transaction_id.to_string()).cloned())
 	}
 
 	async fn list_transactions(
 		&self, mint_url: Option<MintUrl>, direction: Option<TransactionDirection>,
 		unit: Option<CurrencyUnit>,
 	) -> Result<Vec<Transaction>, cdk::cdk_database::Error> {
-		let keys = KVStore::list(self.store.as_ref(), CASHU_PRIMARY_KEY, TRANSACTIONS_KEY)
-			.await
-			.map_err(DatabaseError::Io)?;
-
-		let mut transactions = Vec::with_capacity(keys.len());
-		for key in keys {
-			let data =
-				KVStore::read(self.store.as_ref(), CASHU_PRIMARY_KEY, TRANSACTIONS_KEY, &key)
-					.await
-					.map_err(DatabaseError::Io)?;
-
-			if !data.is_empty() {
-				let transaction: Transaction = serde_json::from_slice(&data)
-					.map_err(|e| DatabaseError::Serialization(e.to_string()))?;
-
-				// Apply filters
-				let mut include = true;
-
-				if let Some(mint_url) = &mint_url {
-					if transaction.mint_url != *mint_url {
-						include = false;
-					}
-				}
-
-				if let Some(direction) = direction {
-					if transaction.direction != direction {
-						include = false;
-					}
-				}
-
-				if let Some(ref unit) = unit {
-					if transaction.unit != *unit {
-						include = false;
-					}
-				}
-
-				if include {
-					transactions.push(transaction);
-				}
-			}
-		}
-
-		Ok(transactions)
+		Ok(self
+			.transactions_cache
+			.read()
+			.unwrap()
+			.values()
+			.filter(|transaction| {
+				mint_url.as_ref().is_none_or(|mint_url| transaction.mint_url == *mint_url)
+					&& direction.is_none_or(|direction| transaction.direction == direction)
+					&& unit.as_ref().is_none_or(|unit| transaction.unit == *unit)
+			})
+			.cloned()
+			.collect())
 	}
 
 	async fn remove_transaction(
@@ -973,9 +1011,7 @@ impl WalletDatabase<cdk::cdk_database::Error> for CashuKvDatabase {
 	) -> Result<(), cdk::cdk_database::Error> {
 		let key = transaction_id.to_string();
 
-		KVStore::remove(self.store.as_ref(), CASHU_PRIMARY_KEY, TRANSACTIONS_KEY, &key, false)
-			.await
-			.map_err(DatabaseError::Io)?;
+		self.persist_transaction(key, None).await?;
 
 		Ok(())
 	}
@@ -1289,6 +1325,7 @@ pub(super) async fn write_has_recovered(
 #[cfg(test)]
 mod tests {
 	use super::*;
+	use crate::test_store::{TestStore, test_runtime};
 	use cdk::Amount;
 	use cdk::nuts::Proof;
 	use cdk::secret::Secret;
@@ -1296,6 +1333,7 @@ mod tests {
 	use std::future::ready;
 	use std::sync::Mutex as StdMutex;
 	use std::sync::atomic::{AtomicBool, Ordering};
+	use std::time::Duration;
 
 	#[derive(Default)]
 	struct ProofTestStore {
@@ -1375,6 +1413,199 @@ mod tests {
 		}
 	}
 
+	fn transaction() -> Transaction {
+		Transaction {
+			mint_url: MintUrl::from_str("https://mint.example.com").unwrap(),
+			direction: TransactionDirection::Incoming,
+			amount: Amount::from(2),
+			fee: Amount::from(0),
+			unit: CurrencyUnit::Sat,
+			ys: vec![proof_info("incoming transaction", 2).y],
+			timestamp: 1,
+			memo: None,
+			metadata: HashMap::new(),
+			quote_id: None,
+			payment_request: None,
+			payment_proof: None,
+			payment_method: None,
+			saga_id: None,
+		}
+	}
+
+	#[tokio::test]
+	async fn transaction_cache_preserves_filters_and_typed_updates() {
+		let store = TestStore::default();
+		let database = CashuKvDatabase::new(store.shared(), test_runtime()).await.unwrap();
+		let mut incoming = transaction();
+		let mut outgoing = incoming.clone();
+		outgoing.ys = vec![proof_info("outgoing transaction", 2).y];
+		outgoing.direction = TransactionDirection::Outgoing;
+		outgoing.mint_url = MintUrl::from_str("https://other-mint.example.com").unwrap();
+		database.add_transaction(incoming.clone()).await.unwrap();
+		database.add_transaction(outgoing.clone()).await.unwrap();
+		assert_eq!(database.list_transactions(None, None, None).await.unwrap().len(), 2);
+		let reads = store.reads.load(Ordering::SeqCst);
+		let lists = store.lists.load(Ordering::SeqCst);
+		assert_eq!(
+			database
+				.list_transactions(
+					Some(incoming.mint_url.clone()),
+					Some(TransactionDirection::Incoming),
+					Some(CurrencyUnit::Sat)
+				)
+				.await
+				.unwrap(),
+			vec![incoming.clone()]
+		);
+		assert!(
+			database
+				.list_transactions(
+					Some(incoming.mint_url.clone()),
+					Some(TransactionDirection::Outgoing),
+					None
+				)
+				.await
+				.unwrap()
+				.is_empty()
+		);
+		incoming.memo = Some("updated".into());
+		database.add_transaction(incoming.clone()).await.unwrap();
+		assert_eq!(database.get_transaction(incoming.id()).await.unwrap(), Some(incoming.clone()));
+		database.remove_transaction(outgoing.id()).await.unwrap();
+		assert_eq!(
+			database.list_transactions(None, None, None).await.unwrap(),
+			vec![incoming.clone()]
+		);
+		assert_eq!(store.reads.load(Ordering::SeqCst), reads);
+		assert_eq!(store.lists.load(Ordering::SeqCst), lists);
+		let reopened = CashuKvDatabase::new(store.shared(), test_runtime()).await.unwrap();
+		assert_eq!(
+			reopened.list_transactions(None, None, None).await.unwrap(),
+			vec![incoming.clone()]
+		);
+		database.remove_transaction(incoming.id()).await.unwrap();
+		assert!(database.list_transactions(None, None, None).await.unwrap().is_empty());
+	}
+
+	#[tokio::test]
+	async fn transaction_reads_remain_available_during_writes() {
+		let store = TestStore::default();
+		let database =
+			Arc::new(CashuKvDatabase::new(store.shared(), test_runtime()).await.unwrap());
+		let original = transaction();
+		database.add_transaction(original.clone()).await.unwrap();
+		let mut updated = original.clone();
+		updated.memo = Some("updated".into());
+		let mut writes = store.control_writes();
+		let writer = Arc::clone(&database);
+		let new_transaction = updated.clone();
+		let pending = tokio::spawn(async move { writer.add_transaction(new_transaction).await });
+		let finish = writes.recv().await.unwrap();
+		assert_eq!(
+			tokio::time::timeout(Duration::from_secs(1), database.get_transaction(original.id()))
+				.await
+				.unwrap()
+				.unwrap(),
+			Some(original.clone()),
+		);
+		assert_eq!(
+			tokio::time::timeout(
+				Duration::from_secs(1),
+				database.list_transactions(None, None, None)
+			)
+			.await
+			.unwrap()
+			.unwrap(),
+			vec![original],
+		);
+		finish.send(()).unwrap();
+		pending.await.unwrap().unwrap();
+		assert_eq!(database.get_transaction(updated.id()).await.unwrap(), Some(updated));
+	}
+
+	#[tokio::test]
+	async fn failed_transaction_mutations_keep_committed_objects() {
+		let store = TestStore::default();
+		let database = CashuKvDatabase::new(store.shared(), test_runtime()).await.unwrap();
+		let original = transaction();
+		store.fail_next_write.store(true, Ordering::SeqCst);
+		assert!(database.add_transaction(original.clone()).await.is_err());
+		assert!(database.get_transaction(original.id()).await.unwrap().is_none());
+		database.add_transaction(original.clone()).await.unwrap();
+		let mut updated = original.clone();
+		updated.memo = Some("updated".into());
+		store.fail_next_write.store(true, Ordering::SeqCst);
+		assert!(database.add_transaction(updated.clone()).await.is_err());
+		assert_eq!(database.get_transaction(original.id()).await.unwrap(), Some(original.clone()));
+		store.fail_next_write.store(true, Ordering::SeqCst);
+		assert!(database.remove_transaction(original.id()).await.is_err());
+		assert_eq!(database.get_transaction(original.id()).await.unwrap(), Some(original));
+		database.add_transaction(updated.clone()).await.unwrap();
+		let reopened = CashuKvDatabase::new(store.shared(), test_runtime()).await.unwrap();
+		assert_eq!(reopened.get_transaction(updated.id()).await.unwrap(), Some(updated.clone()));
+		database.remove_transaction(updated.id()).await.unwrap();
+		assert!(database.get_transaction(updated.id()).await.unwrap().is_none());
+	}
+
+	#[tokio::test]
+	async fn cancelled_transaction_caller_still_updates_cache() {
+		let store = TestStore::default();
+		let database =
+			Arc::new(CashuKvDatabase::new(store.shared(), test_runtime()).await.unwrap());
+		let transaction = transaction();
+		let mut writes = store.control_writes();
+		let writer = Arc::clone(&database);
+		let new_transaction = transaction.clone();
+		let pending = tokio::spawn(async move { writer.add_transaction(new_transaction).await });
+		let finish = writes.recv().await.unwrap();
+		pending.abort();
+		assert!(pending.await.unwrap_err().is_cancelled());
+		finish.send(()).unwrap();
+		tokio::time::timeout(Duration::from_secs(1), async {
+			while database.get_transaction(transaction.id()).await.unwrap().is_none() {
+				tokio::task::yield_now().await;
+			}
+		})
+		.await
+		.unwrap();
+		let reopened = CashuKvDatabase::new(store.shared(), test_runtime()).await.unwrap();
+		assert_eq!(
+			database.get_transaction(transaction.id()).await.unwrap(),
+			Some(transaction.clone())
+		);
+		assert_eq!(reopened.get_transaction(transaction.id()).await.unwrap(), Some(transaction));
+	}
+
+	#[tokio::test]
+	async fn transaction_cache_loads_at_startup_and_rejects_invalid_data() {
+		let store = TestStore::default();
+		let transaction = transaction();
+		let key = transaction.id().to_string();
+		let bytes = serde_json::to_vec(&transaction).unwrap();
+		KVStore::write(&store, CASHU_PRIMARY_KEY, TRANSACTIONS_KEY, &key, bytes.clone())
+			.await
+			.unwrap();
+		KVStore::write(&store, CASHU_PRIMARY_KEY, TRANSACTIONS_KEY, "empty", vec![]).await.unwrap();
+		let database = CashuKvDatabase::new(store.shared(), test_runtime()).await.unwrap();
+		let reads = store.reads.load(Ordering::SeqCst);
+		let lists = store.lists.load(Ordering::SeqCst);
+		let (first, second) = tokio::join!(
+			database.list_transactions(None, None, None),
+			database.list_transactions(None, None, None),
+		);
+		assert_eq!(first.unwrap(), vec![transaction.clone()]);
+		assert_eq!(second.unwrap(), vec![transaction.clone()]);
+		assert_eq!(store.reads.load(Ordering::SeqCst), reads);
+		assert_eq!(store.lists.load(Ordering::SeqCst), lists);
+		KVStore::write(&store, CASHU_PRIMARY_KEY, TRANSACTIONS_KEY, &key, b"invalid".to_vec())
+			.await
+			.unwrap();
+		assert!(matches!(
+			CashuKvDatabase::new(store.shared(), test_runtime()).await,
+			Err(DatabaseError::Serialization(_))
+		));
+	}
+
 	fn proof_info(secret: &str, amount: u64) -> ProofInfo {
 		let proof = Proof::new(
 			Amount::from(amount),
@@ -1438,9 +1669,47 @@ mod tests {
 	}
 
 	#[tokio::test]
+	async fn cancelled_proof_updates_commit_storage_and_cache_together() {
+		let store = TestStore::default();
+		let database =
+			Arc::new(CashuKvDatabase::new(store.shared(), test_runtime()).await.unwrap());
+		let proof = proof_info("cancelled proof update", 1);
+		let mut writes = store.control_writes();
+		let db = Arc::clone(&database);
+		let added = proof.clone();
+		let task = tokio::spawn(async move { db.update_proofs(vec![added], vec![]).await });
+		let finish = writes.recv().await.unwrap();
+		task.abort();
+		assert!(task.await.unwrap_err().is_cancelled());
+		finish.send(()).unwrap();
+		// This waits for the first writer, then performs a no-op mutation.
+		database.update_proofs(vec![], vec![]).await.unwrap();
+		assert_eq!(database.get_proofs(None, None, None, None).await.unwrap(), vec![proof.clone()]);
+		let db = Arc::clone(&database);
+		let task =
+			tokio::spawn(
+				async move { db.update_proofs_state(vec![proof.y], State::Reserved).await },
+			);
+		let finish = writes.recv().await.unwrap();
+		task.abort();
+		assert!(task.await.unwrap_err().is_cancelled());
+		finish.send(()).unwrap();
+		database.update_proofs(vec![], vec![]).await.unwrap();
+		let reopened = CashuKvDatabase::new(store.shared(), test_runtime()).await.unwrap();
+		assert_eq!(
+			database.get_proofs(None, None, None, None).await.unwrap(),
+			reopened.get_proofs(None, None, None, None).await.unwrap()
+		);
+		assert_eq!(
+			reopened.get_proofs(None, None, Some(vec![State::Reserved]), None).await.unwrap().len(),
+			1
+		);
+	}
+
+	#[tokio::test]
 	async fn concurrent_proof_updates_do_not_lose_changes() {
 		let store = Arc::new(ProofTestStore::default());
-		let database = Arc::new(CashuKvDatabase::new(store.clone()).await.unwrap());
+		let database = Arc::new(CashuKvDatabase::new(store.clone(), test_runtime()).await.unwrap());
 		let expected: Vec<_> = (0..40)
 			.map(|index| proof_info(&format!("concurrent proof {index}"), index + 1))
 			.collect();
@@ -1460,7 +1729,7 @@ mod tests {
 		assert_eq!(committed.len(), expected.len());
 		assert!(expected.iter().all(|proof| committed.contains(proof)));
 
-		let restarted = CashuKvDatabase::new(store).await.unwrap();
+		let restarted = CashuKvDatabase::new(store, test_runtime()).await.unwrap();
 		let reloaded = all_proofs(&restarted).await;
 		assert_eq!(reloaded.len(), expected.len());
 		assert!(expected.iter().all(|proof| reloaded.contains(proof)));
@@ -1469,7 +1738,7 @@ mod tests {
 	#[tokio::test]
 	async fn proof_state_updates_persist_the_committed_snapshot() {
 		let store = Arc::new(ProofTestStore::default());
-		let database = CashuKvDatabase::new(store.clone()).await.unwrap();
+		let database = CashuKvDatabase::new(store.clone(), test_runtime()).await.unwrap();
 		let updated = proof_info("state updated proof", 1);
 		let unchanged = proof_info("state unchanged proof", 2);
 		database.update_proofs(vec![updated.clone(), unchanged.clone()], vec![]).await.unwrap();
@@ -1485,14 +1754,14 @@ mod tests {
 			proofs.iter().find(|proof| proof.y == unchanged.y).unwrap().state,
 			State::Unspent
 		);
-		let restarted = CashuKvDatabase::new(store).await.unwrap();
+		let restarted = CashuKvDatabase::new(store, test_runtime()).await.unwrap();
 		assert_eq!(all_proofs(&restarted).await, proofs);
 	}
 
 	#[tokio::test]
 	async fn failed_persistence_leaves_committed_cache_unchanged() {
 		let store = Arc::new(ProofTestStore::default());
-		let database = CashuKvDatabase::new(store.clone()).await.unwrap();
+		let database = CashuKvDatabase::new(store.clone(), test_runtime()).await.unwrap();
 		let committed = proof_info("committed proof", 1);
 		let rejected = proof_info("rejected proof", 2);
 		database.update_proofs(vec![committed.clone()], vec![]).await.unwrap();
@@ -1508,7 +1777,7 @@ mod tests {
 		assert!(result.is_err());
 		assert_eq!(all_proofs(&database).await, vec![committed.clone()]);
 
-		let restarted = CashuKvDatabase::new(store).await.unwrap();
+		let restarted = CashuKvDatabase::new(store, test_runtime()).await.unwrap();
 		assert_eq!(all_proofs(&restarted).await, vec![committed]);
 	}
 
@@ -1517,7 +1786,7 @@ mod tests {
 		let store = Arc::new(ProofTestStore::default());
 		store.set_raw_proof_blob(Vec::new());
 
-		let database = CashuKvDatabase::new(store).await.unwrap();
+		let database = CashuKvDatabase::new(store, test_runtime()).await.unwrap();
 
 		assert!(all_proofs(&database).await.is_empty());
 	}
@@ -1525,14 +1794,14 @@ mod tests {
 	#[tokio::test]
 	async fn duplicate_added_proof_y_uses_the_last_proof() {
 		let store = Arc::new(ProofTestStore::default());
-		let database = CashuKvDatabase::new(store.clone()).await.unwrap();
+		let database = CashuKvDatabase::new(store.clone(), test_runtime()).await.unwrap();
 		let original = proof_info("duplicate persisted proof", 1);
 		let replacement = proof_info("duplicate persisted proof", 2);
 
 		database.update_proofs(vec![original, replacement.clone()], vec![]).await.unwrap();
 
 		assert_eq!(all_proofs(&database).await, vec![replacement.clone()]);
-		let restarted = CashuKvDatabase::new(store).await.unwrap();
+		let restarted = CashuKvDatabase::new(store, test_runtime()).await.unwrap();
 		assert_eq!(all_proofs(&restarted).await, vec![replacement]);
 	}
 
@@ -1546,7 +1815,7 @@ mod tests {
 			proofs: vec![original, duplicate],
 		});
 
-		let result = CashuKvDatabase::new(store).await;
+		let result = CashuKvDatabase::new(store, test_runtime()).await;
 
 		assert!(matches!(result, Err(DatabaseError::Duplicate)));
 	}
@@ -1556,7 +1825,7 @@ mod tests {
 		let store = Arc::new(ProofTestStore::default());
 		store.set_proof_blob(&ProofsBlob { schema_version: 2, proofs: vec![] });
 
-		let result = CashuKvDatabase::new(store).await;
+		let result = CashuKvDatabase::new(store, test_runtime()).await;
 
 		assert!(matches!(result, Err(DatabaseError::InvalidFormat)));
 	}

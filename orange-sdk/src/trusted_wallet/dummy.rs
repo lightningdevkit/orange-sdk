@@ -10,10 +10,8 @@ use bitcoin_payment_instructions::amount::Amount;
 use corepc_node::client::bitcoin::Network;
 use corepc_node::{Node as Bitcoind, get_available_port};
 use graduated_rebalancer::ReceivedLightningPayment;
-use ldk_node::lightning::ln::channelmanager;
 use ldk_node::lightning::ln::msgs::SocketAddress;
 use ldk_node::lightning_invoice::{Bolt11Invoice, Bolt11InvoiceDescription, Description};
-use ldk_node::payment::{PaymentKind, PaymentStatus};
 use ldk_node::{Event, Node};
 use rand::RngCore;
 use std::env::temp_dir;
@@ -21,7 +19,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
-use tokio::sync::{RwLock, watch};
+use tokio::sync::RwLock;
 use uuid::Uuid;
 
 /// A dummy implementation of `TrustedWalletInterface` for testing purposes.
@@ -32,7 +30,6 @@ pub(crate) struct DummyTrustedWallet {
 	current_bal_msats: Arc<AtomicU64>,
 	payments: Arc<RwLock<Vec<Payment>>>,
 	ldk_node: Arc<Node>,
-	payment_success_flag: watch::Receiver<()>,
 }
 
 #[derive(Clone)]
@@ -84,8 +81,6 @@ impl DummyTrustedWallet {
 		let current_bal_msats = Arc::new(AtomicU64::new(0));
 		let payments: Arc<RwLock<Vec<Payment>>> = Arc::new(RwLock::new(vec![]));
 
-		let (payment_success_sender, payment_success_flag) = watch::channel(());
-
 		let events_ref = Arc::clone(&ldk_node);
 		let bal = Arc::clone(&current_bal_msats);
 		let pays = Arc::clone(&payments);
@@ -101,7 +96,11 @@ impl DummyTrustedWallet {
 						bolt12_invoice: _,
 					} => {
 						// convert id
-						let id = mangle_payment_id(payment_id.unwrap().0);
+						let id = mangle_payment_id(payment_id.0);
+						event_queue.rebalance_watchers.sent(
+							payment_hash.0,
+							Some(ReceivedLightningPayment { id, fee_paid_msat }),
+						);
 
 						let mut payments = pays.write().await;
 						let item = payments.iter_mut().find(|p| p.id == id);
@@ -137,12 +136,13 @@ impl DummyTrustedWallet {
 								.await
 								.unwrap();
 						}
-
-						payment_success_sender.send(()).unwrap();
 					},
 					Event::PaymentFailed { payment_id, payment_hash, reason } => {
 						// convert id
-						let id = mangle_payment_id(payment_id.unwrap().0);
+						let id = mangle_payment_id(payment_id.0);
+						if let Some(hash) = payment_hash {
+							event_queue.rebalance_watchers.sent(hash.0, None);
+						}
 
 						let mut payments = pays.write().await;
 						let item = payments.iter().cloned().enumerate().find(|(_, p)| p.id == id);
@@ -169,12 +169,10 @@ impl DummyTrustedWallet {
 								.await
 								.unwrap();
 						}
-
-						let _ = payment_success_sender.send(());
 					},
 					Event::PaymentReceived { payment_id, amount_msat, payment_hash, .. } => {
 						// convert id
-						let id = mangle_payment_id(payment_id.unwrap().0);
+						let id = mangle_payment_id(payment_id.0);
 
 						let mut payments = pays.write().await;
 						// We create invoices on the fly without adding the payment to our list
@@ -321,11 +319,7 @@ impl DummyTrustedWallet {
 			);
 		}
 
-		DummyTrustedWallet { current_bal_msats, payments, ldk_node, payment_success_flag }
-	}
-
-	fn payment_wait_timeout() -> Duration {
-		if std::env::var("CI").is_ok() { Duration::from_secs(120) } else { Duration::from_secs(20) }
+		DummyTrustedWallet { current_bal_msats, payments, ldk_node }
 	}
 }
 
@@ -492,43 +486,6 @@ impl TrustedWalletInterface for DummyTrustedWallet {
 			});
 
 			Ok(id)
-		})
-	}
-
-	fn await_payment_success(
-		&self, payment_hash: [u8; 32],
-	) -> Pin<Box<dyn Future<Output = Option<ReceivedLightningPayment>> + Send + '_>> {
-		Box::pin(async move {
-			let id = channelmanager::PaymentId(payment_hash);
-			let mut flag = self.payment_success_flag.clone();
-			flag.mark_unchanged();
-			loop {
-				if let Some(payment) = self.ldk_node.payment(&id) {
-					let counterparty_skimmed_fee_msat = match payment.kind {
-						PaymentKind::Bolt11 { hash, counterparty_skimmed_fee_msat, .. } => {
-							debug_assert!(hash.0 == payment_hash, "Payment Hash mismatch");
-							counterparty_skimmed_fee_msat
-						},
-						_ => return None, /* Ignore other payment kinds, we only care about the one we just sent. */
-					};
-					match payment.status {
-						PaymentStatus::Succeeded => {
-							return Some(ReceivedLightningPayment {
-								id: payment.id.0,
-								fee_paid_msat: counterparty_skimmed_fee_msat,
-							});
-						},
-						PaymentStatus::Pending => {},
-						PaymentStatus::Failed => return None,
-					}
-				}
-				if !matches!(
-					tokio::time::timeout(Self::payment_wait_timeout(), flag.changed()).await,
-					Ok(Ok(()))
-				) {
-					return None;
-				}
-			}
 		})
 	}
 

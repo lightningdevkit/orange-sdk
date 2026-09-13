@@ -11,3 +11,6 @@ bitcoin-payment-instructions = { workspace = true }
 lightning = { workspace = true }
 lightning-invoice = { workspace = true }
 tokio = { version = "1", default-features = false, features = ["sync"] }
+
+[dev-dependencies]
+tokio = { version = "1", default-features = false, features = ["macros", "rt", "time"] }
