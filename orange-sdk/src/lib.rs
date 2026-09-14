@@ -839,6 +839,9 @@ impl Wallet {
 	}
 
 	/// Lists the transactions which have been made.
+	/// Submitted payments include pending and confirmed failed sends across backends.
+	/// Errors before submission, such as invoice validation or quote preparation failures,
+	/// do not create history entries. An uncertain send outcome remains pending.
 	pub async fn list_transactions(&self) -> Result<Vec<Transaction>, WalletError> {
 		let (trusted_payments, splice_outs) = tokio::join!(
 			self.inner.trusted.list_payments(),
@@ -1340,9 +1343,11 @@ impl Wallet {
 					let res = self.inner.trusted.pay(method, instructions.amount).await;
 					match res {
 						Ok(id) => {
+							// A backend that is already paying this request returns the
+							// in-flight payment's id, so the entry may already exist.
 							self.inner
 								.tx_metadata
-								.insert(
+								.upsert(
 									PaymentId::Trusted(id),
 									TxMetadata {
 										ty: TxType::Payment { ty: ty() },
@@ -1581,6 +1586,20 @@ impl Wallet {
 		);
 
 		let payment_hash = invoice.payment_hash();
+
+		// The lightning leg would be rejected as a duplicate if this invoice is already being
+		// paid or has been paid. Check before the trusted leg goes out, since that leg cannot be
+		// recalled and would only fail once the receiver's MPP timeout expires. This is best
+		// effort; ldk-node still rejects a duplicate the check does not see.
+		if self
+			.inner
+			.ln_wallet
+			.recent_outbound_bolt11(payment_hash)?
+			.is_some_and(|p| matches!(p.status, PaymentStatus::Pending | PaymentStatus::Succeeded))
+		{
+			return Err(WalletError::LdkNodeFailure(NodeError::DuplicatePayment));
+		}
+
 		self.inner.event_queue.begin_mpp_setup(payment_hash).await;
 
 		// Pay the trusted portion first; the receiver will hold it until the lightning portion
@@ -1607,23 +1626,27 @@ impl Wallet {
 			Ok(id) => id,
 			Err(e) => {
 				log_error!(self.inner.logger, "Failed to send lightning MPP portion: {e:?}");
-				// The lightning leg failed synchronously, so nothing is in flight — but
-				// ldk-node has still recorded a failed outbound payment for it, keyed by
-				// the invoice's payment hash. Remove that record: it is an internal MPP
-				// leg, not an independent payment, and the attempt is surfaced through
-				// the trusted leg below.
-				use ldk_node::lightning::ln::channelmanager::PaymentId as LdkPaymentId;
-				if let Err(remove_err) = self
-					.inner
-					.ln_wallet
-					.inner
-					.ldk_node
-					.remove_payment(&LdkPaymentId(payment_hash.0))
-				{
-					log_error!(
-						self.inner.logger,
-						"Failed to remove failed MPP lightning leg record: {remove_err:?}"
-					);
+				// Only remove a failed leg. DuplicatePayment refers to an existing payment
+				// and must never delete its pending or completed history.
+				let failed_leg = if e == NodeError::DuplicatePayment {
+					None
+				} else {
+					self.inner
+						.ln_wallet
+						.recent_outbound_bolt11(payment_hash)
+						.ok()
+						.flatten()
+						.filter(|p| p.status == PaymentStatus::Failed)
+				};
+				if let Some(leg) = failed_leg {
+					if let Err(remove_err) =
+						self.inner.ln_wallet.inner.ldk_node.remove_payment(&leg.id)
+					{
+						log_error!(
+							self.inner.logger,
+							"Failed to remove failed MPP leg: {remove_err:?}"
+						);
+					}
 				}
 				// The trusted leg is already in flight but there will be no lightning leg to
 				// complete the MPP. Record it as a plain payment so its eventual (failed) terminal

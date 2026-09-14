@@ -1,5 +1,6 @@
 //! An implementation of `TrustedWalletInterface` using the Cashu (CDK) SDK.
 
+use super::payment_store::PaymentStore;
 use crate::logging::Logger;
 use crate::runtime::Runtime;
 use crate::store::{PaymentId, TxMetadataStore, TxStatus};
@@ -11,7 +12,7 @@ use ldk_node::bitcoin::hashes::Hash;
 use ldk_node::bitcoin::hashes::sha256::Hash as Sha256;
 use ldk_node::bitcoin::hex::FromHex;
 use ldk_node::lightning::util::logger::Logger as _;
-use ldk_node::lightning::{log_error, log_info};
+use ldk_node::lightning::{log_debug, log_error, log_info, log_warn};
 use ldk_node::lightning_invoice::Bolt11Invoice;
 use ldk_node::lightning_types::payment::{PaymentHash, PaymentPreimage};
 
@@ -23,20 +24,21 @@ use cdk::nuts::MeltOptions;
 use cdk::nuts::nut00::PaymentMethod as CdkPaymentMethod;
 use cdk::nuts::nut23::Amountless;
 use cdk::nuts::{CurrencyUnit, MeltQuoteState};
-use cdk::wallet::MintQuote;
+use cdk::types::FinalizedMelt;
 use cdk::wallet::Wallet;
 use cdk::wallet::types::{Transaction, TransactionDirection};
+use cdk::wallet::{MeltQuote, MintQuote};
 use cdk::{Amount as CdkAmount, StreamExt};
 
 use graduated_rebalancer::ReceivedLightningPayment;
 
-use tokio::sync::{mpsc, watch};
+use tokio::sync::{Notify, RwLock, mpsc, watch};
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::pin::Pin;
 use std::str::FromStr;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 /// Cashu KV store implementation
@@ -58,6 +60,7 @@ pub struct CashuConfig {
 /// A wallet implementation using the Cashu (CDK) SDK.
 #[derive(Clone)]
 pub struct Cashu {
+	melt: Arc<MeltContext>,
 	cashu_wallet: Arc<Wallet>,
 	unit: CurrencyUnit,
 	shutdown_sender: watch::Sender<()>,
@@ -65,8 +68,6 @@ pub struct Cashu {
 	supports_bolt12: Arc<std::sync::atomic::AtomicBool>,
 	supports_mpp: Arc<std::sync::atomic::AtomicBool>,
 	mint_quote_sender: mpsc::Sender<MintQuote>,
-	event_queue: Arc<EventQueue>,
-	tx_metadata: TxMetadataStore,
 	runtime: Arc<Runtime>,
 	npubcash_url: Option<String>,
 	npub: Option<String>,
@@ -184,7 +185,7 @@ impl TrustedWalletInterface for Cashu {
 				.map(|t| Self::convert_transaction_to_payment(t, &self.unit))
 				.collect::<Result<Vec<_>, _>>()?;
 
-			Ok(payments)
+			Ok(self.melt.payments.merge(payments).await)
 		})
 	}
 
@@ -316,8 +317,7 @@ impl TrustedWalletInterface for Cashu {
 			// We'll use the quote ID as the payment identifier
 			let payment_id = Self::id_to_32_byte_array(&quote.id);
 
-			// Execute the melt in a background task; do not block on it succeeding/failing.
-			self.spawn_melt(quote.id.clone(), payment_id, payment_hash);
+			self.start_melt(&quote, payment_id, amount, payment_hash).await?;
 
 			Ok(payment_id)
 		})
@@ -354,7 +354,7 @@ impl TrustedWalletInterface for Cashu {
 				})?;
 
 			let payment_id = Self::id_to_32_byte_array(&quote.id);
-			self.spawn_melt(quote.id.clone(), payment_id, payment_hash);
+			self.start_melt(&quote, payment_id, partial_amount, payment_hash).await?;
 			Ok(payment_id)
 		})
 	}
@@ -430,6 +430,7 @@ impl Cashu {
 			},
 		};
 
+		let payments = Arc::new(PaymentStore::new(Arc::clone(&store), Arc::clone(&logger)).await?);
 		let db = Arc::new(
 			CashuKvDatabase::new(Arc::clone(&store), Arc::clone(&runtime)).await.map_err(|e| {
 				InitFailure::TrustedFailure(TrustedError::Other(format!(
@@ -476,6 +477,49 @@ impl Cashu {
 		}
 
 		let (shutdown_sender, mut shutdown_receiver) = watch::channel::<()>(());
+
+		let melt = Arc::new(MeltContext {
+			payments,
+			in_flight: Mutex::new(HashSet::new()),
+			gate: RwLock::new(()),
+			reconcile: Notify::new(),
+			event_queue: Arc::clone(&event_queue),
+			tx_metadata: tx_metadata.clone(),
+			unit: cashu_config.unit.clone(),
+			logger: Arc::clone(&logger),
+		});
+
+		// Resolve melts whose outcome was unknown when the process last stopped, or whose
+		// request failed in a way that does not prove the mint did not pay. The task wakes up
+		// when a melt ends without a definite result and backs off while anything is unresolved.
+		let melt_for_reconcile = Arc::clone(&melt);
+		let wallet_for_reconcile = Arc::clone(&cashu_wallet);
+		let mut shutdown_for_reconcile = shutdown_sender.subscribe();
+		runtime.spawn_cancellable_background_task(async move {
+			const MIN_BACKOFF: Duration = Duration::from_secs(30);
+			const MAX_BACKOFF: Duration = Duration::from_secs(10 * 60);
+			let mut backoff = MIN_BACKOFF;
+			loop {
+				let unresolved = melt_for_reconcile.reconcile(&wallet_for_reconcile).await;
+				let notified = melt_for_reconcile.reconcile.notified();
+				if unresolved == 0 {
+					backoff = MIN_BACKOFF;
+					tokio::select! {
+						_ = shutdown_for_reconcile.changed() => return,
+						_ = notified => {},
+					}
+				} else {
+					tokio::select! {
+						_ = shutdown_for_reconcile.changed() => return,
+						// A melt just ended without a result; check it promptly.
+						_ = notified => backoff = MIN_BACKOFF,
+						_ = tokio::time::sleep(backoff) => {
+							backoff = (backoff * 2).min(MAX_BACKOFF);
+						},
+					}
+				}
+			}
+		});
 
 		// Create channel for mint quote monitoring with bounded capacity
 		let (mint_quote_sender, mut mint_quote_receiver) = mpsc::channel::<MintQuote>(32);
@@ -611,6 +655,7 @@ impl Cashu {
 		}
 
 		Ok(Cashu {
+			melt,
 			cashu_wallet,
 			unit: cashu_config.unit,
 			shutdown_sender,
@@ -618,8 +663,6 @@ impl Cashu {
 			supports_bolt12,
 			supports_mpp,
 			mint_quote_sender,
-			event_queue,
-			tx_metadata,
 			runtime,
 			npubcash_url,
 			npub,
@@ -642,6 +685,40 @@ impl Cashu {
 		encode::<Bech32>(hrp, &xonly.serialize()).map_err(|e| format!("bech32 encode: {e}"))
 	}
 
+	/// Persists the attempt, then melts the quote unless it is already in flight.
+	///
+	/// A quote the mint still lists as unpaid can be melted again after a transient error; the
+	/// CDK and the mint reject a quote that is actually being paid. A quote that is pending at the
+	/// mint is left to the reconciliation task, which reports its final outcome.
+	async fn start_melt(
+		&self, quote: &MeltQuote, payment_id: [u8; 32], amount: Amount,
+		payment_hash: Option<PaymentHash>,
+	) -> Result<(), TrustedError> {
+		if quote.state == MeltQuoteState::Unpaid {
+			// Register before persisting so reconciliation never sees this payment as abandoned.
+			if !self.melt.in_flight.lock().unwrap().insert(payment_id) {
+				log_debug!(self.logger, "Melt for quote {} is already in flight", quote.id);
+				return Ok(());
+			}
+			let reference = Some(quote.id.clone());
+			if let Err(e) = self.melt.payments.insert_pending(payment_id, amount, reference).await {
+				self.melt.in_flight.lock().unwrap().remove(&payment_id);
+				return Err(e);
+			}
+			self.spawn_melt(quote.id.clone(), payment_id, payment_hash);
+		} else {
+			self.melt.payments.insert_pending(payment_id, amount, Some(quote.id.clone())).await?;
+			log_info!(
+				self.logger,
+				"Quote {} is {}; waiting for its outcome instead of melting again",
+				quote.id,
+				quote.state
+			);
+			self.melt.reconcile.notify_one();
+		}
+		Ok(())
+	}
+
 	/// Executes a previously-created melt quote in a background task, emitting a
 	/// [`PaymentSuccessful`] or [`PaymentFailed`] event when it completes. The payment is not
 	/// awaited; this only kicks off the melt.
@@ -652,164 +729,28 @@ impl Cashu {
 		&self, quote_id: String, payment_id: [u8; 32], payment_hash: Option<PaymentHash>,
 	) {
 		let cashu_wallet = Arc::clone(&self.cashu_wallet);
-		let logger = Arc::clone(&self.logger);
-		let event_queue = Arc::clone(&self.event_queue);
-		let tx_metadata = self.tx_metadata.clone();
-		let unit = self.unit.clone();
+		let melt = Arc::clone(&self.melt);
 		self.runtime.spawn_background_task(async move {
+			let gate = melt.gate.read().await;
 			let mut metadata = HashMap::new();
 			if let Some(hash) = &payment_hash {
 				metadata.insert(PAYMENT_HASH_METADATA_KEY.to_string(), hash.to_string());
 			}
 
+			let mut submitted = false;
 			let melt_result = async {
 				let prepared = cashu_wallet.prepare_melt(&quote_id, metadata).await?;
+				submitted = true;
 				prepared.confirm().await
 			}
 			.await;
-			let fee_paid_msat = melt_result
-				.as_ref()
-				.ok()
-				.and_then(|res| convert_amount(res.fee_paid(), &unit).ok())
-				.map(|fee| fee.milli_sats());
-			// confirm() waits for a terminal result. Wake registered rebalances even
-			// when their public payment event is suppressed or cannot be persisted.
-			if let Some(hash) = payment_hash {
-				let receipt = melt_result
-					.as_ref()
-					.ok()
-					.filter(|res| res.state() == MeltQuoteState::Paid)
-					.map(|_| ReceivedLightningPayment { id: payment_id, fee_paid_msat });
-				event_queue.rebalance_watchers.sent(hash.0, receipt);
-			}
-			match melt_result {
-				Ok(res) => {
-					match res.state() {
-						MeltQuoteState::Paid => {
-							log_info!(logger, "Successfully sent for quote: {quote_id}");
-
-							let payment_id = PaymentId::Trusted(payment_id);
-							let is_rebalance = {
-								let map = tx_metadata.read();
-								map.get(&payment_id).is_some_and(|m| m.ty.is_rebalance())
-							};
-							if is_rebalance {
-								return;
-							}
-
-							let preimage: Option<PaymentPreimage> = match res.payment_proof() {
-								Some(str) => match FromHex::from_hex(str) {
-									Ok(b) => Some(PaymentPreimage(b)),
-									Err(e) => {
-										log_error!(
-											logger,
-											"Failed to decode preimage ({:?}) for quote {quote_id}: {e}",
-											res.payment_proof()
-										);
-										None
-									},
-								},
-								None => {
-									// Expected for same-mint payments: when the melt's
-									// bolt11 destination is a mint quote on this same
-									// mint, cdk-mintd settles internally — no Lightning
-									// payment occurs, so there is no preimage to return.
-									// The success path below already tolerates None
-									// (hash falls back to the invoice payment_hash).
-									log_info!(
-										logger,
-										"Melt for quote {quote_id} settled without a preimage (internal/same-mint settlement)"
-									);
-									None
-								},
-							};
-
-							let hash = match payment_hash {
-								Some(hash) => hash,
-								None => {
-									match preimage {
-										Some(pre) => {
-											let hash = Sha256::hash(&pre.0);
-											PaymentHash(hash.to_byte_array())
-										},
-										None => {
-											log_error!(
-												logger,
-												"Melt succeeded but no payment hash or preimage for quote: {quote_id}"
-											);
-											PaymentHash([0u8; 32]) // Placeholder, should not happen
-										},
-									}
-								},
-							};
-
-							let payment_preimage = preimage.unwrap_or(PaymentPreimage([0u8; 32]));
-
-							if tx_metadata
-								.set_preimage(payment_id, payment_preimage.0)
-								.await
-								.is_err()
-							{
-								log_error!(
-									logger,
-									"Failed to set preimage for payment {payment_id:?}"
-								);
-							}
-
-							let _ = event_queue
-								.add_event(Event::PaymentSuccessful {
-									payment_id,
-									payment_hash: hash,
-									payment_preimage,
-									fee_paid_msat,
-								})
-								.await;
-						},
-						MeltQuoteState::Failed => {
-							log_error!(logger, "Melt failed for quote: {quote_id}");
-							let payment_id = PaymentId::Trusted(payment_id);
-							let is_rebalance = {
-								let map = tx_metadata.read();
-								map.get(&payment_id).is_some_and(|m| m.ty.is_rebalance())
-							};
-
-							if !is_rebalance {
-								let _ = event_queue
-									.add_event(Event::PaymentFailed {
-										payment_id,
-										payment_hash,
-										reason: None,
-									})
-									.await;
-							}
-						},
-						state => {
-							log_error!(
-								logger,
-								"Melt in unknown state {state} for quote: {quote_id}"
-							);
-							// todo should we watch for it to complete?
-						},
-					}
-				},
-				Err(e) => {
-					log_error!(logger, "Failed to melt quote {quote_id}: {e}");
-					let payment_id = PaymentId::Trusted(payment_id);
-					let is_rebalance = {
-						let map = tx_metadata.read();
-						map.get(&payment_id).is_some_and(|m| m.ty.is_rebalance())
-					};
-
-					if !is_rebalance {
-						let _ = event_queue
-							.add_event(Event::PaymentFailed {
-								payment_id,
-								payment_hash,
-								reason: None,
-							})
-							.await;
-					}
-				},
+			let resolved = melt
+				.handle_melt_result(&quote_id, payment_id, payment_hash, melt_result, submitted)
+				.await;
+			melt.in_flight.lock().unwrap().remove(&payment_id);
+			drop(gate);
+			if !resolved {
+				melt.reconcile.notify_one();
 			}
 		});
 	}
@@ -947,6 +888,279 @@ impl Cashu {
 	}
 }
 
+/// State shared between melt tasks and the reconciliation task.
+struct MeltContext {
+	payments: Arc<PaymentStore>,
+	/// Payment IDs with a melt running in this process.
+	in_flight: Mutex<HashSet<[u8; 32]>>,
+	/// Melt tasks hold this shared; reconciliation holds it exclusively so it never touches a
+	/// saga while the melt that owns it is running.
+	gate: RwLock<()>,
+	/// Wakes the reconciliation task after a melt ended without a definite outcome.
+	reconcile: Notify,
+	event_queue: Arc<EventQueue>,
+	tx_metadata: TxMetadataStore,
+	unit: CurrencyUnit,
+	logger: Arc<Logger>,
+}
+
+impl MeltContext {
+	/// Records the result of a melt request. Returns whether the outcome is final.
+	async fn handle_melt_result(
+		&self, quote_id: &str, payment_id: [u8; 32], payment_hash: Option<PaymentHash>,
+		result: Result<FinalizedMelt, cdk::Error>, submitted: bool,
+	) -> bool {
+		match result {
+			Ok(res) => self.handle_melt_outcome(quote_id, payment_id, payment_hash, &res).await,
+			Err(e) => {
+				log_error!(self.logger, "Failed to melt quote {quote_id}: {e}");
+				if matches!(e, cdk::Error::PendingQuote | cdk::Error::PaidQuote)
+					|| (submitted && !melt_was_rejected(&e))
+				{
+					// The mint may have paid despite this error. Keep history pending.
+					return false;
+				}
+				self.melt_failed(payment_id, payment_hash).await;
+				true
+			},
+		}
+	}
+
+	/// Records the mint's answer for a melt. Returns whether the outcome is final.
+	async fn handle_melt_outcome(
+		&self, quote_id: &str, payment_id: [u8; 32], payment_hash: Option<PaymentHash>,
+		res: &FinalizedMelt,
+	) -> bool {
+		match res.state() {
+			MeltQuoteState::Paid => {
+				log_info!(self.logger, "Successfully sent for quote: {quote_id}");
+				self.melt_succeeded(quote_id, payment_id, payment_hash, res).await;
+				true
+			},
+			// The CDK reports a melt it compensated without ever executing as unpaid.
+			MeltQuoteState::Failed | MeltQuoteState::Unpaid => {
+				log_error!(self.logger, "Melt failed for quote: {quote_id}");
+				self.melt_failed(payment_id, payment_hash).await;
+				true
+			},
+			state => {
+				log_info!(self.logger, "Melt still {state} for quote: {quote_id}");
+				false
+			},
+		}
+	}
+
+	async fn melt_succeeded(
+		&self, quote_id: &str, payment_id: [u8; 32], payment_hash: Option<PaymentHash>,
+		res: &FinalizedMelt,
+	) {
+		let first_report = self.payments.mark_completed(payment_id).await.unwrap_or_else(|e| {
+			log_error!(self.logger, "Failed to save payment success: {e}");
+			true
+		});
+		let fee_paid_msat =
+			convert_amount(res.fee_paid(), &self.unit).ok().map(|fee| fee.milli_sats());
+		// Wake registered rebalances even when their public payment event is suppressed or
+		// cannot be persisted. The watcher ignores a repeated report itself.
+		if let Some(hash) = payment_hash {
+			let receipt = ReceivedLightningPayment { id: payment_id, fee_paid_msat };
+			self.event_queue.rebalance_watchers.sent(hash.0, Some(receipt));
+		}
+		if !first_report {
+			log_debug!(self.logger, "Success of quote {quote_id} was already reported");
+			return;
+		}
+		let payment_id = PaymentId::Trusted(payment_id);
+		let is_rebalance = {
+			let map = self.tx_metadata.read();
+			map.get(&payment_id).is_some_and(|m| m.ty.is_rebalance())
+		};
+		if is_rebalance {
+			return;
+		}
+
+		let preimage: Option<PaymentPreimage> = match res.payment_proof() {
+			Some(str) => match FromHex::from_hex(str) {
+				Ok(b) => Some(PaymentPreimage(b)),
+				Err(e) => {
+					log_error!(
+						self.logger,
+						"Failed to decode preimage ({:?}) for quote {quote_id}: {e}",
+						res.payment_proof()
+					);
+					None
+				},
+			},
+			None => {
+				// Expected for same-mint payments: when the melt's bolt11 destination is a
+				// mint quote on this same mint, cdk-mintd settles internally. No Lightning
+				// payment occurs, so there is no preimage to return. The success path below
+				// already tolerates None (hash falls back to the invoice payment_hash).
+				log_info!(
+					self.logger,
+					"Melt for quote {quote_id} settled without a preimage (internal/same-mint settlement)"
+				);
+				None
+			},
+		};
+
+		let hash = match payment_hash {
+			Some(hash) => hash,
+			None => match preimage {
+				Some(pre) => {
+					let hash = Sha256::hash(&pre.0);
+					PaymentHash(hash.to_byte_array())
+				},
+				None => {
+					log_error!(
+						self.logger,
+						"Melt succeeded but no payment hash or preimage for quote: {quote_id}"
+					);
+					PaymentHash([0u8; 32]) // Placeholder, should not happen
+				},
+			},
+		};
+
+		let payment_preimage = preimage.unwrap_or(PaymentPreimage([0u8; 32]));
+
+		if self.tx_metadata.set_preimage(payment_id, payment_preimage.0).await.is_err() {
+			log_error!(self.logger, "Failed to set preimage for payment {payment_id:?}");
+		}
+
+		let _ = self
+			.event_queue
+			.add_event(Event::PaymentSuccessful {
+				payment_id,
+				payment_hash: hash,
+				payment_preimage,
+				fee_paid_msat,
+			})
+			.await;
+	}
+
+	async fn melt_failed(&self, payment_id: [u8; 32], payment_hash: Option<PaymentHash>) {
+		let first_report = self.payments.mark_failed(payment_id).await.unwrap_or_else(|e| {
+			log_error!(self.logger, "Failed to save payment failure: {e}");
+			true
+		});
+		if let Some(hash) = payment_hash {
+			self.event_queue.rebalance_watchers.sent(hash.0, None);
+		}
+		if !first_report {
+			log_debug!(self.logger, "Failure of payment {payment_id:?} was already reported");
+			return;
+		}
+		let payment_id = PaymentId::Trusted(payment_id);
+		let is_rebalance = {
+			let map = self.tx_metadata.read();
+			map.get(&payment_id).is_some_and(|m| m.ty.is_rebalance())
+		};
+		if !is_rebalance {
+			let _ = self
+				.event_queue
+				.add_event(Event::PaymentFailed { payment_id, payment_hash, reason: None })
+				.await;
+		}
+	}
+
+	/// Resolves melts with an unknown outcome. Returns how many remain unresolved.
+	///
+	/// Interrupted melts are finalized through the CDK's saga log, which asks the mint and
+	/// either recovers the change or releases the reserved proofs. Submitted payments the CDK
+	/// has no saga for are checked against the mint directly. Melts running in this process
+	/// are left alone so the two paths cannot race on the same quote.
+	async fn reconcile(&self, wallet: &Wallet) -> usize {
+		let mut unresolved = 0;
+		let Ok(_gate) = self.gate.try_write() else {
+			return 1;
+		};
+		match wallet.finalize_pending_melts().await {
+			Ok(finalized) => {
+				for melt in finalized {
+					let quote_id = melt.quote_id().to_owned();
+					let payment_id = Cashu::id_to_32_byte_array(&quote_id);
+					let payment_hash = quote_payment_hash(wallet, &quote_id).await;
+					if !self.handle_melt_outcome(&quote_id, payment_id, payment_hash, &melt).await {
+						unresolved += 1;
+					}
+				}
+			},
+			Err(e) => {
+				log_error!(self.logger, "Failed to finalize pending melts: {e}");
+				unresolved += 1;
+			},
+		}
+
+		let pending = self.payments.pending().await;
+		if pending.is_empty() {
+			return unresolved;
+		}
+		// Quotes with an incomplete saga belong to the CDK; the pass above settles those.
+		let saga_quotes: HashSet<String> = match wallet.localstore.get_incomplete_sagas().await {
+			Ok(sagas) => sagas.into_iter().filter_map(|saga| saga.quote_id).collect(),
+			Err(e) => {
+				log_error!(self.logger, "Failed to load incomplete sagas: {e}");
+				return unresolved + pending.len();
+			},
+		};
+		for (payment_id, reference) in pending {
+			if self.in_flight.lock().unwrap().contains(&payment_id) {
+				continue;
+			}
+			let Some(quote_id) = reference else {
+				log_warn!(self.logger, "No melt quote for pending payment {payment_id:?}");
+				unresolved += 1;
+				continue;
+			};
+			if saga_quotes.contains(&quote_id) {
+				unresolved += 1;
+				continue;
+			}
+			let quote = match wallet.localstore.get_melt_quote(&quote_id).await {
+				Ok(Some(quote)) => quote,
+				Ok(None) => {
+					log_warn!(self.logger, "Melt quote {quote_id} is missing");
+					unresolved += 1;
+					continue;
+				},
+				Err(e) => {
+					log_warn!(self.logger, "Failed to load melt quote {quote_id}: {e}");
+					unresolved += 1;
+					continue;
+				},
+			};
+			let payment_hash =
+				Bolt11Invoice::from_str(&quote.request).ok().map(|i| i.payment_hash());
+			let status = match wallet.check_melt_quote_status(&quote.id).await {
+				Ok(status) => status,
+				Err(e) => {
+					log_warn!(self.logger, "Failed to check melt quote {}: {e}", quote.id);
+					unresolved += 1;
+					continue;
+				},
+			};
+			let outcome = FinalizedMelt::new(
+				quote.id.clone(),
+				status.state,
+				status.payment_preimage.clone(),
+				status.amount,
+				CdkAmount::ZERO,
+				None,
+			);
+			if !self.handle_melt_outcome(&quote.id, payment_id, payment_hash, &outcome).await {
+				unresolved += 1;
+			}
+		}
+		unresolved
+	}
+}
+
+/// The payment hash of the invoice a melt quote pays, when it is a BOLT 11 invoice.
+async fn quote_payment_hash(wallet: &Wallet, quote_id: &str) -> Option<PaymentHash> {
+	let quote = wallet.localstore.get_melt_quote(quote_id).await.ok().flatten()?;
+	Bolt11Invoice::from_str(&quote.request).ok().map(|i| i.payment_hash())
+}
+
 fn convert_amount(cdk_amount: CdkAmount, unit: &CurrencyUnit) -> Result<Amount, TrustedError> {
 	match unit {
 		CurrencyUnit::Sat => {
@@ -958,6 +1172,35 @@ fn convert_amount(cdk_amount: CdkAmount, unit: &CurrencyUnit) -> Result<Amount, 
 		unit => {
 			Err(TrustedError::Other(format!("Unsupported currency unit {unit} for Cashu wallet")))
 		},
+	}
+}
+
+fn melt_was_rejected(error: &cdk::Error) -> bool {
+	matches!(
+		error,
+		cdk::Error::PaymentFailed
+			| cdk::Error::InsufficientFunds
+			| cdk::Error::InvalidInvoice
+			| cdk::Error::ExpiredQuote(_, _)
+			| cdk::Error::AmountOutofLimitRange(_, _, _)
+			| cdk::Error::MeltingDisabled
+			| cdk::Error::UnsupportedUnit
+			| cdk::Error::MaxFeeExceeded
+	)
+}
+
+#[cfg(test)]
+mod melt_error_tests {
+	use super::*;
+
+	#[test]
+	fn ambiguous_melt_errors_are_not_failures() {
+		assert!(melt_was_rejected(&cdk::Error::PaymentFailed));
+		assert!(melt_was_rejected(&cdk::Error::InsufficientFunds));
+		assert!(!melt_was_rejected(&cdk::Error::Timeout));
+		assert!(!melt_was_rejected(&cdk::Error::PendingQuote));
+		assert!(!melt_was_rejected(&cdk::Error::PaidQuote));
+		assert!(!melt_was_rejected(&cdk::Error::Internal));
 	}
 }
 
@@ -991,6 +1234,16 @@ mod tests {
 		let db =
 			Arc::new(CashuKvDatabase::new(store.shared(), Arc::clone(&runtime)).await.unwrap());
 		let wallet = Cashu {
+			melt: Arc::new(MeltContext {
+				payments: Arc::new(PaymentStore::new(store.shared(), test_logger()).await.unwrap()),
+				in_flight: Mutex::new(HashSet::new()),
+				gate: RwLock::new(()),
+				reconcile: Notify::new(),
+				event_queue: Arc::clone(&event_queue),
+				tx_metadata,
+				unit: CurrencyUnit::Sat,
+				logger: test_logger(),
+			}),
 			cashu_wallet: Arc::new(
 				Wallet::new("http://127.0.0.1:1", CurrencyUnit::Sat, db, [1; 64], None).unwrap(),
 			),
@@ -1001,8 +1254,6 @@ mod tests {
 			supports_bolt12: Arc::new(AtomicBool::new(false)),
 			supports_mpp: Arc::new(AtomicBool::new(false)),
 			mint_quote_sender: mpsc::channel(1).0,
-			event_queue: Arc::clone(&event_queue),
-			tx_metadata,
 			runtime: Arc::clone(&runtime),
 			npubcash_url: None,
 			npub: None,

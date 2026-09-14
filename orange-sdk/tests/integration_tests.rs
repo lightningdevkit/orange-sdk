@@ -2078,6 +2078,55 @@ async fn test_failed_lightning_send_is_surfaced() {
 	.await;
 }
 
+#[cfg(feature = "_cashu-tests")]
+#[tokio::test(flavor = "multi_thread")]
+#[test_log::test]
+async fn test_failed_cashu_send_is_surfaced() {
+	test_utils::run_test(|params| async move {
+		let wallet = &params.wallet;
+		let funded = Amount::from_sats(500).unwrap();
+		let uri = wallet.get_single_use_receive_uri(Some(funded)).await.unwrap();
+		assert!(uri.from_trusted);
+		params.third_party.bolt11_payment().send(&uri.invoice, None).unwrap();
+		test_utils::wait_for_condition("trusted wallet funded", || async {
+			wallet.get_balance().await.unwrap().trusted == funded
+		})
+		.await;
+		assert!(matches!(wait_next_event(wallet).await, Event::PaymentReceived { .. }));
+
+		let amount = Amount::from_sats(100).unwrap();
+		let secp = Secp256k1::new();
+		let key = SecretKey::from_slice(&[99; 32]).unwrap();
+		let invoice = InvoiceBuilder::new(Currency::Regtest)
+			.description("unreachable payee".to_owned())
+			.payment_hash(PaymentHash([43; 32]))
+			.payment_secret(PaymentSecret([44; 32]))
+			.current_timestamp()
+			.min_final_cltv_expiry_delta(144)
+			.amount_milli_satoshis(amount.milli_sats())
+			.build_signed(|hash| secp.sign_ecdsa_recoverable(hash, &key))
+			.unwrap();
+		let info = PaymentInfo::build(
+			wallet.parse_payment_instructions(&invoice.to_string()).await.unwrap(),
+			None,
+		)
+		.unwrap();
+		let id = wallet.pay(&info).await.unwrap();
+		assert!(matches!(id, PaymentId::Trusted(_)));
+		let history = wallet.list_transactions().await.unwrap();
+		assert_eq!(history.iter().filter(|t| t.id == id).count(), 1);
+		assert!(matches!(wait_next_event(wallet).await,
+			Event::PaymentFailed { payment_id, .. } if payment_id == id));
+		let history = wallet.list_transactions().await.unwrap();
+		let outbound: Vec<_> = history.iter().filter(|t| t.outbound).collect();
+		assert_eq!(outbound.len(), 1, "{history:?}");
+		assert_eq!(outbound[0].id, id);
+		assert_eq!(outbound[0].status, TxStatus::Failed);
+		assert_eq!(outbound[0].amount, Some(amount));
+	})
+	.await;
+}
+
 #[tokio::test(flavor = "multi_thread")]
 #[test_log::test]
 #[cfg_attr(
@@ -2955,6 +3004,66 @@ async fn test_lsp_connectivity_fallback() {
 			"Small amount should still generate a valid invoice even with LSP offline"
 		);
 		assert!(uri_small.from_trusted);
+	})
+	.await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[test_log::test]
+#[cfg_attr(
+	feature = "_cashu-tests",
+	ignore = "CDK's test mint/payment processor does not support partial MPP melts"
+)]
+async fn test_duplicate_mpp_preserves_completed_payment() {
+	test_utils::run_test(|params| async move {
+		let wallet = Arc::clone(&params.wallet);
+		let bitcoind = Arc::clone(&params.bitcoind);
+		let third_party = Arc::clone(&params.third_party);
+		let electrsd = Arc::clone(&params.electrsd);
+		let desc = Bolt11InvoiceDescription::Direct(Description::empty());
+
+		// Fund the trusted wallet with 100 sats before a channel exists (once inbound
+		// liquidity exists, small receives route to the lightning wallet instead).
+		let trusted_amt = Amount::from_sats(100).unwrap();
+		let uri = wallet.get_single_use_receive_uri(Some(trusted_amt)).await.unwrap();
+		assert!(uri.from_trusted);
+		third_party.bolt11_payment().send(&uri.invoice, None).unwrap();
+		test_utils::wait_for_condition("trusted balance funded", || async {
+			wallet.get_balance().await.unwrap().trusted == trusted_amt
+		})
+		.await;
+		assert!(matches!(wait_next_event(&wallet).await, Event::PaymentReceived { .. }));
+
+		// Open a lightning channel.
+		open_channel_from_lsp(&wallet, Arc::clone(&third_party)).await;
+		generate_blocks(&bitcoind, &electrsd, 6).await;
+		test_utils::wait_for_condition("wallet sync after channel open", || async {
+			wallet.channels().iter().any(|c| c.confirmations.is_some_and(|n| n > 0) && c.is_usable)
+		})
+		.await;
+
+		let pay_amt = Amount::from_sats(350).unwrap();
+		let invoice =
+			third_party.bolt11_payment().receive(pay_amt.milli_sats(), &desc, 300).unwrap();
+		let info = PaymentInfo::build(
+			wallet.parse_payment_instructions(&invoice.to_string()).await.unwrap(),
+			Some(pay_amt),
+		)
+		.unwrap();
+		let original_id = wallet.pay(&info).await.unwrap();
+		assert!(matches!(wait_next_event(&wallet).await, Event::PaymentSuccessful { .. }));
+		let before = wallet.list_transactions().await.unwrap();
+		assert!(before.iter().any(|t| t.id == original_id && t.status == TxStatus::Completed));
+		let retry = wallet.pay(&info).await;
+		assert!(
+			matches!(retry, Err(WalletError::LdkNodeFailure(NodeError::DuplicatePayment))),
+			"{retry:?}"
+		);
+		let after = wallet.list_transactions().await.unwrap();
+		assert!(
+			after.iter().any(|t| t.id == original_id && t.status == TxStatus::Completed),
+			"Retry removed completed payment {original_id:?}: {after:?}"
+		);
 	})
 	.await;
 }
