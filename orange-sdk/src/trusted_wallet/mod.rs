@@ -19,6 +19,9 @@ pub mod dummy;
 #[cfg(feature = "spark")]
 pub mod spark;
 
+#[cfg(any(feature = "cashu", feature = "spark"))]
+mod payment_store;
+
 /// Represents a payment with its associated details.
 ///
 /// This struct contains information about a payment, including its unique ID,
@@ -73,7 +76,10 @@ pub trait TrustedWalletInterface: Send + Sync + private::Sealed {
 	/// the result of the payment, it should only initiate it and return the payment ID.
 	///
 	/// This should later emit a [`PaymentSuccessful`] or [`PaymentFailed`] event
-	/// when the payment is completed or failed.
+	/// when the payment is completed or failed. A backend that is already paying the same
+	/// request may return that payment's ID instead of starting another; the terminal event is
+	/// still emitted once for that ID. When the backend cannot tell whether the payment went
+	/// through, the event follows once it has resolved the outcome.
 	///
 	/// [`PaymentSuccessful`]: `crate::event::Event::PaymentSuccessful`
 	/// [`PaymentFailed`]: `crate::event::Event::PaymentFailed`
