@@ -21,6 +21,7 @@ use ldk_node::lightning::ln::msgs::SocketAddress;
 use ldk_node::lightning::util::logger::Logger as _;
 use ldk_node::lightning::{log_debug, log_error, log_info};
 use ldk_node::lightning_invoice::{Bolt11Invoice, Bolt11InvoiceDescription, Description};
+use ldk_node::lightning_types::payment::PaymentHash;
 use ldk_node::payment::{
 	ConfirmationStatus, PaymentDetails, PaymentDirection, PaymentKind, PaymentStatus,
 };
@@ -297,6 +298,21 @@ impl LightningWallet {
 
 	pub(crate) fn list_payments(&self) -> Result<Vec<PaymentDetails>, NodeError> {
 		list_node_payments(&self.inner.ldk_node)
+	}
+
+	/// The most recent outbound BOLT 11 record for `payment_hash`, if one was created recently.
+	///
+	/// Only the newest page of the payment list is read, so this neither derives an LDK payment
+	/// ID from the hash nor walks the history. The failed MPP leg this finds was inserted
+	/// moments ago, and the duplicate check that also uses it is best effort, since ldk-node
+	/// rejects a duplicate itself.
+	pub(crate) fn recent_outbound_bolt11(
+		&self, payment_hash: PaymentHash,
+	) -> Result<Option<PaymentDetails>, NodeError> {
+		Ok(self.inner.ldk_node.list_payments(None)?.payments.into_iter().find(|p| {
+			p.direction == PaymentDirection::Outbound
+				&& matches!(p.kind, PaymentKind::Bolt11 { hash, .. } if hash == payment_hash)
+		}))
 	}
 
 	pub(crate) fn get_balance(&self) -> LightningWalletBalance {

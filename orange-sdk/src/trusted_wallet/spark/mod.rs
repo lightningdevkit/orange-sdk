@@ -2,6 +2,7 @@
 
 pub(crate) mod spark_store;
 
+use super::payment_store::PaymentStore;
 use crate::bitcoin::Network;
 use crate::bitcoin::hex::FromHex;
 use crate::logging::Logger;
@@ -95,6 +96,8 @@ impl SparkWalletConfig {
 /// A wallet implementation using the Breez Spark SDK.
 #[derive(Clone)]
 pub(crate) struct Spark {
+	tx_metadata: TxMetadataStore,
+	payments: Arc<PaymentStore>,
 	event_queue: Arc<EventQueue>,
 	spark_wallet: Arc<BreezSdk>,
 	shutdown_sender: watch::Sender<()>,
@@ -161,7 +164,7 @@ impl TrustedWalletInterface for Spark {
 			let payments =
 				resp.payments.into_iter().map(|p| p.try_into()).collect::<Result<_, _>>()?;
 
-			Ok(payments)
+			Ok(self.payments.merge(payments).await)
 		})
 	}
 
@@ -220,6 +223,10 @@ impl TrustedWalletInterface for Spark {
 				let prepare = self.spark_wallet.prepare_send_payment(params).await?;
 
 				let uuid = Uuid::now_v7();
+				let payment_id = parse_payment_id(&uuid.to_string())?;
+				self.payments.insert_pending(payment_id, amount, None).await?;
+				let payments = Arc::clone(&self.payments);
+				let tx_metadata = self.tx_metadata.clone();
 				// spawn payment send in background since it can take a while and we don't want to block the caller
 				let w = Arc::clone(&self.spark_wallet);
 				let logger = Arc::clone(&self.logger);
@@ -243,11 +250,30 @@ impl TrustedWalletInterface for Spark {
 						Err(e) => {
 							log_error!(logger, "Failed to send payment: {e:?}");
 							event_queue.rebalance_watchers.sent(payment_hash, None);
+							if send_was_rejected(&e) {
+								if let Err(err) = payments.mark_failed(payment_id).await {
+									log_error!(logger, "Failed to save payment failure: {err}");
+								}
+								let is_rebalance = tx_metadata
+									.read()
+									.get(&PaymentId::Trusted(payment_id))
+									.is_some_and(|m| m.ty.is_rebalance());
+								if is_rebalance {
+									return;
+								}
+								let _ = event_queue
+									.add_event(Event::PaymentFailed {
+										payment_id: PaymentId::Trusted(payment_id),
+										payment_hash: Some(PaymentHash(payment_hash)),
+										reason: None,
+									})
+									.await;
+							}
 						},
 					}
 				});
 
-				Ok(parse_payment_id(&uuid.to_string())?)
+				Ok(payment_id)
 			} else {
 				Err(TrustedError::UnsupportedOperation(
 					"Only BOLT 11 is currently supported".to_owned(),
@@ -326,6 +352,7 @@ impl Spark {
 			},
 		};
 
+		let payments = Arc::new(PaymentStore::new(Arc::clone(&store), Arc::clone(&logger)).await?);
 		let spark_store = Arc::new(spark_store::SparkStore::new(store));
 		let builder = SdkBuilder::new(spark_config, seed).with_storage(spark_store);
 
@@ -340,7 +367,7 @@ impl Spark {
 
 		let listener = SparkEventHandler {
 			event_queue: Arc::clone(&event_queue),
-			tx_metadata,
+			tx_metadata: tx_metadata.clone(),
 			logger: Arc::clone(&logger),
 		};
 
@@ -355,7 +382,15 @@ impl Spark {
 
 		log_info!(logger, "Spark wallet initialized");
 
-		Ok(Spark { spark_wallet, shutdown_sender, event_queue, runtime, logger })
+		Ok(Spark {
+			tx_metadata,
+			payments,
+			spark_wallet,
+			shutdown_sender,
+			event_queue,
+			runtime,
+			logger,
+		})
 	}
 }
 
@@ -634,6 +669,28 @@ impl TryFrom<breez_sdk_spark::Payment> for Payment {
 			outbound: value.payment_type == PaymentType::Send,
 			time_since_epoch: Duration::from_secs(value.timestamp),
 		})
+	}
+}
+
+// A service or transport error does not prove that the payment failed.
+fn send_was_rejected(error: &SdkError) -> bool {
+	matches!(
+		error,
+		SdkError::InvalidInput(_) | SdkError::InvalidUuid(_) | SdkError::InsufficientFunds
+	)
+}
+
+#[cfg(test)]
+mod send_error_tests {
+	use super::*;
+
+	#[test]
+	fn ambiguous_send_errors_are_not_failures() {
+		assert!(send_was_rejected(&SdkError::InsufficientFunds));
+		assert!(send_was_rejected(&SdkError::InvalidInput("invalid".to_owned())));
+		assert!(!send_was_rejected(&SdkError::NetworkError("timeout".to_owned())));
+		assert!(!send_was_rejected(&SdkError::StorageError("write failed".to_owned())));
+		assert!(!send_was_rejected(&SdkError::SparkError("unknown".to_owned())));
 	}
 }
 
