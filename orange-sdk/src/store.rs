@@ -255,7 +255,16 @@ pub(crate) enum TxType {
 	Payment {
 		ty: PaymentType,
 	},
-	PendingRebalance {},
+	/// A rebalance leg that is not yet matched to its counterpart, or a funding transaction
+	/// placeholder. Hidden from the transaction list.
+	PendingRebalance {
+		/// Hash of the rebalance invoice. Absent for legacy records and funding placeholders.
+		payment_hash: Option<[u8; 32]>,
+		/// The trusted payment that triggered the rebalance.
+		trigger: Option<[u8; 32]>,
+		/// The amount being rebalanced in millisatoshis.
+		amount_msat: Option<u64>,
+	},
 	/// A single leg of a multi-path payment that is split across the trusted and lightning
 	/// wallets. Both legs carry the same `surface_id`; the entry stored under that id additionally
 	/// accumulates each leg's terminal result so the two can be coalesced into a single event. The
@@ -264,8 +273,10 @@ pub(crate) enum TxType {
 	MppPayment {
 		/// The id under which the combined payment is surfaced to the user (the trusted leg id).
 		surface_id: PaymentId,
-		/// The lightning leg's payment id (equal to the BOLT 11 payment hash).
+		/// The lightning leg's payment id.
 		lightning_leg: [u8; 32],
+		/// The invoice hash. Absent in legacy records where it equalled the lightning ID.
+		payment_hash: Option<[u8; 32]>,
 		/// The total amount, in msats, of the combined payment (i.e. the invoice amount).
 		total_amount_msat: u64,
 		/// The payment type of the combined transaction.
@@ -399,7 +410,7 @@ impl TxType {
 	pub(crate) fn is_rebalance(&self) -> bool {
 		matches!(
 			self,
-			TxType::PendingRebalance {}
+			TxType::PendingRebalance { .. }
 				| TxType::TrustedToLightning { .. }
 				| TxType::OnchainToLightning { .. }
 		)
@@ -418,7 +429,11 @@ impl_writeable_tlv_based_enum!(TxType,
 	},
 	(2, PaymentTriggeringTransferLightning) => { (0, ty, required), },
 	(3, Payment) => { (0, ty, required), },
-	(4, PendingRebalance) => {},
+	(4, PendingRebalance) => {
+		(1, payment_hash, option),
+		(3, trigger, option),
+		(5, amount_msat, option),
+	},
 	(5, MppPayment) => {
 		(0, surface_id, required),
 		(2, total_amount_msat, required),
@@ -429,6 +444,7 @@ impl_writeable_tlv_based_enum!(TxType,
 		(12, trusted_fee_msat, option),
 		(14, lightning_fee_msat, option),
 		(16, preimage, option),
+		(17, payment_hash, option),
 	},
 );
 
@@ -507,14 +523,20 @@ impl TxMetadataStore {
 		let (key_str, ser) = {
 			let mut tx_metadata = self.tx_metadata.write().unwrap();
 			if let Some(metadata) = tx_metadata.get_mut(payment_id) {
-				if let TxType::Payment { ty } = &mut metadata.ty {
-					metadata.ty = TxType::PaymentTriggeringTransferLightning { ty: *ty };
-					let key_str = payment_id.to_string();
-					let ser = metadata.encode();
-					(key_str, ser)
-				} else {
-					eprintln!("payment_id {payment_id} is not a payment, cannot set rebalance");
-					return Err(());
+				match &mut metadata.ty {
+					TxType::Payment { ty } => {
+						metadata.ty = TxType::PaymentTriggeringTransferLightning { ty: *ty };
+						let key_str = payment_id.to_string();
+						let ser = metadata.encode();
+						(key_str, ser)
+					},
+					// Already promoted, for example by a rebalance whose completion was
+					// interrupted after this write. Finishing it again is a no-op here.
+					TxType::PaymentTriggeringTransferLightning { .. } => return Ok(()),
+					_ => {
+						eprintln!("payment_id {payment_id} is not a payment, cannot set rebalance");
+						return Err(());
+					},
 				}
 			} else {
 				eprintln!("doesn't exist in metadata store: {payment_id}");
@@ -674,6 +696,7 @@ impl TxMetadataStore {
 				};
 				let TxType::MppPayment {
 					lightning_leg,
+					payment_hash,
 					trusted_fee_msat,
 					lightning_fee_msat,
 					preimage,
@@ -700,7 +723,7 @@ impl TxMetadataStore {
 					None => *failed = true,
 				}
 
-				let payment_hash = *lightning_leg;
+				let payment_hash = payment_hash.unwrap_or(*lightning_leg);
 				if *failed {
 					*finalized = true;
 					Some(MppOutcome::Failed { payment_hash })
@@ -816,21 +839,9 @@ pub(crate) async fn read_splice_outs(store: &dyn DynStore) -> Vec<PaymentDetails
 #[cfg(test)]
 mod tests {
 	use super::*;
+	use crate::test_store::{open_sqlite_store, temp_sqlite_store};
 	use ldk_node::bitcoin::hex::DisplayHex;
-	use ldk_node::io::sqlite_store::SqliteStore;
-	use std::path::PathBuf;
 	use std::str::FromStr;
-	use std::time::{SystemTime, UNIX_EPOCH};
-
-	fn temp_sqlite_store() -> (PathBuf, Arc<dyn DynStore>) {
-		let path = std::env::temp_dir().join(format!(
-			"orange-sdk-mpp-finalize-test-{}",
-			SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()
-		));
-		let store = SqliteStore::new(path.clone(), Some("orange.sqlite".to_string()), None)
-			.expect("sqlite store");
-		(path, Arc::new(store))
-	}
 
 	const TRUSTED_LEG: [u8; 32] = [7u8; 32];
 	const LIGHTNING_LEG: [u8; 32] = [9u8; 32];
@@ -867,6 +878,7 @@ mod tests {
 			ty: TxType::MppPayment {
 				surface_id: surface_id(),
 				lightning_leg: LIGHTNING_LEG,
+				payment_hash: Some([7; 32]),
 				total_amount_msat: 200_000,
 				ty: PaymentType::OutgoingLightningBolt11 { payment_preimage: None },
 				trusted_fee_msat: None,
@@ -901,7 +913,7 @@ mod tests {
 			Some((
 				surface_id(),
 				MppOutcome::Succeeded {
-					payment_hash: LIGHTNING_LEG,
+					payment_hash: [7; 32],
 					preimage: [1u8; 32],
 					fee_msat: 3_000,
 				}
@@ -921,19 +933,10 @@ mod tests {
 	// crash/restart by dropping the `TxMetadataStore` and rebuilding it from the same on-disk store.
 	#[tokio::test]
 	async fn record_mpp_leg_persists_across_restart() {
-		let path = std::env::temp_dir().join(format!(
-			"orange-sdk-mpp-record-test-{}",
-			SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()
-		));
-		let open = |path: PathBuf| -> Arc<dyn DynStore> {
-			Arc::new(
-				SqliteStore::new(path, Some("orange.sqlite".to_string()), None)
-					.expect("sqlite store"),
-			)
-		};
+		let (path, store) = temp_sqlite_store();
 
 		{
-			let tx_metadata = TxMetadataStore::new(open(path.clone())).await;
+			let tx_metadata = TxMetadataStore::new(store).await;
 			insert_legs(&tx_metadata).await;
 			assert_eq!(
 				tx_metadata.record_mpp_leg(surface_id(), Some((1_000, [1u8; 32]))).await,
@@ -949,7 +952,7 @@ mod tests {
 
 		// Simulate a crash/restart: reload from the same on-disk store.
 		{
-			let tx_metadata = TxMetadataStore::new(open(path.clone())).await;
+			let tx_metadata = TxMetadataStore::new(open_sqlite_store(&path)).await;
 			// Both the recorded legs and the finalized flag survived, so a replayed event after the
 			// restart does not surface a duplicate combined event.
 			assert_eq!(
@@ -968,7 +971,7 @@ mod tests {
 		// A failed leg fails the whole payment immediately, exactly once.
 		assert_eq!(
 			tx_metadata.record_mpp_leg(surface_id(), None).await,
-			Some((surface_id(), MppOutcome::Failed { payment_hash: LIGHTNING_LEG }))
+			Some((surface_id(), MppOutcome::Failed { payment_hash: [7; 32] }))
 		);
 		assert_eq!(
 			tx_metadata.record_mpp_leg(lightning_id(), Some((2_000, [1u8; 32]))).await,
@@ -990,6 +993,50 @@ mod tests {
 			)
 			.await;
 		assert_eq!(tx_metadata.record_mpp_leg(plain, Some((1, [0u8; 32]))).await, None);
+	}
+
+	#[test]
+	fn pending_rebalance_details_round_trip_and_legacy_records_decode() {
+		let time = Duration::from_secs(7);
+		let detailed = TxMetadata {
+			ty: TxType::PendingRebalance {
+				payment_hash: Some([1; 32]),
+				trigger: Some([2; 32]),
+				amount_msat: Some(3),
+			},
+			time,
+		};
+		let encoded = detailed.encode();
+		let decoded = TxMetadata::read(&mut &encoded[..]).unwrap();
+		assert_eq!((decoded.ty, decoded.time), (detailed.ty, time));
+
+		// Records written before the details existed carry no optional TLVs.
+		let legacy = TxMetadata {
+			ty: TxType::PendingRebalance { payment_hash: None, trigger: None, amount_msat: None },
+			time,
+		};
+		let encoded = legacy.encode();
+		let decoded = TxMetadata::read(&mut &encoded[..]).unwrap();
+		assert_eq!((decoded.ty, decoded.time), (legacy.ty, time));
+		assert!(legacy.ty.is_rebalance());
+	}
+
+	#[tokio::test]
+	async fn legacy_mpp_metadata_uses_lightning_id_as_hash() {
+		let (_path, store) = temp_sqlite_store();
+		let tx_metadata = TxMetadataStore::new(store).await;
+		let mut legacy = mpp_metadata();
+		if let TxType::MppPayment { payment_hash, .. } = &mut legacy.ty {
+			*payment_hash = None;
+		}
+		// None omits the new TLV, reproducing the old metadata encoding.
+		let encoded = legacy.encode();
+		let decoded = TxMetadata::read(&mut &encoded[..]).unwrap();
+		tx_metadata.insert(surface_id(), decoded).await;
+		assert_eq!(
+			tx_metadata.record_mpp_leg(surface_id(), None).await,
+			Some((surface_id(), MppOutcome::Failed { payment_hash: LIGHTNING_LEG }))
+		);
 	}
 
 	#[test]

@@ -24,15 +24,15 @@ use ldk_node::lightning_invoice::{Bolt11Invoice, Bolt11InvoiceDescription, Descr
 use ldk_node::payment::{
 	ConfirmationStatus, PaymentDetails, PaymentDirection, PaymentKind, PaymentStatus,
 };
-use ldk_node::{NodeError, UserChannelId};
+use ldk_node::{Node, NodeError, UserChannelId};
 
-use graduated_rebalancer::{LightningBalance, ReceivedLightningPayment};
+use graduated_rebalancer::{LightningBalance, RebalanceWait};
 
 use std::collections::{HashMap, VecDeque};
 use std::fmt::Debug;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 use tokio::sync::{Notify, watch};
 
 #[derive(Debug, Clone, Copy)]
@@ -42,10 +42,10 @@ pub(crate) struct LightningWalletBalance {
 }
 
 pub(crate) struct LightningWalletImpl {
+	event_queue: Arc<EventQueue>,
 	pub(crate) ldk_node: Arc<ldk_node::Node>,
 	logger: Arc<Logger>,
 	store: Arc<dyn DynStore>,
-	payment_receipt_flag: watch::Receiver<()>,
 	channel_pending_receipt_flag: watch::Receiver<u128>,
 	splice_pending_inbox: Arc<SplicePendingInbox>,
 	lsp_node_id: PublicKey,
@@ -54,6 +54,23 @@ pub(crate) struct LightningWalletImpl {
 
 pub(crate) struct LightningWallet {
 	pub(crate) inner: Arc<LightningWalletImpl>,
+}
+
+/// Returns every page of a node's payment history.
+pub fn list_node_payments(node: &Node) -> Result<Vec<PaymentDetails>, NodeError> {
+	// TODO: Paginate Orange's transaction history instead of collecting every LDK page.
+	// This needs to preserve merged split payments and rebalance fees across page
+	// boundaries, as well as ordering across Lightning and trusted-wallet records.
+	let mut payments = Vec::new();
+	let mut page_token = None;
+	loop {
+		let page = node.list_payments(page_token)?;
+		payments.extend(page.payments);
+		page_token = page.next_page_token;
+		if page_token.is_none() {
+			return Ok(payments);
+		}
+	}
 }
 
 const DEFAULT_INVOICE_EXPIRY_SECS: u32 = 86_400; // 24 hours
@@ -189,26 +206,24 @@ impl LightningWallet {
 
 		let ldk_node =
 			Arc::new(builder.build_with_store(node_entropy, LdkNodeStore(Arc::clone(&store)))?);
-		let (payment_receipt_sender, payment_receipt_flag) = watch::channel(());
 		let (channel_pending_sender, channel_pending_receipt_flag) = watch::channel(0);
 		let splice_pending_inbox = Arc::new(SplicePendingInbox {
 			pending: Mutex::new(HashMap::new()),
 			notify: Notify::new(),
 		});
 		let ev_handler = Arc::new(LdkEventHandler {
-			event_queue,
+			event_queue: Arc::clone(&event_queue),
 			ldk_node: Arc::clone(&ldk_node),
 			tx_metadata,
-			payment_receipt_sender,
 			channel_pending_sender,
 			splice_pending_inbox: Arc::clone(&splice_pending_inbox),
 			logger: Arc::clone(&logger),
 		});
 		let inner = Arc::new(LightningWalletImpl {
+			event_queue,
 			ldk_node,
 			logger,
 			store,
-			payment_receipt_flag,
 			channel_pending_receipt_flag,
 			splice_pending_inbox,
 			lsp_node_id,
@@ -221,17 +236,14 @@ impl LightningWallet {
 			loop {
 				let event = ev_handler.ldk_node.next_event_async().await;
 				log_debug!(ev_handler.logger, "Got ldk-node event {event:?}");
-				ev_handler.handle_ldk_node_event(event).await;
+				if !ev_handler.handle_ldk_node_event(event).await {
+					// LDK replays unacknowledged events immediately. Bound retries on store errors.
+					tokio::time::sleep(Duration::from_secs(1)).await;
+				}
 			}
 		});
 
 		Ok(Self { inner })
-	}
-
-	pub(crate) async fn await_payment_receipt(&self) {
-		let mut flag = self.inner.payment_receipt_flag.clone();
-		flag.mark_unchanged();
-		let _ = flag.changed().await;
 	}
 
 	pub(crate) async fn await_channel_pending(&self, channel_id: u128) {
@@ -283,8 +295,8 @@ impl LightningWallet {
 		}
 	}
 
-	pub(crate) fn list_payments(&self) -> Vec<PaymentDetails> {
-		self.inner.ldk_node.list_payments()
+	pub(crate) fn list_payments(&self) -> Result<Vec<PaymentDetails>, NodeError> {
+		list_node_payments(&self.inner.ldk_node)
 	}
 
 	pub(crate) fn get_balance(&self) -> LightningWalletBalance {
@@ -485,34 +497,8 @@ impl graduated_rebalancer::LightningWallet for LightningWallet {
 		Box::pin(async move { self.pay(&method, amount).await.map(|p| p.0) })
 	}
 
-	fn await_payment_receipt(
-		&self, payment_hash: [u8; 32],
-	) -> Pin<Box<dyn Future<Output = Option<ReceivedLightningPayment>> + Send + '_>> {
-		Box::pin(async move {
-			let id = PaymentId(payment_hash);
-			loop {
-				if let Some(payment) = self.inner.ldk_node.payment(&id) {
-					let counterparty_skimmed_fee_msat = match payment.kind {
-						PaymentKind::Bolt11 { hash, counterparty_skimmed_fee_msat, .. } => {
-							debug_assert!(hash.0 == payment_hash, "Payment Hash mismatch");
-							counterparty_skimmed_fee_msat
-						},
-						_ => return None, // Ignore other payment kinds, we only care about the one we just sent.
-					};
-					match payment.status {
-						PaymentStatus::Succeeded => {
-							return Some(ReceivedLightningPayment {
-								id: payment.id.0,
-								fee_paid_msat: counterparty_skimmed_fee_msat,
-							});
-						},
-						PaymentStatus::Pending => {},
-						PaymentStatus::Failed => return None,
-					}
-				}
-				self.await_payment_receipt().await;
-			}
-		})
+	fn watch_rebalance(&self, payment_hash: [u8; 32]) -> RebalanceWait {
+		self.inner.event_queue.rebalance_watchers.register(payment_hash)
 	}
 
 	fn has_channel_with_lsp(&self) -> bool {
@@ -647,7 +633,50 @@ impl SplicePendingInbox {
 #[cfg(test)]
 mod tests {
 	use super::*;
+	use crate::test_store::temp_sqlite_store;
 	use ldk_node::bitcoin::Txid;
+	use ldk_node::entropy::NodeEntropy;
+	use ldk_node::lightning::util::persist::KVStore;
+	use ldk_node::lightning::util::ser::Writeable;
+
+	#[tokio::test(flavor = "multi_thread")]
+	async fn payment_history_includes_every_sqlite_page() {
+		let (path, store) = temp_sqlite_store();
+		// SQLite pages contain 50 entries; use two full pages and one short page.
+		for id in 0..101u8 {
+			let payment = PaymentDetails {
+				id: PaymentId([id; 32]),
+				kind: PaymentKind::Onchain {
+					txid: Txid::from_byte_array([id; 32]),
+					status: ConfirmationStatus::Unconfirmed,
+					tx_type: None,
+				},
+				amount_msat: Some(1_000),
+				fee_paid_msat: None,
+				direction: PaymentDirection::Inbound,
+				status: PaymentStatus::Pending,
+				latest_update_timestamp: id as u64,
+			};
+			let key = format!("{id:02x}").repeat(32);
+			KVStore::write(store.as_ref(), "payments", "", &key, payment.encode()).await.unwrap();
+		}
+		let mut builder = ldk_node::Builder::new();
+		builder.set_network(Network::Regtest);
+		builder.set_storage_dir_path(path.to_str().unwrap().to_owned());
+		builder.set_gossip_source_p2p();
+		let node = builder
+			.build_with_store(NodeEntropy::from_seed_bytes([42; 64]), LdkNodeStore(store))
+			.unwrap();
+		assert!(node.list_payments(None).unwrap().next_page_token.is_some());
+		let mut payments = list_node_payments(&node).unwrap();
+		payments.sort_by_key(|payment| payment.id.0);
+		assert_eq!(payments.len(), 101);
+		for (id, payment) in payments.iter().enumerate() {
+			assert_eq!(payment.id, PaymentId([id as u8; 32]));
+		}
+		drop(node);
+		std::fs::remove_dir_all(path).unwrap();
+	}
 
 	fn dummy_outpoint(seed: u8) -> OutPoint {
 		let bytes = [seed; 32];

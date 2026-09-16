@@ -7,7 +7,7 @@ use bitcoin_payment_instructions::{PaymentInstructions, http_resolver::HTTPHrnRe
 pub use bitcoin_payment_instructions::PaymentMethod;
 use bitcoin_payment_instructions::amount::Amount;
 
-use crate::rebalancer::{OrangeRebalanceEventHandler, OrangeTrigger};
+use crate::rebalancer::{OrangeRebalanceEventHandler, OrangeTrigger, RebalanceScheduler};
 use crate::store::{MppLegKind, MppMerge, TxMetadata, TxMetadataStore, TxType};
 #[cfg(feature = "cashu")]
 use crate::trusted_wallet::cashu::Cashu;
@@ -29,6 +29,8 @@ use ldk_node::lightning::{log_debug, log_error, log_info, log_trace, log_warn};
 use ldk_node::lightning_invoice::Bolt11Invoice;
 use ldk_node::payment::{PaymentDetails, PaymentDirection, PaymentKind};
 use ldk_node::{BuildError, ChannelDetails, NodeError};
+#[cfg(feature = "_test-utils")]
+pub use lightning_wallet::list_node_payments;
 
 use crate::dyn_store::DynStore;
 
@@ -43,9 +45,12 @@ mod event;
 mod ffi;
 mod lightning_wallet;
 pub(crate) mod logging;
+mod rebalance_watcher;
 mod rebalancer;
 mod runtime;
 mod store;
+#[cfg(test)]
+mod test_store;
 pub mod trusted_wallet;
 
 use lightning_wallet::LightningWallet;
@@ -112,6 +117,8 @@ struct WalletImpl {
 	tunables: Tunables,
 	/// The rebalancer for managing the transfer of funds between the trusted and lightning wallets.
 	rebalancer: Arc<Rebalancer>,
+	/// Combines pending balance checks into one background worker.
+	rebalance_scheduler: Arc<RebalanceScheduler>,
 	/// The Bitcoin network the wallet operates on (e.g., Mainnet, Testnet).
 	network: Network,
 	/// Metadata store for tracking transactions.
@@ -638,10 +645,18 @@ impl Wallet {
 			},
 		};
 
-		let tx_metadata = TxMetadataStore::new(Arc::clone(&store)).await;
-
-		let event_queue =
-			Arc::new(EventQueue::new(Arc::clone(&store), tx_metadata.clone(), Arc::clone(&logger)));
+		// Independent startup reads; a remote store can serve them in one round trip.
+		let (tx_metadata, restored_events) = tokio::join!(
+			TxMetadataStore::new(Arc::clone(&store)),
+			EventQueue::load_events(store.as_ref()),
+		);
+		let event_queue = Arc::new(EventQueue::new(
+			Arc::clone(&store),
+			restored_events?,
+			tx_metadata.clone(),
+			Arc::clone(&logger),
+			Arc::clone(&runtime),
+		));
 
 		// Cashu must init before LDK Node because CashuKvDatabase does
 		// synchronous SQLite reads that deadlock with LDK Node's background
@@ -735,18 +750,32 @@ impl Wallet {
 			wt,
 			Arc::clone(&ln_wallet),
 			trigger,
-			rebalance_events,
+			Arc::clone(&rebalance_events),
 			Arc::clone(&logger),
 		));
+
+		let rebalance_scheduler = Arc::new(RebalanceScheduler::default());
+		let requests = Arc::clone(&rebalance_scheduler);
+		let rb = Arc::clone(&rebalancer);
+		runtime.spawn_cancellable_background_task(async move {
+			requests.run(|| rb.do_rebalance_if_needed()).await;
+		});
 
 		// Spawn a background thread to initiate a rebalance if needed.
 		// We only do this once as we generally rebalance in response to
 		// `Event`s which indicated our balance has changed.
 		let rb = Arc::clone(&rebalancer);
+		let requests = Arc::clone(&rebalance_scheduler);
+		let startup_events = Arc::clone(&rebalance_events);
+		let startup_trusted = Arc::clone(&trusted);
+		let startup_ln_wallet = Arc::clone(&ln_wallet);
 		runtime.spawn_cancellable_background_task(async move {
 			// Wait a second to get caught up, then try to rebalance.
 			tokio::time::sleep(Duration::from_secs(1)).await;
-			rb.do_rebalance_if_needed().await;
+			startup_events
+				.reconcile_pending_rebalances(&**startup_trusted, &startup_ln_wallet)
+				.await;
+			requests.request();
 
 			// create loop for onchain rebalancing.
 			// we only do onchain rebalancing here as trusted rebalancing is
@@ -765,6 +794,7 @@ impl Wallet {
 			network,
 			tunables,
 			rebalancer,
+			rebalance_scheduler,
 			tx_metadata,
 			store,
 			logger,
@@ -806,7 +836,7 @@ impl Wallet {
 			store::read_splice_outs(self.inner.store.as_ref())
 		);
 		let trusted_payments = trusted_payments?;
-		let mut lightning_payments = self.inner.ln_wallet.list_payments();
+		let mut lightning_payments = self.inner.ln_wallet.list_payments()?;
 		lightning_payments.sort_by_key(|l| l.latest_update_timestamp);
 
 		let mut res = Vec::with_capacity(
@@ -1341,10 +1371,7 @@ impl Wallet {
 										},
 									)
 									.await;
-								let inner_ref = Arc::clone(&self.inner);
-								self.inner.runtime.spawn_cancellable_background_task(async move {
-									inner_ref.rebalancer.do_rebalance_if_needed().await;
-								});
+								self.inner.rebalance_scheduler.request();
 								return Ok(PaymentId::SelfCustodial(id.0));
 							},
 							Err(e) => {
@@ -1589,6 +1616,7 @@ impl Wallet {
 			ty: TxType::MppPayment {
 				surface_id,
 				lightning_leg: ln_id.0,
+				payment_hash: Some(payment_hash.0),
 				total_amount_msat: amount.milli_sats(),
 				ty: PaymentType::OutgoingLightningBolt11 { payment_preimage: None },
 				trusted_fee_msat: None,
@@ -1605,10 +1633,7 @@ impl Wallet {
 			log_error!(self.inner.logger, "Failed to replay pending MPP events: {queue_err}");
 		}
 
-		let inner_ref = Arc::clone(&self.inner);
-		self.inner.runtime.spawn_cancellable_background_task(async move {
-			inner_ref.rebalancer.do_rebalance_if_needed().await;
-		});
+		self.inner.rebalance_scheduler.request();
 
 		Ok(surface_id)
 	}
@@ -1648,7 +1673,7 @@ impl Wallet {
 	/// **Caution:** Users must handle events as quickly as possible to prevent a large event backlog,
 	/// which can increase the memory footprint of [`Wallet`].
 	pub fn next_event(&self) -> Option<Event> {
-		self.inner.runtime.block_on(self.inner.event_queue.next_event())
+		self.inner.event_queue.next_event()
 	}
 
 	/// Returns the next event in the event queue.
@@ -1682,21 +1707,24 @@ impl Wallet {
 	///
 	/// **Note:** This **MUST** be called after each event has been handled.
 	pub fn event_handled(&self) -> Result<(), ()> {
-		let res =
-			self.inner.runtime.block_on(self.inner.event_queue.event_handled()).map_err(|e| {
-				log_error!(
-					self.inner.logger,
-					"Couldn't mark event handled due to persistence failure: {e}"
-				);
-			});
-		if res.is_ok() {
-			// If an event was handled, probably our balances changed and we may need to rebalance.
-			let inner_ref = Arc::clone(&self.inner);
-			self.inner.runtime.spawn_cancellable_background_task(async move {
-				inner_ref.rebalancer.do_rebalance_if_needed().await;
-			});
-		}
-		res
+		self.inner.runtime.block_on(self.event_handled_async())
+	}
+
+	/// Confirms the last retrieved event handled without blocking the calling thread.
+	///
+	/// Await this before retrieving and acknowledging the next event. If persistence fails,
+	/// the same event remains queued and acknowledgement can be retried. Once a write
+	/// starts, it continues if the caller cancels the wait. Call [`Wallet::stop`] to wait
+	/// for pending writes, up to the runtime shutdown timeout.
+	pub async fn event_handled_async(&self) -> Result<(), ()> {
+		self.inner.event_queue.event_handled().await.map_err(|e| {
+			log_error!(
+				self.inner.logger,
+				"Couldn't mark event handled due to persistence failure: {e}"
+			);
+		})?;
+		self.inner.rebalance_scheduler.request();
+		Ok(())
 	}
 
 	/// Gets the lightning address for this wallet, if one is set.
