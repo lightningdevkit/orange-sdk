@@ -11,7 +11,8 @@ use breez_sdk_spark::sync_storage::{
 };
 use breez_sdk_spark::{
 	Contact, DepositInfo, ListContactsRequest, Payment, PaymentDetails, PaymentMetadata,
-	SetLnurlMetadataItem, StorageError, StorageListPaymentsRequest, UpdateDepositPayload,
+	SetLnurlMetadataItem, StorageError, StorageListPaymentsRequest, StoredCrossChainSwap,
+	UpdateDepositPayload,
 };
 use ldk_node::bitcoin::hashes::Hash;
 use ldk_node::bitcoin::hashes::sha256::Hash as Sha256;
@@ -24,6 +25,7 @@ const SPARK_PRIMARY_NAMESPACE: &str = "spark";
 const SPARK_CACHE_NAMESPACE: &str = "cache";
 const SPARK_PAYMENTS_NAMESPACE: &str = "payment";
 const SPARK_DEPOSITS_NAMESPACE: &str = "deposit";
+const SPARK_CROSS_CHAIN_NAMESPACE: &str = "cross_chain";
 const SPARK_METADATA_NAMESPACE: &str = "metadata";
 const SPARK_SYNC_STATE_NAMESPACE: &str = "sync_state";
 const SPARK_SYNC_OUT_NAMESPACE: &str = "sync_out";
@@ -39,6 +41,8 @@ const LOCAL_REVISION_KEY: &str = "local_revision";
 pub(crate) struct SparkStore {
 	pub(crate) store: Arc<dyn DynStore>,
 	local_revision_lock: Arc<Mutex<()>>,
+	payment_update_lock: Arc<Mutex<()>>,
+	deposit_update_lock: Arc<Mutex<()>>,
 }
 
 /// The Spark sdk can produce keys that are too long, we just truncate them here
@@ -104,7 +108,69 @@ fn bytes_to_record(bytes: &[u8]) -> Result<Record, StorageError> {
 
 impl SparkStore {
 	pub(crate) fn new(store: Arc<dyn DynStore>) -> Self {
-		Self { store, local_revision_lock: Arc::new(Mutex::new(())) }
+		Self {
+			store,
+			local_revision_lock: Arc::new(Mutex::new(())),
+			payment_update_lock: Arc::new(Mutex::new(())),
+			deposit_update_lock: Arc::new(Mutex::new(())),
+		}
+	}
+
+	/// Run before starting the SDK, which otherwise cannot read old deposit payments.
+	pub(crate) async fn migrate_deposit_details(&self) -> Result<(), StorageError> {
+		use breez_sdk_spark::Storage;
+		const MIGRATION_KEY: &str = "deposit_vout_migrated";
+		if self.get_cached_item(MIGRATION_KEY.to_string()).await?.is_some() {
+			return Ok(());
+		}
+		let keys =
+			KVStore::list(self.store.as_ref(), SPARK_PRIMARY_NAMESPACE, SPARK_PAYMENTS_NAMESPACE)
+				.await
+				.map_err(|e| StorageError::Implementation(format!("{e:?}")))?;
+		let mut sync_reset = false;
+		for key in keys {
+			let data = KVStore::read(
+				self.store.as_ref(),
+				SPARK_PRIMARY_NAMESPACE,
+				SPARK_PAYMENTS_NAMESPACE,
+				&key,
+			)
+			.await
+			.map_err(|e| StorageError::Implementation(format!("{e:?}")))?;
+			let mut payment: serde_json::Value = serde_json::from_slice(&data)?;
+			let legacy_deposit = payment["details"]["Deposit"]
+				.as_object()
+				.is_some_and(|details| !details.contains_key("vout"));
+			if !legacy_deposit {
+				continue;
+			}
+			// Reset before changing any records so an interrupted migration still resyncs.
+			if !sync_reset {
+				if let Some(value) = self.get_cached_item("sync_offset".to_string()).await? {
+					let mut sync: serde_json::Value = serde_json::from_str(&value)?;
+					let object = sync.as_object_mut().ok_or_else(|| {
+						StorageError::Serialization("sync_offset must be an object".to_string())
+					})?;
+					object.insert("offset".to_string(), serde_json::json!(0));
+					self.set_cached_item("sync_offset".to_string(), serde_json::to_string(&sync)?)
+						.await?;
+				}
+				sync_reset = true;
+			}
+			// The original output index is unknown. Match the upstream migration by
+			// retaining the payment and letting sync recover its deposit details.
+			payment["details"] = serde_json::Value::Null;
+			KVStore::write(
+				self.store.as_ref(),
+				SPARK_PRIMARY_NAMESPACE,
+				SPARK_PAYMENTS_NAMESPACE,
+				&key,
+				serde_json::to_vec(&payment)?,
+			)
+			.await
+			.map_err(|e| StorageError::Implementation(format!("{e:?}")))?;
+		}
+		self.set_cached_item(MIGRATION_KEY.to_string(), "true".to_string()).await
 	}
 
 	/// Read the sync state for a given RecordId, if it exists.
@@ -300,7 +366,20 @@ impl breez_sdk_spark::Storage for SparkStore {
 		Ok(payments)
 	}
 
-	async fn insert_payment(&self, payment: breez_sdk_spark::Payment) -> Result<(), StorageError> {
+	async fn apply_payment_update(&self, payment: Payment) -> Result<bool, StorageError> {
+		// Keep the status check and write atomic across SDK tasks sharing this store.
+		let _guard = self.payment_update_lock.lock().await;
+		let stored_status = match self.get_payment_by_id(payment.id.clone()).await {
+			Ok(stored) => Some(stored.status),
+			Err(StorageError::NotFound) => None,
+			Err(e) => return Err(e),
+		};
+		if let Some(status) = stored_status {
+			if status.is_final() && status != payment.status {
+				return Ok(false);
+			}
+		}
+		let should_emit = stored_status != Some(payment.status);
 		let data = serde_json::to_vec(&payment)
 			.map_err(|e| StorageError::Serialization(format!("{e:?}")))?;
 
@@ -313,7 +392,7 @@ impl breez_sdk_spark::Storage for SparkStore {
 		)
 		.await
 		.map_err(|e| StorageError::Implementation(format!("{e:?}")))?;
-		Ok(())
+		Ok(should_emit)
 	}
 
 	async fn insert_payment_metadata(
@@ -370,7 +449,10 @@ impl breez_sdk_spark::Storage for SparkStore {
 			&id,
 		)
 		.await
-		.map_err(|e| StorageError::Implementation(format!("{e:?}")))?;
+		.map_err(|e| match e.kind() {
+			io::ErrorKind::NotFound => StorageError::NotFound,
+			_ => StorageError::Implementation(format!("{e:?}")),
+		})?;
 
 		let payment: breez_sdk_spark::Payment = serde_json::from_slice(&data)
 			.map_err(|e| StorageError::Serialization(format!("{e:?}")))?;
@@ -455,16 +537,32 @@ impl breez_sdk_spark::Storage for SparkStore {
 	async fn add_deposit(
 		&self, txid: String, vout: u32, amount_sats: u64, is_mature: bool,
 	) -> Result<(), StorageError> {
-		let id = format!("{txid}:{vout}");
-		let info = DepositInfo {
-			txid,
-			vout,
-			amount_sats,
-			is_mature,
-			refund_tx: None,
-			refund_tx_id: None,
-			claim_error: None,
+		let _guard = self.deposit_update_lock.lock().await;
+		let id = format!("{txid}_{vout}");
+		let mut info = match KVStore::read(
+			self.store.as_ref(),
+			SPARK_PRIMARY_NAMESPACE,
+			SPARK_DEPOSITS_NAMESPACE,
+			&id,
+		)
+		.await
+		{
+			Ok(data) => serde_json::from_slice(&data)?,
+			Err(e) if e.kind() == io::ErrorKind::NotFound => DepositInfo {
+				txid,
+				vout,
+				amount_sats,
+				is_mature,
+				refund_tx: None,
+				refund_tx_id: None,
+				claim_error: None,
+				refund_state: None,
+				instant_claim_status: None,
+			},
+			Err(e) => return Err(StorageError::Implementation(format!("{e:?}"))),
 		};
+		info.amount_sats = amount_sats;
+		info.is_mature = is_mature;
 
 		let data =
 			serde_json::to_vec(&info).map_err(|e| StorageError::Serialization(format!("{e:?}")))?;
@@ -483,7 +581,8 @@ impl breez_sdk_spark::Storage for SparkStore {
 	}
 
 	async fn delete_deposit(&self, txid: String, vout: u32) -> Result<(), StorageError> {
-		let id = format!("{txid}:{vout}");
+		let _guard = self.deposit_update_lock.lock().await;
+		let id = format!("{txid}_{vout}");
 		KVStore::remove(
 			self.store.as_ref(),
 			SPARK_PRIMARY_NAMESPACE,
@@ -524,7 +623,8 @@ impl breez_sdk_spark::Storage for SparkStore {
 	async fn update_deposit(
 		&self, txid: String, vout: u32, payload: UpdateDepositPayload,
 	) -> Result<(), StorageError> {
-		let id = format!("{txid}:{vout}");
+		let _guard = self.deposit_update_lock.lock().await;
+		let id = format!("{txid}_{vout}");
 
 		let data = match KVStore::read(
 			self.store.as_ref(),
@@ -552,9 +652,20 @@ impl breez_sdk_spark::Storage for SparkStore {
 			UpdateDepositPayload::ClaimError { error } => {
 				deposit.claim_error = Some(error);
 			},
-			UpdateDepositPayload::Refund { refund_txid, refund_tx } => {
+			UpdateDepositPayload::Refund { refund_txid, refund_tx, state } => {
 				deposit.refund_tx_id = Some(refund_txid);
 				deposit.refund_tx = Some(refund_tx);
+				deposit.refund_state = Some(state);
+				deposit.claim_error = None;
+			},
+			UpdateDepositPayload::InstantClaim { status } => {
+				deposit.instant_claim_status = Some(status);
+			},
+			UpdateDepositPayload::RefundBroadcastState { refund_txid, state } => {
+				if deposit.refund_tx_id.as_ref() != Some(&refund_txid) {
+					return Ok(());
+				}
+				deposit.refund_state = Some(state);
 			},
 		}
 
@@ -572,6 +683,65 @@ impl breez_sdk_spark::Storage for SparkStore {
 		.map_err(|e| StorageError::Implementation(format!("{e:?}")))?;
 
 		Ok(())
+	}
+
+	async fn set_cross_chain_swap(&self, swap: StoredCrossChainSwap) -> Result<(), StorageError> {
+		let key = sync_record_key(&[&swap.provider, &swap.id]);
+		KVStore::write(
+			self.store.as_ref(),
+			SPARK_PRIMARY_NAMESPACE,
+			SPARK_CROSS_CHAIN_NAMESPACE,
+			&key,
+			serde_json::to_vec(&swap)?,
+		)
+		.await
+		.map_err(|e| StorageError::Implementation(format!("{e:?}")))
+	}
+
+	async fn get_cross_chain_swap(
+		&self, provider: String, id: String,
+	) -> Result<Option<StoredCrossChainSwap>, StorageError> {
+		let key = sync_record_key(&[&provider, &id]);
+		match KVStore::read(
+			self.store.as_ref(),
+			SPARK_PRIMARY_NAMESPACE,
+			SPARK_CROSS_CHAIN_NAMESPACE,
+			&key,
+		)
+		.await
+		{
+			Ok(data) => Ok(Some(serde_json::from_slice(&data)?)),
+			Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
+			Err(e) => Err(StorageError::Implementation(format!("{e:?}"))),
+		}
+	}
+
+	async fn list_active_cross_chain_swaps(
+		&self, provider: String,
+	) -> Result<Vec<StoredCrossChainSwap>, StorageError> {
+		let keys = KVStore::list(
+			self.store.as_ref(),
+			SPARK_PRIMARY_NAMESPACE,
+			SPARK_CROSS_CHAIN_NAMESPACE,
+		)
+		.await
+		.map_err(|e| StorageError::Implementation(format!("{e:?}")))?;
+		let mut swaps = Vec::new();
+		for key in keys {
+			let data = KVStore::read(
+				self.store.as_ref(),
+				SPARK_PRIMARY_NAMESPACE,
+				SPARK_CROSS_CHAIN_NAMESPACE,
+				&key,
+			)
+			.await
+			.map_err(|e| StorageError::Implementation(format!("{e:?}")))?;
+			let swap: StoredCrossChainSwap = serde_json::from_slice(&data)?;
+			if swap.provider == provider && !swap.is_terminal {
+				swaps.push(swap);
+			}
+		}
+		Ok(swaps)
 	}
 
 	async fn set_lnurl_metadata(
@@ -851,6 +1021,285 @@ mod tests {
 			data: HashMap::new(),
 			revision,
 		}
+	}
+
+	fn payment(status: breez_sdk_spark::PaymentStatus) -> Payment {
+		Payment {
+			id: "payment_1".to_string(),
+			payment_type: breez_sdk_spark::PaymentType::Receive,
+			status,
+			amount: 1000,
+			fees: 0,
+			timestamp: 123,
+			method: breez_sdk_spark::PaymentMethod::Spark,
+			details: None,
+			conversion_details: None,
+		}
+	}
+
+	#[tokio::test]
+	async fn legacy_deposit_payments_migrate_and_recover_without_duplicate_events() {
+		use breez_sdk_spark::{PaymentStatus, Storage};
+		let (store, path) = test_store();
+		let legacy = serde_json::json!({
+			"id": "old_deposit", "payment_type": "Receive", "status": "Completed",
+			"amount": 1000, "fees": 10, "timestamp": 123, "method": "Deposit",
+			"details": {"Deposit": {"tx_id": "funding_tx"}}, "conversion_details": null,
+		});
+		assert!(serde_json::from_value::<Payment>(legacy.clone()).is_err());
+		KVStore::write(
+			store.store.as_ref(),
+			SPARK_PRIMARY_NAMESPACE,
+			SPARK_PAYMENTS_NAMESPACE,
+			"old_deposit",
+			serde_json::to_vec(&legacy).unwrap(),
+		)
+		.await
+		.unwrap();
+		let mut current = payment(PaymentStatus::Completed);
+		current.method = breez_sdk_spark::PaymentMethod::Deposit;
+		current.details =
+			Some(PaymentDetails::Deposit { tx_id: "current_tx".to_string(), vout: 7 });
+		store.apply_payment_update(current.clone()).await.unwrap();
+		store
+			.set_cached_item(
+				"sync_offset".to_string(),
+				serde_json::json!({"offset": 42, "last_synced_final_token_payment_id": "token_payment"}).to_string(),
+			)
+			.await
+			.unwrap();
+		store.migrate_deposit_details().await.unwrap();
+		assert_eq!(
+			store.list_payments(StorageListPaymentsRequest::default()).await.unwrap().len(),
+			2
+		);
+		let mut migrated = store.get_payment_by_id("old_deposit".to_string()).await.unwrap();
+		assert_eq!(migrated.status, PaymentStatus::Completed);
+		assert_eq!(migrated.amount, 1000);
+		assert_eq!(migrated.fees, 10);
+		assert_eq!(migrated.timestamp, 123);
+		assert!(migrated.details.is_none());
+		let sync: serde_json::Value = serde_json::from_str(
+			&store.get_cached_item("sync_offset".to_string()).await.unwrap().unwrap(),
+		)
+		.unwrap();
+		assert_eq!(
+			sync,
+			serde_json::json!({"offset": 0, "last_synced_final_token_payment_id": "token_payment"})
+		);
+		assert_eq!(
+			serde_json::to_value(store.get_payment_by_id(current.id.clone()).await.unwrap())
+				.unwrap(),
+			serde_json::to_value(current).unwrap()
+		);
+
+		// A resync supplies the actual output index without emitting payment success twice.
+		migrated.details =
+			Some(PaymentDetails::Deposit { tx_id: "funding_tx".to_string(), vout: 3 });
+		assert!(!store.apply_payment_update(migrated.clone()).await.unwrap());
+		store
+			.set_cached_item("sync_offset".to_string(), "{\"offset\":99}".to_string())
+			.await
+			.unwrap();
+		let reopened = SparkStore::new(Arc::clone(&store.store));
+		reopened.migrate_deposit_details().await.unwrap();
+		assert_eq!(
+			reopened.get_cached_item("sync_offset".to_string()).await.unwrap().as_deref(),
+			Some("{\"offset\":99}")
+		);
+		assert_eq!(
+			serde_json::to_value(reopened.get_payment_by_id(migrated.id.clone()).await.unwrap())
+				.unwrap(),
+			serde_json::to_value(migrated).unwrap()
+		);
+		drop(reopened);
+		drop(store);
+		std::fs::remove_dir_all(path).unwrap();
+	}
+
+	#[tokio::test]
+	async fn payment_updates_preserve_terminal_status_and_enrich_details() {
+		use breez_sdk_spark::{PaymentStatus, Storage};
+		let (store, path) = test_store();
+		for terminal in [PaymentStatus::Completed, PaymentStatus::Failed] {
+			let mut pending = payment(PaymentStatus::Pending);
+			pending.id = format!("payment_{terminal:?}");
+			assert!(store.apply_payment_update(pending.clone()).await.unwrap());
+			assert!(!store.apply_payment_update(pending.clone()).await.unwrap());
+			let mut completed = pending.clone();
+			completed.status = terminal;
+			assert!(store.apply_payment_update(completed.clone()).await.unwrap());
+
+			completed.details = Some(PaymentDetails::Spark {
+				invoice_details: None,
+				htlc_details: None,
+				conversion_info: None,
+			});
+			assert!(!store.apply_payment_update(completed.clone()).await.unwrap());
+			assert!(!store.apply_payment_update(pending.clone()).await.unwrap());
+			pending.status = if terminal == PaymentStatus::Completed {
+				PaymentStatus::Failed
+			} else {
+				PaymentStatus::Completed
+			};
+			assert!(!store.apply_payment_update(pending).await.unwrap());
+			let stored = store.get_payment_by_id(completed.id).await.unwrap();
+			assert_eq!(stored.status, terminal);
+			assert!(stored.details.is_some());
+		}
+		drop(store);
+		std::fs::remove_dir_all(path).unwrap();
+	}
+
+	#[tokio::test(flavor = "multi_thread")]
+	async fn concurrent_payment_updates_emit_once() {
+		use breez_sdk_spark::{PaymentStatus, Storage};
+		let (store, path) = test_store();
+		let mut handles = Vec::new();
+		for _ in 0..32 {
+			let store = store.clone();
+			handles.push(tokio::spawn(async move {
+				store.apply_payment_update(payment(PaymentStatus::Completed)).await.unwrap()
+			}));
+		}
+		let mut events = 0;
+		for handle in handles {
+			events += usize::from(handle.await.unwrap());
+		}
+		assert_eq!(events, 1);
+		drop(store);
+		std::fs::remove_dir_all(path).unwrap();
+	}
+
+	#[tokio::test]
+	async fn deposit_updates_preserve_claims_and_reject_stale_refunds() {
+		use breez_sdk_spark::{InstantClaimStatus, RefundState, Storage};
+		let (store, path) = test_store();
+		// Existing deposits predate the new optional fields.
+		let legacy = serde_json::json!({
+			"txid": "deposit", "vout": 0, "amount_sats": 1000, "is_mature": false,
+			"refund_tx": null, "refund_tx_id": null, "claim_error": null,
+		});
+		KVStore::write(
+			store.store.as_ref(),
+			SPARK_PRIMARY_NAMESPACE,
+			SPARK_DEPOSITS_NAMESPACE,
+			"deposit_0",
+			serde_json::to_vec(&legacy).unwrap(),
+		)
+		.await
+		.unwrap();
+		let deposit = store.list_deposits().await.unwrap().pop().unwrap();
+		assert!(deposit.refund_state.is_none());
+		assert!(deposit.instant_claim_status.is_none());
+
+		let claim = InstantClaimStatus::Submitted { claim_id: "claim".to_string() };
+		store
+			.update_deposit(
+				"deposit".to_string(),
+				0,
+				UpdateDepositPayload::InstantClaim { status: claim.clone() },
+			)
+			.await
+			.unwrap();
+		let pending = RefundState::BroadcastPending { last_error: None };
+		store
+			.update_deposit(
+				"deposit".to_string(),
+				0,
+				UpdateDepositPayload::Refund {
+					refund_txid: "new_refund".to_string(),
+					refund_tx: "signed_tx".to_string(),
+					state: pending.clone(),
+				},
+			)
+			.await
+			.unwrap();
+		store
+			.update_deposit(
+				"deposit".to_string(),
+				0,
+				UpdateDepositPayload::RefundBroadcastState {
+					refund_txid: "old_refund".to_string(),
+					state: RefundState::Broadcast,
+				},
+			)
+			.await
+			.unwrap();
+		store.add_deposit("deposit".to_string(), 0, 1000, true).await.unwrap();
+		let deposit = store.list_deposits().await.unwrap().pop().unwrap();
+		assert_eq!(deposit.refund_state, Some(pending));
+		assert_eq!(deposit.instant_claim_status, Some(claim));
+		assert_eq!(deposit.refund_tx.as_deref(), Some("signed_tx"));
+		assert!(deposit.is_mature);
+		store
+			.update_deposit(
+				"deposit".to_string(),
+				0,
+				UpdateDepositPayload::RefundBroadcastState {
+					refund_txid: "new_refund".to_string(),
+					state: RefundState::Broadcast,
+				},
+			)
+			.await
+			.unwrap();
+		assert_eq!(
+			store.list_deposits().await.unwrap()[0].refund_state,
+			Some(RefundState::Broadcast)
+		);
+		drop(store);
+		std::fs::remove_dir_all(path).unwrap();
+	}
+
+	#[tokio::test]
+	async fn cross_chain_swaps_round_trip_and_filter_by_provider_and_state() {
+		use breez_sdk_spark::Storage;
+		let (store, path) = test_store();
+		assert!(
+			store
+				.get_cross_chain_swap("boltz".to_string(), "missing".to_string())
+				.await
+				.unwrap()
+				.is_none()
+		);
+		for (provider, id, is_terminal) in [
+			("boltz", "same_id", false),
+			("orchestra", "same_id", false),
+			("boltz", "finished", true),
+		] {
+			store
+				.set_cross_chain_swap(StoredCrossChainSwap {
+					provider: provider.to_string(),
+					id: id.to_string(),
+					is_terminal,
+					updated_at: 123,
+					data: "opaque_data".to_string(),
+					secrets: "ciphertext".to_string(),
+				})
+				.await
+				.unwrap();
+		}
+		let mut swap = store
+			.get_cross_chain_swap("boltz".to_string(), "same_id".to_string())
+			.await
+			.unwrap()
+			.unwrap();
+		assert_eq!(swap.data, "opaque_data");
+		assert_eq!(swap.secrets, "ciphertext");
+		assert_eq!(
+			store.list_active_cross_chain_swaps("boltz".to_string()).await.unwrap().len(),
+			1
+		);
+		swap.is_terminal = true;
+		swap.updated_at = 456;
+		store.set_cross_chain_swap(swap).await.unwrap();
+		assert!(store.list_active_cross_chain_swaps("boltz".to_string()).await.unwrap().is_empty());
+		assert_eq!(
+			store.list_active_cross_chain_swaps("orchestra".to_string()).await.unwrap().len(),
+			1
+		);
+		drop(store);
+		std::fs::remove_dir_all(path).unwrap();
 	}
 
 	#[test]
