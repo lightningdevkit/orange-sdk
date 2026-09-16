@@ -19,10 +19,10 @@ use bitcoin_payment_instructions::PaymentMethod;
 use bitcoin_payment_instructions::amount::Amount;
 
 use breez_sdk_spark::{
-	BreezSdk, EventListener, GetInfoRequest, ListPaymentsRequest, OptimizationConfig,
-	PaymentDetails, PaymentStatus, PaymentType, PrepareSendPaymentRequest, ReceivePaymentMethod,
-	ReceivePaymentRequest, RegisterLightningAddressRequest, SdkBuilder, SdkError, SdkEvent,
-	SendPaymentMethod, SendPaymentRequest,
+	BreezSdk, EventListener, GetInfoRequest, LeafOptimizationConfig, ListPaymentsRequest,
+	PaymentDetails, PaymentRequest, PaymentStatus, PaymentType, PrepareSendPaymentRequest,
+	ReceivePaymentMethod, ReceivePaymentRequest, RegisterLightningAddressRequest, SdkBuilder,
+	SdkError, SdkEvent, SendPaymentMethod, SendPaymentRequest, custom_storage,
 };
 
 use graduated_rebalancer::ReceivedLightningPayment;
@@ -84,10 +84,14 @@ impl SparkWalletConfig {
 			max_deposit_claim_fee: None,
 			lnurl_domain: self.lnurl_domain,
 			private_enabled_default: true,
-			optimization_config: OptimizationConfig { auto_enabled: true, multiplicity: 1 },
+			leaf_optimization_config: LeafOptimizationConfig {
+				auto_enabled: true,
+				multiplicity: 1,
+			},
 			stable_balance_config: None,
 			max_concurrent_claims: 4,
 			spark_config: None,
+			..breez_sdk_spark::default_config(network)
 		})
 	}
 }
@@ -142,6 +146,7 @@ impl TrustedWalletInterface for Spark {
 					amount_sats,
 					expiry_secs: None,
 					payment_hash: None,
+					receiver_identity_public_key: None,
 				},
 			};
 			let res = self.spark_wallet.receive_payment(params).await?;
@@ -176,7 +181,7 @@ impl TrustedWalletInterface for Spark {
 				})?;
 
 				let params = PrepareSendPaymentRequest {
-					payment_request: invoice.to_string(),
+					payment_request: PaymentRequest::Input { input: invoice.to_string() },
 					amount: Some(sats.into()),
 					token_identifier: None,
 					conversion_options: None,
@@ -210,7 +215,7 @@ impl TrustedWalletInterface for Spark {
 				})?;
 
 				let params = PrepareSendPaymentRequest {
-					payment_request: invoice.to_string(),
+					payment_request: PaymentRequest::Input { input: invoice.to_string() },
 					amount: Some(sats.into()),
 					token_identifier: None,
 					conversion_options: None,
@@ -350,7 +355,12 @@ impl Spark {
 		};
 
 		let spark_store = Arc::new(spark_store::SparkStore::new(store));
-		let builder = SdkBuilder::new(spark_config, seed).with_storage(spark_store);
+		spark_store.migrate_deposit_details().await.map_err(|e| {
+			log_error!(logger, "Failed to migrate Spark storage: {e:?}");
+			InitFailure::TrustedFailure(SdkError::from(e).into())
+		})?;
+		let builder =
+			SdkBuilder::new(spark_config, seed).with_storage_backend(custom_storage(spark_store));
 
 		let spark_wallet = Arc::new(builder.build().await.map_err(|e| {
 			log_error!(logger, "Failed to initialize Spark wallet: {e:?}");
@@ -429,11 +439,14 @@ impl EventListener for SparkEventHandler {
 					"Spark payment pending event received for payment: {payment:?}"
 				);
 			},
-			SdkEvent::Optimization { optimization_event } => {
+			SdkEvent::AutoOptimization { optimization_event } => {
 				log_debug!(self.logger, "Spark optimization event: {optimization_event:?}");
 			},
 			SdkEvent::LightningAddressChanged { lightning_address } => {
 				log_debug!(self.logger, "Spark lightning address changed: {lightning_address:?}");
+			},
+			SdkEvent::UnilateralExitStateChanged => {
+				log_debug!(self.logger, "Spark unilateral exit state changed");
 			},
 			SdkEvent::NewDeposits { new_deposits } => {
 				log_info!(self.logger, "Spark wallet new deposits: {new_deposits:?}");
