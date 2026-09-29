@@ -1,6 +1,5 @@
 //! An implementation of `TrustedWalletInterface` using the Cashu (CDK) SDK.
 
-use crate::bitcoin::hex::DisplayHex;
 use crate::logging::Logger;
 use crate::runtime::Runtime;
 use crate::store::{PaymentId, TxMetadataStore, TxStatus};
@@ -62,8 +61,6 @@ pub struct Cashu {
 	cashu_wallet: Arc<Wallet>,
 	unit: CurrencyUnit,
 	shutdown_sender: watch::Sender<()>,
-	payment_success_sender: watch::Sender<()>,
-	payment_success_flag: watch::Receiver<()>,
 	logger: Arc<Logger>,
 	supports_bolt12: Arc<std::sync::atomic::AtomicBool>,
 	supports_mpp: Arc<std::sync::atomic::AtomicBool>,
@@ -362,35 +359,6 @@ impl TrustedWalletInterface for Cashu {
 		})
 	}
 
-	fn await_payment_success(
-		&self, payment_hash: [u8; 32],
-	) -> Pin<Box<dyn Future<Output = Option<ReceivedLightningPayment>> + Send + '_>> {
-		Box::pin(async move {
-			loop {
-				let txs = self
-					.cashu_wallet
-					.list_transactions(Some(TransactionDirection::Outgoing))
-					.await
-					.ok()?;
-
-				let hex = payment_hash.to_lower_hex_string();
-				let tx = txs.iter().find(|tx| {
-					tx.metadata.get(PAYMENT_HASH_METADATA_KEY).is_some_and(|h| h == &hex)
-				});
-
-				if let Some(tx) = tx {
-					let payment_id = Self::id_to_32_byte_array(tx.quote_id.as_ref().expect("safe"));
-					return Some(ReceivedLightningPayment {
-						id: payment_id,
-						fee_paid_msat: Some(convert_amount(tx.fee, &self.unit).ok()?.milli_sats()),
-					});
-				}
-
-				self.await_payment_success().await;
-			}
-		})
-	}
-
 	fn get_lightning_address(
 		&self,
 	) -> Pin<Box<dyn Future<Output = Result<Option<String>, TrustedError>> + Send + '_>> {
@@ -462,11 +430,13 @@ impl Cashu {
 			},
 		};
 
-		let db = Arc::new(CashuKvDatabase::new(Arc::clone(&store)).await.map_err(|e| {
-			InitFailure::TrustedFailure(TrustedError::Other(format!(
-				"Failed to create Cashu database: {e}"
-			)))
-		})?);
+		let db = Arc::new(
+			CashuKvDatabase::new(Arc::clone(&store), Arc::clone(&runtime)).await.map_err(|e| {
+				InitFailure::TrustedFailure(TrustedError::Other(format!(
+					"Failed to create Cashu database: {e}"
+				)))
+			})?,
+		);
 
 		// Create the Cashu wallet
 		let cashu_wallet = Arc::new(
@@ -506,7 +476,6 @@ impl Cashu {
 		}
 
 		let (shutdown_sender, mut shutdown_receiver) = watch::channel::<()>(());
-		let (payment_success_sender, payment_success_flag) = watch::channel(());
 
 		// Create channel for mint quote monitoring with bounded capacity
 		let (mint_quote_sender, mut mint_quote_receiver) = mpsc::channel::<MintQuote>(32);
@@ -645,8 +614,6 @@ impl Cashu {
 			cashu_wallet,
 			unit: cashu_config.unit,
 			shutdown_sender,
-			payment_success_sender,
-			payment_success_flag,
 			logger,
 			supports_bolt12,
 			supports_mpp,
@@ -688,7 +655,7 @@ impl Cashu {
 		let logger = Arc::clone(&self.logger);
 		let event_queue = Arc::clone(&self.event_queue);
 		let tx_metadata = self.tx_metadata.clone();
-		let payment_success_sender = self.payment_success_sender.clone();
+		let unit = self.unit.clone();
 		self.runtime.spawn_background_task(async move {
 			let mut metadata = HashMap::new();
 			if let Some(hash) = &payment_hash {
@@ -700,6 +667,21 @@ impl Cashu {
 				prepared.confirm().await
 			}
 			.await;
+			let fee_paid_msat = melt_result
+				.as_ref()
+				.ok()
+				.and_then(|res| convert_amount(res.fee_paid(), &unit).ok())
+				.map(|fee| fee.milli_sats());
+			// confirm() waits for a terminal result. Wake registered rebalances even
+			// when their public payment event is suppressed or cannot be persisted.
+			if let Some(hash) = payment_hash {
+				let receipt = melt_result
+					.as_ref()
+					.ok()
+					.filter(|res| res.state() == MeltQuoteState::Paid)
+					.map(|_| ReceivedLightningPayment { id: payment_id, fee_paid_msat });
+				event_queue.rebalance_watchers.sent(hash.0, receipt);
+			}
 			match melt_result {
 				Ok(res) => {
 					match res.state() {
@@ -712,8 +694,6 @@ impl Cashu {
 								map.get(&payment_id).is_some_and(|m| m.ty.is_rebalance())
 							};
 							if is_rebalance {
-								// make sure we still send payment success
-								payment_success_sender.send(()).unwrap();
 								return;
 							}
 
@@ -776,17 +756,14 @@ impl Cashu {
 								);
 							}
 
-							let fee_paid_sat: u64 = res.fee_paid().into();
 							let _ = event_queue
 								.add_event(Event::PaymentSuccessful {
 									payment_id,
 									payment_hash: hash,
 									payment_preimage,
-									fee_paid_msat: Some(fee_paid_sat * 1_000), // convert to msats
+									fee_paid_msat,
 								})
 								.await;
-
-							payment_success_sender.send(()).unwrap();
 						},
 						MeltQuoteState::Failed => {
 							log_error!(logger, "Melt failed for quote: {quote_id}");
@@ -968,12 +945,6 @@ impl Cashu {
 
 		Ok(fee)
 	}
-
-	pub(crate) async fn await_payment_success(&self) {
-		let mut flag = self.payment_success_flag.clone();
-		flag.mark_unchanged();
-		let _ = flag.changed().await;
-	}
 }
 
 fn convert_amount(cdk_amount: CdkAmount, unit: &CurrencyUnit) -> Result<Amount, TrustedError> {
@@ -987,5 +958,60 @@ fn convert_amount(cdk_amount: CdkAmount, unit: &CurrencyUnit) -> Result<Amount, 
 		unit => {
 			Err(TrustedError::Other(format!("Unsupported currency unit {unit} for Cashu wallet")))
 		},
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+	use crate::store::{TxMetadata, TxType};
+	use crate::test_store::{TestStore, test_event_queue, test_logger, test_runtime};
+	use std::sync::atomic::AtomicBool;
+
+	#[tokio::test(flavor = "multi_thread")]
+	async fn failed_melt_resolves_rebalance_wait_without_a_public_event() {
+		let store = TestStore::default();
+		let runtime = test_runtime();
+		let tx_metadata = TxMetadataStore::new(store.shared()).await;
+		let id = [1; 32];
+		tx_metadata
+			.insert(
+				PaymentId::Trusted(id),
+				TxMetadata {
+					time: Duration::ZERO,
+					ty: TxType::PendingRebalance {
+						payment_hash: None,
+						trigger: None,
+						amount_msat: None,
+					},
+				},
+			)
+			.await;
+		let event_queue = test_event_queue(&store, tx_metadata.clone(), Arc::clone(&runtime)).await;
+		let db =
+			Arc::new(CashuKvDatabase::new(store.shared(), Arc::clone(&runtime)).await.unwrap());
+		let wallet = Cashu {
+			cashu_wallet: Arc::new(
+				Wallet::new("http://127.0.0.1:1", CurrencyUnit::Sat, db, [1; 64], None).unwrap(),
+			),
+			unit: CurrencyUnit::Sat,
+			shutdown_sender: watch::channel(()).0,
+			logger: test_logger(),
+
+			supports_bolt12: Arc::new(AtomicBool::new(false)),
+			supports_mpp: Arc::new(AtomicBool::new(false)),
+			mint_quote_sender: mpsc::channel(1).0,
+			event_queue: Arc::clone(&event_queue),
+			tx_metadata,
+			runtime: Arc::clone(&runtime),
+			npubcash_url: None,
+			npub: None,
+		};
+		let result = event_queue.rebalance_watchers.register([2; 32]);
+		// A missing quote fails in CDK before any network request.
+		wallet.spawn_melt("missing-quote".into(), id, Some(PaymentHash([2; 32])));
+		assert!(tokio::time::timeout(Duration::from_secs(2), result).await.unwrap().is_none());
+		runtime.wait_on_background_tasks();
+		assert!(event_queue.next_event().is_none());
 	}
 }

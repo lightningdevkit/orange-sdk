@@ -297,6 +297,12 @@ impl Wallet {
 		self.inner.event_handled().is_ok()
 	}
 
+	/// Confirms the last retrieved event handled without blocking the calling thread.
+	/// Await this before retrieving and acknowledging the next event.
+	pub async fn event_handled_async(&self) -> bool {
+		RTPoller::new(self.inner.event_handled_async(), Arc::clone(&self.rt)).await.is_ok()
+	}
+
 	/// Gets the lightning address for this wallet, if one is set.
 	pub async fn get_lightning_address(&self) -> Result<Option<String>, WalletError> {
 		let result = self.inner.get_lightning_address().await?;
