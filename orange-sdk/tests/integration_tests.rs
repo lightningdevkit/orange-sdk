@@ -374,6 +374,71 @@ async fn test_pay_mpp_trusted_and_lightning() {
 
 #[tokio::test(flavor = "multi_thread")]
 #[test_log::test]
+#[cfg_attr(
+	feature = "_cashu-tests",
+	ignore = "CDK's test mint/payment processor does not support partial MPP melts"
+)]
+async fn test_pay_error_reports_dispatched_mpp_leg() {
+	test_utils::run_test(|params| async move {
+		let wallet = Arc::clone(&params.wallet);
+		let bitcoind = Arc::clone(&params.bitcoind);
+		let third_party = Arc::clone(&params.third_party);
+		let electrsd = Arc::clone(&params.electrsd);
+		let lsp = Arc::clone(&params.lsp);
+		let desc = Bolt11InvoiceDescription::Direct(Description::empty());
+
+		// Fund the trusted wallet with 100 sats before any channel exists.
+		let trusted_amt = Amount::from_sats(100).unwrap();
+		let uri = wallet.get_single_use_receive_uri(Some(trusted_amt)).await.unwrap();
+		assert!(uri.from_trusted);
+		third_party.bolt11_payment().send(&uri.invoice, None).unwrap();
+		test_utils::wait_for_condition("trusted balance funded", || async {
+			wallet.get_balance().await.unwrap().trusted == trusted_amt
+		})
+		.await;
+		assert!(matches!(wait_next_event(&wallet).await, Event::PaymentReceived { .. }));
+
+		open_channel_from_lsp(&wallet, Arc::clone(&third_party)).await;
+		generate_blocks(&bitcoind, &electrsd, 6).await;
+		test_utils::wait_for_condition("wallet sync after channel open", || async {
+			wallet.channels().iter().any(|c| c.confirmations.is_some_and(|n| n > 0) && c.is_usable)
+		})
+		.await;
+
+		// Take the wallet's lightning node offline from the LSP. The lightning balance still counts
+		// the channel, so `pay` attempts lightning, but there is no route. The trusted wallet keeps
+		// its own connectivity, so its MPP leg can still be dispatched.
+		lsp.disconnect(wallet.node_id()).unwrap();
+		test_utils::wait_for_condition("wallet disconnected from LSP", || async {
+			!wallet.is_connected_to_lsp()
+		})
+		.await;
+
+		// 200 sats: more than the trusted balance, so the trusted wallet alone can't pay it and
+		// `pay` falls through to lightning and then to the trusted + lightning MPP split.
+		let pay_amt = Amount::from_sats(200).unwrap();
+		let invoice =
+			third_party.bolt11_payment().receive(pay_amt.milli_sats(), &desc, 300).unwrap();
+		let info = PaymentInfo::build(
+			wallet.parse_payment_instructions(&invoice.to_string()).await.unwrap(),
+			Some(pay_amt),
+		)
+		.unwrap();
+
+		// The trusted leg was dispatched before the lightning leg failed, so the error must say so
+		// (and name the in-flight payment) rather than look like a payment that never left.
+		match wallet.pay(&info).await {
+			Err(WalletError::PartialPaymentPending { payment_id, .. }) => {
+				assert!(matches!(payment_id, orange_sdk::PaymentId::Trusted(_)));
+			},
+			res => panic!("Expected PartialPaymentPending, got {res:?}"),
+		}
+	})
+	.await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[test_log::test]
 async fn test_sweep_to_ln() {
 	test_utils::run_test(|params| async move {
 		let wallet = Arc::clone(&params.wallet);

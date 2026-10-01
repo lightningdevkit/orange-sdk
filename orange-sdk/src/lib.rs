@@ -515,6 +515,15 @@ pub enum WalletError {
 	LdkNodeFailure(NodeError),
 	/// Failure in the trusted wallet implementation.
 	TrustedFailure(TrustedError),
+	/// The payment could not be completed, but part of it had already been sent before the
+	/// failure. That part is still pending under `payment_id` and reports its outcome through the
+	/// usual payment events, so this must not be treated as a payment that never left the wallet.
+	PartialPaymentPending {
+		/// The id the already-sent part is tracked under.
+		payment_id: PaymentId,
+		/// The failure that stopped the rest of the payment.
+		error: NodeError,
+	},
 }
 
 impl From<TrustedError> for WalletError {
@@ -1473,6 +1482,11 @@ impl Wallet {
 			}
 		}
 
+		// If part of the payment is already in flight, report that over any earlier failure.
+		if let Some(e @ WalletError::PartialPaymentPending { .. }) = last_mpp_err {
+			return Err(e);
+		}
+
 		Err(last_lightning_err
 			.or(last_mpp_err)
 			.or(last_trusted_err)
@@ -1577,7 +1591,10 @@ impl Wallet {
 						"Failed to replay pending MPP events: {queue_err}"
 					);
 				}
-				return Err(e.into());
+				return Err(WalletError::PartialPaymentPending {
+					payment_id: surface_id,
+					error: e,
+				});
 			},
 		};
 
