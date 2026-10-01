@@ -115,6 +115,11 @@ impl From<OrangeWalletError> for WalletError {
 		match e {
 			OrangeWalletError::LdkNodeFailure(e) => WalletError::LdkNodeFailure(e.to_string()),
 			OrangeWalletError::TrustedFailure(e) => WalletError::TrustedFailure(e.to_string()),
+			OrangeWalletError::PartialPaymentPending { payment_id, error } => {
+				WalletError::LdkNodeFailure(format!(
+					"part of the payment is still pending as {payment_id:?}: {error}"
+				))
+			},
 		}
 	}
 }
