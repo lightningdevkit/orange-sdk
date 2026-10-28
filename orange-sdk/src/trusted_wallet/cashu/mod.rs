@@ -26,7 +26,7 @@ use cdk::nuts::nut23::Amountless;
 use cdk::nuts::{CurrencyUnit, MeltQuoteState};
 use cdk::wallet::MintQuote;
 use cdk::wallet::Wallet;
-use cdk::wallet::types::{Transaction, TransactionDirection};
+use cdk::wallet::types::{Transaction, TransactionDirection, TransactionStatus};
 use cdk::{Amount as CdkAmount, StreamExt};
 
 use graduated_rebalancer::ReceivedLightningPayment;
@@ -181,13 +181,7 @@ impl TrustedWalletInterface for Cashu {
 				TrustedError::WalletOperationFailed(format!("Failed to list transactions: {e}"))
 			})?;
 
-			// Convert CDK Transaction to Payment
-			let payments = transactions
-				.into_iter()
-				.map(|t| Self::convert_transaction_to_payment(t, &self.unit))
-				.collect::<Result<Vec<_>, _>>()?;
-
-			Ok(payments)
+			Self::convert_transactions_to_payments(transactions, &self.unit)
 		})
 	}
 
@@ -375,7 +369,8 @@ impl TrustedWalletInterface for Cashu {
 
 				let hex = payment_hash.to_lower_hex_string();
 				let tx = txs.iter().find(|tx| {
-					tx.metadata.get(PAYMENT_HASH_METADATA_KEY).is_some_and(|h| h == &hex)
+					tx.status == TransactionStatus::Completed
+						&& tx.metadata.get(PAYMENT_HASH_METADATA_KEY).is_some_and(|h| h == &hex)
 				});
 
 				if let Some(tx) = tx {
@@ -477,6 +472,29 @@ impl Cashu {
 					)))
 				})?,
 		);
+
+		// Recover before exposing the wallet or starting tasks that create operations.
+		// This must run on every open, independently of the seed-restore flag.
+		let recovery = cashu_wallet.recover_incomplete_sagas().await.map_err(|e| {
+			InitFailure::TrustedFailure(TrustedError::WalletOperationFailed(format!(
+				"Failed to recover Cashu operations: {e}"
+			)))
+		})?;
+		if recovery.failed != 0 {
+			return Err(InitFailure::TrustedFailure(TrustedError::WalletOperationFailed(format!(
+				"Failed to recover {} Cashu operations; reopen the wallet to retry",
+				recovery.failed
+			))));
+		}
+		if !recovery.is_empty() {
+			log_info!(
+				logger,
+				"Cashu recovery: {} recovered, {} compensated, {} still pending (retry on next startup)",
+				recovery.recovered,
+				recovery.compensated,
+				recovery.skipped
+			);
+		}
 
 		let supports_bolt12 = Arc::new(std::sync::atomic::AtomicBool::new(false));
 		let supports_mpp = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -849,6 +867,35 @@ impl Cashu {
 		id_array
 	}
 
+	fn convert_transactions_to_payments(
+		transactions: Vec<Transaction>, unit: &CurrencyUnit,
+	) -> Result<Vec<Payment>, TrustedError> {
+		let mut outgoing_quotes: HashMap<String, usize> = HashMap::new();
+		let mut selected: Vec<Transaction> = Vec::new();
+		// CDK retains each retry under its saga ID, while Orange identifies an
+		// outgoing payment by quote. A settled attempt wins; otherwise expose the
+		// newest attempt. UUIDv7 saga IDs break ties in second-resolution timestamps.
+		let priority = |tx: &Transaction| {
+			(tx.status == TransactionStatus::Completed, tx.timestamp, tx.saga_id)
+		};
+		for transaction in transactions {
+			if transaction.direction == TransactionDirection::Outgoing {
+				if let Some(quote_id) = &transaction.quote_id {
+					if let Some(&index) = outgoing_quotes.get(quote_id) {
+						if priority(&transaction) > priority(&selected[index]) {
+							selected[index] = transaction;
+						}
+						continue;
+					}
+					outgoing_quotes.insert(quote_id.clone(), selected.len());
+				}
+			}
+			// Reusable incoming quotes can represent multiple actual receipts.
+			selected.push(transaction);
+		}
+		selected.into_iter().map(|tx| Self::convert_transaction_to_payment(tx, unit)).collect()
+	}
+
 	/// Convert a CDK Transaction to a Payment struct
 	fn convert_transaction_to_payment(
 		transaction: Transaction, unit: &CurrencyUnit,
@@ -865,9 +912,11 @@ impl Cashu {
 
 		let outbound = transaction.direction == TransactionDirection::Outgoing;
 
-		// For Cashu, we'll assume all completed transactions are successful
-		// and all others are pending. CDK doesn't have a direct status mapping.
-		let status = TxStatus::Completed; // Assume completed since it's in the transaction list
+		let status = match transaction.status {
+			TransactionStatus::Pending => TxStatus::Pending,
+			TransactionStatus::Completed => TxStatus::Completed,
+			TransactionStatus::Failed => TxStatus::Failed,
+		};
 
 		// Convert timestamp to Duration since epoch
 		let time_since_epoch = Duration::from_secs(transaction.timestamp);
@@ -941,7 +990,7 @@ impl Cashu {
 			fee = fee.saturating_add(convert_amount(keyset_fee, &self.unit)?);
 		}
 
-		let active_keyset = self.cashu_wallet.get_active_keyset().await.map_err(|e| {
+		let active_keyset = self.cashu_wallet.active_keyset().await.map_err(|e| {
 			TrustedError::WalletOperationFailed(format!("Failed to get active keyset: {e}"))
 		})?;
 		let fee_and_amounts =

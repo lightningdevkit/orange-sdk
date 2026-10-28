@@ -1,6 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::fmt::Debug;
 use std::str::FromStr;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
 
 use crate::dyn_store::{DynStore, read_keys_bounded};
@@ -37,6 +38,7 @@ const KEYS_KEY: &str = "keys";
 const PROOFS_KEY: &str = "proofs";
 const PROOFS_BLOB_KEY: &str = "proof_set";
 const PROOFS_SCHEMA_VERSION: u8 = 1;
+const DERIVATION_COUNTERS_KEY: &str = "derivation_counters";
 const KEYSET_COUNTERS_KEY: &str = "keyset_counters";
 const TRANSACTIONS_KEY: &str = "transactions";
 const KEYSETS_TABLE_KEY: &str = "keysets_table";
@@ -130,9 +132,11 @@ impl From<DatabaseError> for cdk::cdk_database::Error {
 pub struct CashuKvDatabase {
 	store: Arc<dyn DynStore>,
 	keyset_counter_lock: Mutex<()>,
+	records_mutation_lock: Mutex<()>,
 	// This only serializes writers in this process. The whole-snapshot storage
 	// format requires a single active wallet instance for a given store.
 	proofs_mutation_lock: Mutex<()>,
+	proofs_cache_needs_reload: AtomicBool,
 	// In-memory caches for frequently accessed data
 	mints_cache: Arc<RwLock<HashMap<MintUrl, Option<MintInfo>>>>,
 	proofs_cache: Arc<RwLock<Vec<ProofInfo>>>,
@@ -168,15 +172,98 @@ impl CashuKvDatabase {
 		let database = Self {
 			store,
 			keyset_counter_lock: Mutex::new(()),
+			records_mutation_lock: Mutex::new(()),
 			proofs_mutation_lock: Mutex::new(()),
+			proofs_cache_needs_reload: AtomicBool::new(false),
 			mints_cache: Arc::new(RwLock::new(HashMap::new())),
 			proofs_cache: Arc::new(RwLock::new(Vec::new())),
 		};
+
+		database.migrate_transaction_ids().await?;
 
 		// Initialize caches from persistent storage
 		database.load_caches().await?;
 
 		Ok(database)
+	}
+
+	// CDK 0.18 identifies saga transactions by saga ID instead of proof Ys.
+	// Run before exposing the database to recovery. Copy before deleting so an
+	// interrupted migration can resume; never overwrite a conflicting record.
+	async fn migrate_transaction_ids(&self) -> Result<(), DatabaseError> {
+		const MIGRATION_KEY: &str = "cdk_018_transaction_ids";
+		match KVStore::read(self.store.as_ref(), CASHU_PRIMARY_KEY, "", MIGRATION_KEY).await {
+			Ok(data) if data == [1] => return Ok(()),
+			Ok(_) => return Err(DatabaseError::InvalidFormat),
+			Err(e) if e.kind() == io::ErrorKind::NotFound => {},
+			Err(e) => return Err(e.into()),
+		}
+		let keys = KVStore::list(self.store.as_ref(), CASHU_PRIMARY_KEY, TRANSACTIONS_KEY).await?;
+		if keys.is_empty() {
+			return Ok(());
+		}
+		for old_key in keys {
+			let data =
+				KVStore::read(self.store.as_ref(), CASHU_PRIMARY_KEY, TRANSACTIONS_KEY, &old_key)
+					.await?;
+			if data.is_empty() {
+				continue;
+			}
+			let transaction: Transaction = serde_json::from_slice(&data)
+				.map_err(|e| DatabaseError::Serialization(e.to_string()))?;
+			let new_key = transaction.id().to_string();
+			if old_key == new_key {
+				continue;
+			}
+			if old_key != TransactionId::new(transaction.ys.clone()).to_string() {
+				return Err(DatabaseError::InvalidFormat);
+			}
+			match KVStore::read(self.store.as_ref(), CASHU_PRIMARY_KEY, TRANSACTIONS_KEY, &new_key)
+				.await
+			{
+				Ok(existing) => {
+					let existing: Transaction = serde_json::from_slice(&existing)
+						.map_err(|e| DatabaseError::Serialization(e.to_string()))?;
+					if existing != transaction {
+						return Err(DatabaseError::Duplicate);
+					}
+				},
+				Err(e) if e.kind() == io::ErrorKind::NotFound => {
+					KVStore::write(
+						self.store.as_ref(),
+						CASHU_PRIMARY_KEY,
+						TRANSACTIONS_KEY,
+						&new_key,
+						data,
+					)
+					.await?;
+				},
+				Err(e) => return Err(e.into()),
+			}
+			KVStore::remove(
+				self.store.as_ref(),
+				CASHU_PRIMARY_KEY,
+				TRANSACTIONS_KEY,
+				&old_key,
+				false,
+			)
+			.await?;
+		}
+		// Mark complete only after every old key was removed. Remote stores then
+		// avoid downloading the whole transaction history on each startup.
+		KVStore::write(self.store.as_ref(), CASHU_PRIMARY_KEY, "", MIGRATION_KEY, vec![1]).await?;
+		Ok(())
+	}
+
+	async fn write_record<T: serde::Serialize>(
+		&self, namespace: &str, key: &str, value: &T,
+	) -> Result<(), cdk::cdk_database::Error> {
+		let data =
+			serde_json::to_vec(value).map_err(|e| DatabaseError::Serialization(e.to_string()))?;
+		KVStore::write(self.store.as_ref(), CASHU_PRIMARY_KEY, namespace, key, data)
+			.await
+			.map_err(DatabaseError::Io)?;
+		Ok(())
 	}
 
 	async fn load_caches(&self) -> Result<(), DatabaseError> {
@@ -186,10 +273,7 @@ impl CashuKvDatabase {
 		let (mints, proofs) =
 			tokio::join!(self.load_mints_from_store(), self.load_proofs_from_store());
 
-		if let Ok(mints) = mints {
-			let mut cache = self.mints_cache.write().unwrap();
-			*cache = mints;
-		}
+		*self.mints_cache.write().unwrap() = mints?;
 
 		// Proof errors must not be hidden: presenting an empty cache for an unreadable
 		// proof set could make the wallet report an incorrect balance.
@@ -209,6 +293,10 @@ impl CashuKvDatabase {
 
 		let mut mints = HashMap::with_capacity(keys.len());
 		for key in keys {
+			// Mint metadata shares this namespace under info_* keys.
+			if !key.starts_with("mint_") {
+				continue;
+			}
 			let data = KVStore::read(self.store.as_ref(), CASHU_PRIMARY_KEY, MINTS_KEY, &key)
 				.await
 				.map_err(DatabaseError::Io)?;
@@ -218,7 +306,7 @@ impl CashuKvDatabase {
 					.map_err(|e| DatabaseError::Serialization(e.to_string()))?;
 
 				// Try to load mint info
-				let mint_info = self.load_mint_info(&mint_url).await.ok().flatten();
+				let mint_info = self.load_mint_info(&mint_url).await?;
 				mints.insert(mint_url, mint_info);
 			}
 		}
@@ -251,12 +339,55 @@ impl CashuKvDatabase {
 		Ok(blob.proofs)
 	}
 
+	// Caller holds proofs_mutation_lock. A successful read establishes the
+	// authoritative snapshot after an error or cancellation during persistence.
+	async fn reload_uncertain_proofs(&self) -> Result<(), DatabaseError> {
+		if self.proofs_cache_needs_reload.load(Ordering::Relaxed) {
+			let proofs = self.load_proofs_from_store().await?;
+			*self.proofs_cache.write().unwrap() = proofs;
+			self.proofs_cache_needs_reload.store(false, Ordering::Relaxed);
+		}
+		Ok(())
+	}
+
+	async fn reserved_proofs(
+		&self, operation_id: &uuid::Uuid,
+	) -> Result<Vec<ProofInfo>, cdk::cdk_database::Error> {
+		// 0.16's adapter kept ownership in a separate index. Retain that fallback
+		// for in-flight operations, but explicit ownership always takes precedence.
+		let legacy: Vec<String> = match KVStore::read(
+			self.store.as_ref(),
+			CASHU_PRIMARY_KEY,
+			PROOF_RESERVATIONS_KEY,
+			&operation_id.to_string(),
+		)
+		.await
+		{
+			Ok(data) => serde_json::from_slice(&data)
+				.map_err(|e| DatabaseError::Serialization(e.to_string()))?,
+			Err(e) if e.kind() == io::ErrorKind::NotFound => Vec::new(),
+			Err(e) => return Err(DatabaseError::Io(e).into()),
+		};
+		let proofs = self.proofs_cache.read().unwrap();
+		Ok(proofs
+			.iter()
+			.filter(|proof| match proof.used_by_operation {
+				Some(owner) => owner == *operation_id,
+				None => legacy.contains(&hex::encode(proof.y.serialize())),
+			})
+			.cloned()
+			.collect())
+	}
+
 	async fn persist_proofs(&self, proofs: &[ProofInfo]) -> Result<(), DatabaseError> {
 		Self::ensure_unique_proof_ys(proofs)?;
 		let blob = ProofsBlobRef { schema_version: PROOFS_SCHEMA_VERSION, proofs };
 		let data =
 			serde_json::to_vec(&blob).map_err(|e| DatabaseError::Serialization(e.to_string()))?;
 
+		// An interrupted write or lost acknowledgement leaves the commit uncertain.
+		// Keep readers/writers from trusting the old cache until it is reloaded.
+		self.proofs_cache_needs_reload.store(true, Ordering::Relaxed);
 		KVStore::write(self.store.as_ref(), CASHU_PRIMARY_KEY, PROOFS_KEY, PROOFS_BLOB_KEY, data)
 			.await
 			.map_err(DatabaseError::Io)
@@ -302,6 +433,21 @@ impl CashuKvDatabase {
 	fn update_proofs_cache(
 		cache: &mut Vec<ProofInfo>, added: Vec<ProofInfo>, removed_ys: Vec<PublicKey>,
 	) {
+		// Reconstructed/legacy records may omit the NUT-13 index. Match CDK's
+		// upsert behavior by preserving an index already committed for this proof.
+		let mut indexes: HashMap<_, _> =
+			cache.iter().filter_map(|p| p.derivation_index.map(|index| (p.y, index))).collect();
+		let added: Vec<_> = added
+			.into_iter()
+			.map(|mut proof| {
+				if let Some(index) = proof.derivation_index {
+					indexes.insert(proof.y, index);
+				} else {
+					proof.derivation_index = indexes.get(&proof.y).copied();
+				}
+				proof
+			})
+			.collect();
 		let mut added_ys = HashSet::new();
 		let mut added_deduped = Vec::with_capacity(added.len());
 		for proof in added.into_iter().rev() {
@@ -611,16 +757,15 @@ impl WalletDatabase<cdk::cdk_database::Error> for CashuKvDatabase {
 		}
 	}
 
-	async fn add_mint_quote(&self, quote: MintQuote) -> Result<(), cdk::cdk_database::Error> {
-		let key = quote.id.clone();
-		let data =
-			serde_json::to_vec(&quote).map_err(|e| DatabaseError::Serialization(e.to_string()))?;
-
-		KVStore::write(self.store.as_ref(), CASHU_PRIMARY_KEY, MINT_QUOTES_KEY, &key, data)
-			.await
-			.map_err(DatabaseError::Io)?;
-
-		Ok(())
+	async fn add_mint_quote(&self, mut quote: MintQuote) -> Result<(), cdk::cdk_database::Error> {
+		let _lock = self.records_mutation_lock.lock().await;
+		if let Some(existing) = self.get_mint_quote(&quote.id).await? {
+			if existing.version != quote.version {
+				return Err(cdk::cdk_database::Error::ConcurrentUpdate);
+			}
+			quote.version = quote.version.wrapping_add(1);
+		}
+		self.write_record(MINT_QUOTES_KEY, &quote.id, &quote).await
 	}
 
 	async fn get_mint_quote(
@@ -663,6 +808,7 @@ impl WalletDatabase<cdk::cdk_database::Error> for CashuKvDatabase {
 	}
 
 	async fn remove_mint_quote(&self, quote_id: &str) -> Result<(), cdk::cdk_database::Error> {
+		let _lock = self.records_mutation_lock.lock().await;
 		// Mark as removed by writing empty data
 		KVStore::remove(self.store.as_ref(), CASHU_PRIMARY_KEY, MINT_QUOTES_KEY, quote_id, false)
 			.await
@@ -671,16 +817,16 @@ impl WalletDatabase<cdk::cdk_database::Error> for CashuKvDatabase {
 		Ok(())
 	}
 
-	async fn add_melt_quote(&self, quote: MeltQuote) -> Result<(), cdk::cdk_database::Error> {
-		let key = quote.id.clone();
-		let data =
-			serde_json::to_vec(&quote).map_err(|e| DatabaseError::Serialization(e.to_string()))?;
-
-		KVStore::write(self.store.as_ref(), CASHU_PRIMARY_KEY, MELT_QUOTES_KEY, &key, data)
-			.await
-			.map_err(DatabaseError::Io)?;
-
-		Ok(())
+	async fn add_melt_quote(&self, mut quote: MeltQuote) -> Result<(), cdk::cdk_database::Error> {
+		let _lock = self.records_mutation_lock.lock().await;
+		if let Some(existing) = self.get_melt_quote(&quote.id).await? {
+			if existing.version != quote.version {
+				return Err(cdk::cdk_database::Error::ConcurrentUpdate);
+			}
+			quote.version = quote.version.wrapping_add(1);
+			quote.payment_proof = quote.payment_proof.or(existing.payment_proof);
+		}
+		self.write_record(MELT_QUOTES_KEY, &quote.id, &quote).await
 	}
 
 	async fn get_melt_quote(
@@ -723,6 +869,7 @@ impl WalletDatabase<cdk::cdk_database::Error> for CashuKvDatabase {
 	}
 
 	async fn remove_melt_quote(&self, quote_id: &str) -> Result<(), cdk::cdk_database::Error> {
+		let _lock = self.records_mutation_lock.lock().await;
 		KVStore::remove(self.store.as_ref(), CASHU_PRIMARY_KEY, MELT_QUOTES_KEY, quote_id, false)
 			.await
 			.map_err(DatabaseError::Io)?;
@@ -779,6 +926,7 @@ impl WalletDatabase<cdk::cdk_database::Error> for CashuKvDatabase {
 		&self, added: Vec<ProofInfo>, removed_ys: Vec<PublicKey>,
 	) -> Result<(), cdk::cdk_database::Error> {
 		let _guard = self.proofs_mutation_lock.lock().await;
+		self.reload_uncertain_proofs().await?;
 		let (updated_proofs, changed) = {
 			let committed_proofs = self.proofs_cache.read().unwrap();
 			let mut updated_proofs = committed_proofs.clone();
@@ -790,6 +938,7 @@ impl WalletDatabase<cdk::cdk_database::Error> for CashuKvDatabase {
 		if changed {
 			self.persist_proofs(&updated_proofs).await?;
 			*self.proofs_cache.write().unwrap() = updated_proofs;
+			self.proofs_cache_needs_reload.store(false, Ordering::Relaxed);
 		}
 
 		Ok(())
@@ -799,6 +948,8 @@ impl WalletDatabase<cdk::cdk_database::Error> for CashuKvDatabase {
 		&self, mint_url: Option<MintUrl>, unit: Option<CurrencyUnit>, state: Option<Vec<State>>,
 		spending_conditions: Option<Vec<SpendingConditions>>,
 	) -> Result<Vec<ProofInfo>, cdk::cdk_database::Error> {
+		let _lock = self.proofs_mutation_lock.lock().await;
+		self.reload_uncertain_proofs().await?;
 		let cache = self.proofs_cache.read().unwrap();
 		let mut filtered_proofs = cache.clone();
 
@@ -839,6 +990,7 @@ impl WalletDatabase<cdk::cdk_database::Error> for CashuKvDatabase {
 		&self, ys: Vec<PublicKey>, state: State,
 	) -> Result<(), cdk::cdk_database::Error> {
 		let _guard = self.proofs_mutation_lock.lock().await;
+		self.reload_uncertain_proofs().await?;
 		let ys: HashSet<_> = ys.into_iter().collect();
 		let mut updated_proofs = self.proofs_cache.read().unwrap().clone();
 		let mut changed = false;
@@ -852,6 +1004,7 @@ impl WalletDatabase<cdk::cdk_database::Error> for CashuKvDatabase {
 		if changed {
 			self.persist_proofs(&updated_proofs).await?;
 			*self.proofs_cache.write().unwrap() = updated_proofs;
+			self.proofs_cache_needs_reload.store(false, Ordering::Relaxed);
 		}
 
 		Ok(())
@@ -868,12 +1021,13 @@ impl WalletDatabase<cdk::cdk_database::Error> for CashuKvDatabase {
 			match KVStore::read(self.store.as_ref(), CASHU_PRIMARY_KEY, KEYSET_COUNTERS_KEY, &key)
 				.await
 			{
-				Ok(data) if !data.is_empty() => serde_json::from_slice::<u32>(&data)
+				Ok(data) => serde_json::from_slice::<u32>(&data)
 					.map_err(|e| DatabaseError::Serialization(e.to_string()))?,
-				_ => 0, // Default to 0 if not found
+				Err(e) if e.kind() == io::ErrorKind::NotFound => 0,
+				Err(e) => return Err(DatabaseError::Io(e).into()),
 			};
 
-		let new_count = current_count + count;
+		let new_count = current_count.checked_add(count).ok_or(DatabaseError::InvalidFormat)?;
 
 		// Write back updated counter
 		let data = serde_json::to_vec(&new_count)
@@ -884,6 +1038,34 @@ impl WalletDatabase<cdk::cdk_database::Error> for CashuKvDatabase {
 			.map_err(DatabaseError::Io)?;
 
 		Ok(new_count)
+	}
+
+	async fn increment_derivation_counter(
+		&self, namespace: &str, count: u32,
+	) -> Result<u32, cdk::cdk_database::Error> {
+		let _lock = self.keyset_counter_lock.lock().await;
+		// Encode arbitrary CDK namespaces as valid KVStore keys.
+		let key = hex::encode(namespace.as_bytes());
+		let current = match KVStore::read(
+			self.store.as_ref(),
+			CASHU_PRIMARY_KEY,
+			DERIVATION_COUNTERS_KEY,
+			&key,
+		)
+		.await
+		{
+			Ok(data) => serde_json::from_slice::<u32>(&data)
+				.map_err(|e| DatabaseError::Serialization(e.to_string()))?,
+			Err(e) if e.kind() == io::ErrorKind::NotFound => 0,
+			Err(e) => return Err(DatabaseError::Io(e).into()),
+		};
+		let next = current.checked_add(count).ok_or(DatabaseError::InvalidFormat)?;
+		let data =
+			serde_json::to_vec(&next).map_err(|e| DatabaseError::Serialization(e.to_string()))?;
+		KVStore::write(self.store.as_ref(), CASHU_PRIMARY_KEY, DERIVATION_COUNTERS_KEY, &key, data)
+			.await
+			.map_err(DatabaseError::Io)?;
+		Ok(next)
 	}
 
 	async fn add_transaction(
@@ -991,11 +1173,14 @@ impl WalletDatabase<cdk::cdk_database::Error> for CashuKvDatabase {
 	async fn get_proofs_by_ys(
 		&self, ys: Vec<PublicKey>,
 	) -> Result<Vec<ProofInfo>, cdk::cdk_database::Error> {
+		let _lock = self.proofs_mutation_lock.lock().await;
+		self.reload_uncertain_proofs().await?;
 		let cache = self.proofs_cache.read().unwrap();
 		Ok(cache.iter().filter(|p| ys.contains(&p.y)).cloned().collect())
 	}
 
 	async fn add_saga(&self, saga: WalletSaga) -> Result<(), cdk::cdk_database::Error> {
+		let _lock = self.records_mutation_lock.lock().await;
 		let key = saga.id.to_string();
 		let data =
 			serde_json::to_vec(&saga).map_err(|e| DatabaseError::Serialization(e.to_string()))?;
@@ -1022,16 +1207,20 @@ impl WalletDatabase<cdk::cdk_database::Error> for CashuKvDatabase {
 	}
 
 	async fn update_saga(&self, saga: WalletSaga) -> Result<bool, cdk::cdk_database::Error> {
-		let key = saga.id.to_string();
-		let data =
-			serde_json::to_vec(&saga).map_err(|e| DatabaseError::Serialization(e.to_string()))?;
-		KVStore::write(self.store.as_ref(), CASHU_PRIMARY_KEY, SAGAS_KEY, &key, data)
-			.await
-			.map_err(DatabaseError::Io)?;
+		let _lock = self.records_mutation_lock.lock().await;
+		let Some(existing) = self.get_saga(&saga.id).await? else {
+			return Ok(false);
+		};
+		// Unlike quote updates, CDK increments a saga's version before calling us.
+		if existing.version.checked_add(1) != Some(saga.version) {
+			return Ok(false);
+		}
+		self.write_record(SAGAS_KEY, &saga.id.to_string(), &saga).await?;
 		Ok(true)
 	}
 
 	async fn delete_saga(&self, id: &uuid::Uuid) -> Result<(), cdk::cdk_database::Error> {
+		let _lock = self.records_mutation_lock.lock().await;
 		let key = id.to_string();
 		KVStore::remove(self.store.as_ref(), CASHU_PRIMARY_KEY, SAGAS_KEY, &key, false)
 			.await
@@ -1049,9 +1238,9 @@ impl WalletDatabase<cdk::cdk_database::Error> for CashuKvDatabase {
 				.await
 				.map_err(DatabaseError::Io)?;
 			if !data.is_empty() {
-				if let Ok(saga) = serde_json::from_slice::<WalletSaga>(&data) {
-					sagas.push(saga);
-				}
+				let saga = serde_json::from_slice::<WalletSaga>(&data)
+					.map_err(|e| DatabaseError::Serialization(e.to_string()))?;
+				sagas.push(saga);
 			}
 		}
 		Ok(sagas)
@@ -1060,87 +1249,92 @@ impl WalletDatabase<cdk::cdk_database::Error> for CashuKvDatabase {
 	async fn reserve_proofs(
 		&self, ys: Vec<PublicKey>, operation_id: &uuid::Uuid,
 	) -> Result<(), cdk::cdk_database::Error> {
-		// Store which Y values are reserved by this operation
-		let key = operation_id.to_string();
-		let ys_data: Vec<String> = ys.iter().map(|y| hex::encode(y.serialize())).collect();
-		let data = serde_json::to_vec(&ys_data)
-			.map_err(|e| DatabaseError::Serialization(e.to_string()))?;
-		KVStore::write(self.store.as_ref(), CASHU_PRIMARY_KEY, PROOF_RESERVATIONS_KEY, &key, data)
-			.await
-			.map_err(DatabaseError::Io)?;
-
-		self.update_proofs_state(ys, State::Reserved).await
+		if ys.is_empty() {
+			return Ok(());
+		}
+		let _lock = self.proofs_mutation_lock.lock().await;
+		self.reload_uncertain_proofs().await?;
+		let mut proofs = self.proofs_cache.read().unwrap().clone();
+		// Selection happens before this lock is acquired. Reject a stale selection
+		// in its entirety if another operation has removed any requested proof.
+		let requested: HashSet<_> = ys.iter().copied().collect();
+		if requested.len() != ys.len()
+			|| proofs.iter().filter(|p| requested.contains(&p.y)).count() != ys.len()
+		{
+			return Err(cdk::cdk_database::Error::ProofNotUnspent);
+		}
+		for proof in proofs.iter_mut().filter(|p| requested.contains(&p.y)) {
+			if proof.used_by_operation.is_some_and(|owner| owner != *operation_id)
+				|| !matches!(proof.state, State::Unspent | State::Reserved)
+			{
+				return Err(cdk::cdk_database::Error::ProofNotUnspent);
+			}
+			if proof.state == State::Reserved && proof.used_by_operation.is_none() {
+				// Old adapters kept ownership only in proof_reservations. Do not
+				// steal a reservation just because its inline owner is absent.
+				if !self.reserved_proofs(operation_id).await?.iter().any(|p| p.y == proof.y) {
+					return Err(cdk::cdk_database::Error::ProofNotUnspent);
+				}
+			}
+			proof.state = State::Reserved;
+			proof.used_by_operation = Some(*operation_id);
+		}
+		self.persist_proofs(&proofs).await?;
+		*self.proofs_cache.write().unwrap() = proofs;
+		self.proofs_cache_needs_reload.store(false, Ordering::Relaxed);
+		Ok(())
 	}
 
 	async fn release_proofs(
 		&self, operation_id: &uuid::Uuid,
 	) -> Result<(), cdk::cdk_database::Error> {
-		let key = operation_id.to_string();
-		match KVStore::read(self.store.as_ref(), CASHU_PRIMARY_KEY, PROOF_RESERVATIONS_KEY, &key)
-			.await
-		{
-			Ok(data) if !data.is_empty() => {
-				let ys_hex: Vec<String> = serde_json::from_slice(&data)
-					.map_err(|e| DatabaseError::Serialization(e.to_string()))?;
-				let ys: Vec<PublicKey> = ys_hex
-					.iter()
-					.filter_map(|h| {
-						let bytes = hex::decode(h).ok()?;
-						PublicKey::from_slice(&bytes).ok()
-					})
-					.collect();
-				if !ys.is_empty() {
-					self.update_proofs_state(ys, State::Unspent).await?;
-				}
-				KVStore::remove(
-					self.store.as_ref(),
-					CASHU_PRIMARY_KEY,
-					PROOF_RESERVATIONS_KEY,
-					&key,
-					false,
-				)
-				.await
-				.map_err(DatabaseError::Io)?;
-			},
-			_ => {},
+		let _lock = self.proofs_mutation_lock.lock().await;
+		self.reload_uncertain_proofs().await?;
+		let reserved = self.reserved_proofs(operation_id).await?;
+		let mut proofs = self.proofs_cache.read().unwrap().clone();
+		for proof in &mut proofs {
+			if reserved.iter().any(|p| p.y == proof.y)
+				&& matches!(proof.state, State::Reserved | State::Pending)
+			{
+				proof.state = State::Unspent;
+				proof.used_by_operation = None;
+			}
 		}
+		self.persist_proofs(&proofs).await?;
+		*self.proofs_cache.write().unwrap() = proofs;
+		self.proofs_cache_needs_reload.store(false, Ordering::Relaxed);
+		KVStore::remove(
+			self.store.as_ref(),
+			CASHU_PRIMARY_KEY,
+			PROOF_RESERVATIONS_KEY,
+			&operation_id.to_string(),
+			false,
+		)
+		.await
+		.map_err(DatabaseError::Io)?;
 		Ok(())
 	}
 
 	async fn get_reserved_proofs(
 		&self, operation_id: &uuid::Uuid,
 	) -> Result<Vec<ProofInfo>, cdk::cdk_database::Error> {
-		let key = operation_id.to_string();
-		match KVStore::read(self.store.as_ref(), CASHU_PRIMARY_KEY, PROOF_RESERVATIONS_KEY, &key)
-			.await
-		{
-			Ok(data) if !data.is_empty() => {
-				let ys_hex: Vec<String> = serde_json::from_slice(&data)
-					.map_err(|e| DatabaseError::Serialization(e.to_string()))?;
-				let ys: Vec<PublicKey> = ys_hex
-					.iter()
-					.filter_map(|h| {
-						let bytes = hex::decode(h).ok()?;
-						PublicKey::from_slice(&bytes).ok()
-					})
-					.collect();
-				self.get_proofs_by_ys(ys).await
-			},
-			_ => Ok(Vec::new()),
-		}
+		let _lock = self.proofs_mutation_lock.lock().await;
+		self.reload_uncertain_proofs().await?;
+		self.reserved_proofs(operation_id).await
 	}
 
 	async fn reserve_melt_quote(
 		&self, quote_id: &str, operation_id: &uuid::Uuid,
 	) -> Result<(), cdk::cdk_database::Error> {
+		let _lock = self.records_mutation_lock.lock().await;
 		if let Some(mut quote) = self.get_melt_quote(quote_id).await? {
 			if quote.used_by_operation.is_some() {
-				return Err(cdk::cdk_database::Error::Database(
-					"Quote already in use by another operation".to_string().into(),
-				));
+				return Err(cdk::cdk_database::Error::QuoteAlreadyInUse);
 			}
 			quote.used_by_operation = Some(operation_id.to_string());
-			self.add_melt_quote(quote).await?;
+			self.write_record(MELT_QUOTES_KEY, &quote.id, &quote).await?;
+		} else {
+			return Err(cdk::cdk_database::Error::UnknownQuote);
 		}
 		Ok(())
 	}
@@ -1148,12 +1342,13 @@ impl WalletDatabase<cdk::cdk_database::Error> for CashuKvDatabase {
 	async fn release_melt_quote(
 		&self, operation_id: &uuid::Uuid,
 	) -> Result<(), cdk::cdk_database::Error> {
+		let _lock = self.records_mutation_lock.lock().await;
 		let quotes = self.get_melt_quotes().await?;
 		let op_str = operation_id.to_string();
 		for mut quote in quotes {
 			if quote.used_by_operation.as_deref() == Some(&op_str) {
 				quote.used_by_operation = None;
-				self.add_melt_quote(quote).await?;
+				self.write_record(MELT_QUOTES_KEY, &quote.id, &quote).await?;
 			}
 		}
 		Ok(())
@@ -1162,14 +1357,15 @@ impl WalletDatabase<cdk::cdk_database::Error> for CashuKvDatabase {
 	async fn reserve_mint_quote(
 		&self, quote_id: &str, operation_id: &uuid::Uuid,
 	) -> Result<(), cdk::cdk_database::Error> {
+		let _lock = self.records_mutation_lock.lock().await;
 		if let Some(mut quote) = self.get_mint_quote(quote_id).await? {
 			if quote.used_by_operation.is_some() {
-				return Err(cdk::cdk_database::Error::Database(
-					"Quote already in use by another operation".to_string().into(),
-				));
+				return Err(cdk::cdk_database::Error::QuoteAlreadyInUse);
 			}
 			quote.used_by_operation = Some(operation_id.to_string());
-			self.add_mint_quote(quote).await?;
+			self.write_record(MINT_QUOTES_KEY, &quote.id, &quote).await?;
+		} else {
+			return Err(cdk::cdk_database::Error::UnknownQuote);
 		}
 		Ok(())
 	}
@@ -1177,12 +1373,13 @@ impl WalletDatabase<cdk::cdk_database::Error> for CashuKvDatabase {
 	async fn release_mint_quote(
 		&self, operation_id: &uuid::Uuid,
 	) -> Result<(), cdk::cdk_database::Error> {
+		let _lock = self.records_mutation_lock.lock().await;
 		let quotes = self.get_mint_quotes().await?;
 		let op_str = operation_id.to_string();
 		for mut quote in quotes {
 			if quote.used_by_operation.as_deref() == Some(&op_str) {
 				quote.used_by_operation = None;
-				self.add_mint_quote(quote).await?;
+				self.write_record(MINT_QUOTES_KEY, &quote.id, &quote).await?;
 			}
 		}
 		Ok(())
@@ -1375,7 +1572,7 @@ mod tests {
 		}
 	}
 
-	fn proof_info(secret: &str, amount: u64) -> ProofInfo {
+	pub(super) fn proof_info(secret: &str, amount: u64) -> ProofInfo {
 		let proof = Proof::new(
 			Amount::from(amount),
 			Id::from_str("009a1f293253e41e").unwrap(),
@@ -1399,6 +1596,225 @@ mod tests {
 		database.get_proofs(None, None, None, None).await.unwrap()
 	}
 
+	pub(super) fn migration_store() -> (std::path::PathBuf, Arc<dyn DynStore>) {
+		let path = std::env::temp_dir()
+			// PIDs can repeat across sandbox namespaces sharing this directory.
+			.join(format!("orange-cdk-migration-{}", uuid::Uuid::new_v4()));
+		let store = ldk_node::io::sqlite_store::SqliteStore::new(
+			path.clone(),
+			Some("orange.sqlite".into()),
+			None,
+		)
+		.unwrap();
+		(path, Arc::new(store))
+	}
+
+	// This is the JSON shape written by CDK 0.16, deliberately without status.
+	fn legacy_transaction() -> serde_json::Value {
+		serde_json::json!({
+			"mint_url": "https://mint.example.com", "direction": "Outgoing",
+			"amount": 10, "fee": 1, "unit": "sat", "ys": [], "timestamp": 42,
+			"memo": null, "metadata": {}, "quote_id": "quote-1",
+			"payment_request": "invoice", "payment_proof": "preimage",
+			"payment_method": "bolt11", "saga_id": "019fa338-b72f-7f21-9bb2-a504cdd5927b"
+		})
+	}
+
+	#[test]
+	fn transaction_status_is_preserved_in_orange_payments() {
+		for (status, expected) in [
+			(cdk::wallet::types::TransactionStatus::Pending, crate::store::TxStatus::Pending),
+			(cdk::wallet::types::TransactionStatus::Completed, crate::store::TxStatus::Completed),
+			(cdk::wallet::types::TransactionStatus::Failed, crate::store::TxStatus::Failed),
+		] {
+			let mut tx: Transaction = serde_json::from_value(legacy_transaction()).unwrap();
+			tx.status = status;
+			let payment =
+				super::super::Cashu::convert_transaction_to_payment(tx, &CurrencyUnit::Sat)
+					.unwrap();
+			assert_eq!(payment.status, expected);
+		}
+	}
+
+	#[test]
+	fn outgoing_retries_surface_one_payment_in_either_storage_order() {
+		use super::super::Cashu;
+		use cdk::wallet::types::TransactionStatus::{Completed, Failed, Pending};
+		for (old_status, new_status, settled_wins) in [
+			(Failed, Pending, false),
+			(Failed, Completed, false),
+			(Completed, Failed, true),
+			(Pending, Failed, false),
+		] {
+			for same_second in [false, true] {
+				let mut old: Transaction = serde_json::from_value(legacy_transaction()).unwrap();
+				old.status = old_status;
+				old.saga_id = Some("019fa338-b72f-7000-8000-000000000001".parse().unwrap());
+				let mut retry = old.clone();
+				retry.status = new_status;
+				retry.saga_id = Some("019fa338-b730-7000-8000-000000000001".parse().unwrap());
+				retry.timestamp += u64::from(!same_second);
+				retry.fee = Amount::from(2);
+				let expected = if settled_wins { &old } else { &retry };
+				let expected =
+					Cashu::convert_transaction_to_payment(expected.clone(), &CurrencyUnit::Sat)
+						.unwrap();
+				for attempts in [vec![old.clone(), retry.clone()], vec![retry.clone(), old.clone()]]
+				{
+					let payments =
+						Cashu::convert_transactions_to_payments(attempts, &CurrencyUnit::Sat)
+							.unwrap();
+					assert_eq!(payments.len(), 1);
+					assert_eq!(payments[0].id, expected.id);
+					assert_eq!(payments[0].status, expected.status);
+					assert_eq!(payments[0].fee, expected.fee);
+					assert_eq!(payments[0].time_since_epoch, expected.time_since_epoch);
+				}
+			}
+		}
+	}
+
+	#[test]
+	fn reconciliation_keeps_distinct_quotes_and_repeated_incoming_receipts() {
+		use super::super::Cashu;
+		let outgoing: Transaction = serde_json::from_value(legacy_transaction()).unwrap();
+		let mut another_quote = outgoing.clone();
+		another_quote.quote_id = Some("quote-2".into());
+		let mut incoming = outgoing.clone();
+		incoming.direction = cdk::wallet::types::TransactionDirection::Incoming;
+		let mut second_receipt = incoming.clone();
+		second_receipt.saga_id = Some(uuid::Uuid::from_u128(2));
+		second_receipt.amount = Amount::from(20);
+		let payments = Cashu::convert_transactions_to_payments(
+			vec![outgoing, another_quote, incoming, second_receipt],
+			&CurrencyUnit::Sat,
+		)
+		.unwrap();
+		assert_eq!(payments.len(), 4);
+		assert_ne!(payments[0].id, payments[1].id);
+		assert!(!payments[2].outbound && !payments[3].outbound);
+		assert_ne!(payments[2].amount, payments[3].amount);
+	}
+
+	#[tokio::test]
+	async fn transaction_migration_preserves_conflicting_records() {
+		let (path, store) = migration_store();
+		let data = serde_json::to_vec(&legacy_transaction()).unwrap();
+		let mut tx: Transaction = serde_json::from_slice(&data).unwrap();
+		let old_key = TransactionId::new(tx.ys.clone()).to_string();
+		KVStore::write(store.as_ref(), CASHU_PRIMARY_KEY, TRANSACTIONS_KEY, &old_key, data.clone())
+			.await
+			.unwrap();
+		tx.amount = Amount::from(99);
+		let conflicting = serde_json::to_vec(&tx).unwrap();
+		KVStore::write(
+			store.as_ref(),
+			CASHU_PRIMARY_KEY,
+			TRANSACTIONS_KEY,
+			&tx.id().to_string(),
+			conflicting.clone(),
+		)
+		.await
+		.unwrap();
+		assert!(matches!(CashuKvDatabase::new(store.clone()).await, Err(DatabaseError::Duplicate)));
+		assert_eq!(
+			KVStore::read(store.as_ref(), CASHU_PRIMARY_KEY, TRANSACTIONS_KEY, &old_key)
+				.await
+				.unwrap(),
+			data
+		);
+		assert_eq!(
+			KVStore::read(
+				store.as_ref(),
+				CASHU_PRIMARY_KEY,
+				TRANSACTIONS_KEY,
+				&tx.id().to_string()
+			)
+			.await
+			.unwrap(),
+			conflicting
+		);
+		drop(store);
+		std::fs::remove_dir_all(path).unwrap();
+	}
+
+	#[tokio::test]
+	async fn derivation_counters_are_namespaced_persistent_and_checked() {
+		let (path, store) = migration_store();
+		let db = Arc::new(CashuKvDatabase::new(store.clone()).await.unwrap());
+		let (a, b) = tokio::join!(
+			db.increment_derivation_counter("nut20_quote", 1),
+			db.increment_derivation_counter("nut20_quote", 1)
+		);
+		let mut counts = [a.unwrap(), b.unwrap()];
+		counts.sort();
+		assert_eq!(counts, [1, 2]);
+		assert_eq!(db.increment_derivation_counter("other", 0).await.unwrap(), 0);
+		drop(db);
+		let db = CashuKvDatabase::new(store.clone()).await.unwrap();
+		assert_eq!(db.increment_derivation_counter("nut20_quote", 0).await.unwrap(), 2);
+		assert!(db.increment_derivation_counter("nut20_quote", u32::MAX).await.is_err());
+		assert_eq!(db.increment_derivation_counter("nut20_quote", 0).await.unwrap(), 2);
+		drop(db);
+		drop(store);
+		std::fs::remove_dir_all(path).unwrap();
+	}
+
+	#[tokio::test]
+	async fn release_proofs_preserves_spent_and_foreign_ownership_after_restart() {
+		let (path, store) = migration_store();
+		let db = CashuKvDatabase::new(store.clone()).await.unwrap();
+		let operation = uuid::Uuid::from_u128(1);
+		let other = uuid::Uuid::from_u128(2);
+		let reserved = proof_info("reserved", 1);
+		let mut pending = proof_info("pending", 2);
+		pending.state = State::Pending;
+		pending.used_by_operation = Some(operation);
+		let mut spent = proof_info("spent", 4);
+		spent.state = State::Spent;
+		spent.used_by_operation = Some(operation);
+		let mut foreign = proof_info("foreign", 8);
+		foreign.state = State::Reserved;
+		foreign.used_by_operation = Some(other);
+		let mut legacy = proof_info("legacy reservation", 16);
+		legacy.state = State::Reserved;
+		db.update_proofs(
+			vec![reserved.clone(), pending.clone(), spent.clone(), foreign.clone(), legacy.clone()],
+			vec![],
+		)
+		.await
+		.unwrap();
+		db.reserve_proofs(vec![reserved.y], &operation).await.unwrap();
+		// A stale legacy index must not release spent or reassigned proofs.
+		let index: Vec<_> = [legacy.y, spent.y, foreign.y]
+			.into_iter()
+			.map(|y| hex::encode(y.serialize()))
+			.collect();
+		KVStore::write(
+			store.as_ref(),
+			CASHU_PRIMARY_KEY,
+			PROOF_RESERVATIONS_KEY,
+			&operation.to_string(),
+			serde_json::to_vec(&index).unwrap(),
+		)
+		.await
+		.unwrap();
+		drop(db);
+		let db = CashuKvDatabase::new(store.clone()).await.unwrap();
+		db.release_proofs(&operation).await.unwrap();
+		let proofs = all_proofs(&db).await;
+		for y in [reserved.y, pending.y, legacy.y] {
+			let proof = proofs.iter().find(|p| p.y == y).unwrap();
+			assert_eq!(proof.state, State::Unspent);
+			assert_eq!(proof.used_by_operation, None);
+		}
+		assert!(proofs.contains(&spent));
+		assert!(proofs.contains(&foreign));
+		drop(db);
+		drop(store);
+		std::fs::remove_dir_all(path).unwrap();
+	}
+
 	#[test]
 	fn update_proofs_cache_replaces_existing_proof_with_same_y() {
 		let original = proof_info("same cached proof", 1);
@@ -1406,22 +1822,6 @@ mod tests {
 		let mut cache = vec![original.clone()];
 
 		CashuKvDatabase::update_proofs_cache(&mut cache, vec![replacement.clone()], vec![]);
-
-		assert_eq!(cache, vec![replacement]);
-		assert_eq!(cache.iter().filter(|proof| proof.y == original.y).count(), 1);
-	}
-
-	#[test]
-	fn update_proofs_cache_deduplicates_added_proofs_by_y() {
-		let original = proof_info("duplicate added proof", 1);
-		let replacement = proof_info("duplicate added proof", 2);
-		let mut cache = Vec::new();
-
-		CashuKvDatabase::update_proofs_cache(
-			&mut cache,
-			vec![original.clone(), replacement.clone()],
-			vec![],
-		);
 
 		assert_eq!(cache, vec![replacement]);
 		assert_eq!(cache.iter().filter(|proof| proof.y == original.y).count(), 1);
