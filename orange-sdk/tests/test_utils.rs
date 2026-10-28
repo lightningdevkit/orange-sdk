@@ -154,7 +154,10 @@ pub async fn generate_blocks(bitcoind: &Bitcoind, electrs: &ElectrsD, num: usize
 	wait_for_block(&electrs.client, cur_height as usize + num).await;
 }
 
-fn create_lsp(uuid: Uuid, bitcoind: &Bitcoind) -> Arc<Node> {
+fn create_lsp(
+	uuid: Uuid, bitcoind: &Bitcoind,
+	splices: Arc<std::sync::Mutex<Vec<ldk_node::bitcoin::OutPoint>>>,
+) -> Arc<Node> {
 	let mut config = ldk_node::config::Config::default();
 	config.anchor_channels_config.enable_zero_fee_commitments = true;
 	let mut builder = ldk_node::Builder::from_config(config);
@@ -206,6 +209,9 @@ fn create_lsp(uuid: Uuid, bitcoind: &Bitcoind) -> Arc<Node> {
 		loop {
 			let event = events_ref.next_event_async().await;
 			println!("LSP: {event:?}");
+			if let ldk_node::Event::SpliceNegotiated { new_funding_txo, .. } = &event {
+				splices.lock().unwrap().push(*new_funding_txo);
+			}
 			if let Err(e) = events_ref.event_handled() {
 				eprintln!("Error handling LSP ldk event: {e}");
 			}
@@ -282,6 +288,7 @@ async fn fund_two_nodes(a: &Node, b: &Node, bitcoind: &Bitcoind, electrsd: &Elec
 pub struct TestParams {
 	pub wallet: Arc<orange_sdk::Wallet>,
 	pub lsp: Arc<Node>,
+	pub lsp_splices: Arc<std::sync::Mutex<Vec<ldk_node::bitcoin::OutPoint>>>,
 	pub third_party: Arc<Node>,
 	pub bitcoind: Arc<Bitcoind>,
 	pub electrsd: Arc<ElectrsD>,
@@ -437,7 +444,8 @@ async fn build_test_nodes() -> TestParams {
 	let (bitcoind, electrsd) = create_bitcoind(test_id).await;
 
 	log::info!("creating LSP and third-party nodes for {test_id}");
-	let lsp = create_lsp(test_id, &bitcoind);
+	let lsp_splices = Arc::new(std::sync::Mutex::new(Vec::new()));
+	let lsp = create_lsp(test_id, &bitcoind, Arc::clone(&lsp_splices));
 	let third_party = create_third_party(test_id, &bitcoind);
 	let start_bal = third_party.list_balances().total_onchain_balance_sats;
 	log::info!("funding LSP and third-party nodes for {test_id}");
@@ -659,13 +667,21 @@ async fn build_test_nodes() -> TestParams {
 		let wallet = Arc::new(Wallet::new(wallet_config).await.unwrap());
 
 		log::info!("finished building test nodes for {test_id}");
-		return TestParams { wallet, lsp, third_party, bitcoind, electrsd, _mint: mint };
+		return TestParams {
+			wallet,
+			lsp,
+			lsp_splices,
+			third_party,
+			bitcoind,
+			electrsd,
+			_mint: mint,
+		};
 	};
 
 	#[cfg(not(feature = "_cashu-tests"))]
 	{
 		log::info!("finished building test nodes for {test_id}");
-		TestParams { wallet, lsp, third_party, bitcoind, electrsd }
+		TestParams { wallet, lsp, lsp_splices, third_party, bitcoind, electrsd }
 	}
 }
 
