@@ -1,0 +1,67 @@
+[
+  {
+    "key": "info_374d58f396cb3152",
+    "namespace": "mints",
+    "value": "{\"nuts\":{\"4\":{\"methods\":[],\"disabled\":false},\"5\":{\"methods\":[],\"disabled\":false},\"7\":{\"supported\":false},\"8\":{\"supported\":false},\"9\":{\"supported\":false},\"10\":{\"supported\":false},\"11\":{\"supported\":false},\"12\":{\"supported\":false},\"14\":{\"supported\":false},\"17\":{\"supported\":[]},\"19\":{\"ttl\":null,\"cached_endpoints\":[]},\"20\":{\"supported\":false}}}"
+  },
+  {
+    "key": "mint_374d58f396cb3152",
+    "namespace": "mints",
+    "value": "\"https://mint.example.com\""
+  },
+  {
+    "key": "keysets_374d58f396cb3152",
+    "namespace": "mint_keysets",
+    "value": "[{\"id\":\"009a1f293253e41e\",\"unit\":\"sat\",\"active\":true,\"input_fee_ppk\":100}]"
+  },
+  {
+    "key": "keyset_009a1f293253e41e",
+    "namespace": "keysets_table",
+    "value": "{\"id\":\"009a1f293253e41e\",\"unit\":\"sat\",\"active\":true,\"input_fee_ppk\":100}"
+  },
+  {
+    "key": "u32_864559728",
+    "namespace": "keyset_u32_mapping",
+    "value": "009a1f293253e41e"
+  },
+  {
+    "key": "009a1f293253e41e",
+    "namespace": "keyset_counters",
+    "value": "41"
+  },
+  {
+    "key": "proof_set",
+    "namespace": "proofs",
+    "value": "{\"schema_version\":1,\"proofs\":[{\"proof\":{\"amount\":1,\"id\":\"009a1f293253e41e\",\"secret\":\"fixture-only-secret-0\",\"C\":\"024369d2d22a80ecf78f3937da9d5f30c1b9f74f0c32684d583cca0fa6a61cdcfc\"},\"y\":\"022485c6bc8f3f9798a8de63f8da2406107bcf3593b21d1d8e1da62774ed5b7265\",\"mint_url\":\"https://mint.example.com\",\"state\":\"UNSPENT\",\"spending_condition\":null,\"unit\":\"sat\"},{\"proof\":{\"amount\":2,\"id\":\"009a1f293253e41e\",\"secret\":\"fixture-only-secret-1\",\"C\":\"024369d2d22a80ecf78f3937da9d5f30c1b9f74f0c32684d583cca0fa6a61cdcfc\"},\"y\":\"0292729b6de3218dcd12d1ddb984e0558f57cdd9d3fb1982a50a88a06d040520b0\",\"mint_url\":\"https://mint.example.com\",\"state\":\"RESERVED\",\"spending_condition\":null,\"unit\":\"sat\"},{\"proof\":{\"amount\":4,\"id\":\"009a1f293253e41e\",\"secret\":\"fixture-only-secret-2\",\"C\":\"024369d2d22a80ecf78f3937da9d5f30c1b9f74f0c32684d583cca0fa6a61cdcfc\"},\"y\":\"025e336af57063adbf0035a8874c6ebe4538decc2efbef127c9d7345bbeb383dc1\",\"mint_url\":\"https://mint.example.com\",\"state\":\"PENDING\",\"spending_condition\":null,\"unit\":\"sat\"},{\"proof\":{\"amount\":8,\"id\":\"009a1f293253e41e\",\"secret\":\"fixture-only-secret-3\",\"C\":\"024369d2d22a80ecf78f3937da9d5f30c1b9f74f0c32684d583cca0fa6a61cdcfc\"},\"y\":\"023616cee749e6f69f7baa85cb544a60dfa3910f730789fbd42eb39c1044f71543\",\"mint_url\":\"https://mint.example.com\",\"state\":\"SPENT\",\"spending_condition\":null,\"unit\":\"sat\"}]}"
+  },
+  {
+    "key": "b62568ef5f7f4037381fce92bc2a745fdb72aa6830de20e77da8c8fe2691123c",
+    "namespace": "transactions",
+    "value": "{\"mint_url\":\"https://mint.example.com\",\"direction\":\"Outgoing\",\"amount\":10,\"fee\":1,\"unit\":\"sat\",\"ys\":[\"022485c6bc8f3f9798a8de63f8da2406107bcf3593b21d1d8e1da62774ed5b7265\"],\"timestamp\":42,\"memo\":\"fixture\",\"metadata\":{},\"quote_id\":\"quote-0\",\"payment_request\":\"fixture-invoice\",\"payment_proof\":\"fixture-preimage\",\"payment_method\":\"bolt11\",\"saga_id\":\"00000000-0000-0000-0000-000000000001\"}"
+  },
+  {
+    "key": "e785f0ddfaaee3184d68db33d13cad95988da3827ade370c6eb0a406e4312b64",
+    "namespace": "transactions",
+    "value": "{\"mint_url\":\"https://mint.example.com\",\"direction\":\"Outgoing\",\"amount\":10,\"fee\":1,\"unit\":\"sat\",\"ys\":[\"0292729b6de3218dcd12d1ddb984e0558f57cdd9d3fb1982a50a88a06d040520b0\"],\"timestamp\":42,\"memo\":\"fixture\",\"metadata\":{},\"quote_id\":\"quote-1\",\"payment_request\":\"fixture-invoice\",\"payment_proof\":\"fixture-preimage\",\"payment_method\":\"bolt11\",\"saga_id\":null}"
+  },
+  {
+    "key": "mint-quote",
+    "namespace": "mint_quotes",
+    "value": "{\"id\":\"mint-quote\",\"mint_url\":\"https://mint.example.com\",\"payment_method\":\"bolt11\",\"amount\":10,\"unit\":\"sat\",\"request\":\"fixture-invoice\",\"state\":\"PAID\",\"expiry\":123,\"secret_key\":\"0000000000000000000000000000000000000000000000000000000000000001\",\"amount_issued\":0,\"amount_paid\":10,\"used_by_operation\":null,\"version\":0}"
+  },
+  {
+    "key": "melt-quote",
+    "namespace": "melt_quotes",
+    "value": "{\"id\":\"melt-quote\",\"mint_url\":\"https://mint.example.com\",\"unit\":\"sat\",\"amount\":10,\"request\":\"fixture-invoice\",\"fee_reserve\":1,\"state\":\"PENDING\",\"expiry\":123,\"payment_preimage\":\"fixture-preimage\",\"payment_method\":\"bolt11\",\"used_by_operation\":\"00000000-0000-0000-0000-000000000001\",\"version\":2}"
+  },
+  {
+    "key": "00000000-0000-0000-0000-000000000001",
+    "namespace": "sagas",
+    "value": "{\"id\":\"00000000-0000-0000-0000-000000000001\",\"kind\":\"melt\",\"state\":{\"type\":\"melt\",\"state\":\"payment_pending\"},\"amount\":10,\"mint_url\":\"https://mint.example.com\",\"unit\":\"sat\",\"quote_id\":\"melt-quote\",\"created_at\":42,\"updated_at\":43,\"data\":{\"kind\":\"melt\",\"data\":{\"quote_id\":\"melt-quote\",\"amount\":10,\"fee_reserve\":1,\"counter_start\":40,\"counter_end\":41,\"change_amount\":null}},\"version\":0}"
+  },
+  {
+    "key": "00000000-0000-0000-0000-000000000001",
+    "namespace": "proof_reservations",
+    "value": "[\"0292729b6de3218dcd12d1ddb984e0558f57cdd9d3fb1982a50a88a06d040520b0\"]"
+  }
+]

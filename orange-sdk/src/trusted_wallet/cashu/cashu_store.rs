@@ -1982,3 +1982,7 @@ mod tests {
 		assert!(serialized.len() < 1024 * 1024);
 	}
 }
+
+#[cfg(test)]
+#[path = "cashu_store_upgrade_tests.rs"]
+mod upgrade_tests;

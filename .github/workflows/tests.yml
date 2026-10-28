@@ -67,6 +67,9 @@ jobs:
     timeout-minutes: 120
     steps:
       - uses: actions/checkout@v4
+        with:
+          # The upgrade generator compiles the adapter from a pinned old commit.
+          fetch-depth: 0
       - uses: dtolnay/rust-toolchain@stable
 
       - name: Install Protoc
@@ -94,3 +97,8 @@ jobs:
 
       - name: Run cashu tests
         run: cargo test --features _cashu-tests -- --test-threads=2 --nocapture
+
+      - name: Test funded Cashu upgrades from CDK 0.16
+        env:
+          TMPDIR: ${{ runner.temp }}
+        run: bash ci/test-cashu-upgrade.sh
