@@ -141,7 +141,7 @@ The wallet's behavior is controlled by `Tunables`:
 - **Spark** - Custodial Lightning wallet (default)
 - **Cashu** - Ecash-based wallet
 
-### Upgrading Cashu wallets from CDK 0.16 to 0.18.2
+### Upgrading Cashu wallets from CDK 0.16 to 0.18.3
 
 Orange stores Cashu wallet records in its own KV namespaces within `orange.sqlite`
 (or the configured remote store), rather than CDK's SQL wallet tables. On startup,
