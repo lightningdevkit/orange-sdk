@@ -5,7 +5,7 @@ use crate::lightning_wallet::LightningWallet;
 use crate::logging::Logger;
 use crate::store::{PaymentId, TxMetadata, TxMetadataStore, TxType};
 use crate::trusted_wallet::DynTrustedWalletInterface;
-use crate::{Event, EventQueue, PaymentType, Tunables};
+use crate::{Event, EventQueue, PaymentType, Tunables, TxStatus};
 use bitcoin_payment_instructions::amount::Amount;
 use graduated_rebalancer::{RebalanceTrigger, RebalancerEvent, TriggerParams};
 use ldk_node::lightning::util::logger::Logger as _;
@@ -72,6 +72,10 @@ impl RebalanceTrigger for OrangeTrigger {
 					if payment.outbound {
 						// Assume it'll be tracked by the sending task.
 						// TODO: Maybe use this to backfill stuff we lost on crash?
+						continue;
+					}
+					// Only settled receipts can be recorded or selected as rebalance triggers.
+					if payment.status != TxStatus::Completed {
 						continue;
 					}
 					let payment_id = PaymentId::Trusted(payment.id);

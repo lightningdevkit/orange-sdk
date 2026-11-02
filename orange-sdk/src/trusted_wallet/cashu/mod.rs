@@ -12,7 +12,7 @@ use ldk_node::bitcoin::hashes::Hash;
 use ldk_node::bitcoin::hashes::sha256::Hash as Sha256;
 use ldk_node::bitcoin::hex::FromHex;
 use ldk_node::lightning::util::logger::Logger as _;
-use ldk_node::lightning::{log_error, log_info};
+use ldk_node::lightning::{log_error, log_info, log_warn};
 use ldk_node::lightning_invoice::Bolt11Invoice;
 use ldk_node::lightning_types::payment::{PaymentHash, PaymentPreimage};
 
@@ -481,10 +481,13 @@ impl Cashu {
 			)))
 		})?;
 		if recovery.failed != 0 {
-			return Err(InitFailure::TrustedFailure(TrustedError::WalletOperationFailed(format!(
-				"Failed to recover {} Cashu operations; reopen the wallet to retry",
+			// A mint outage can fail individual recoveries. Keep their reservations
+			// intact and allow access to the rest of the wallet, including LDK funds.
+			log_warn!(
+				logger,
+				"Failed to recover {} Cashu operations; continuing startup, retry on next open",
 				recovery.failed
-			))));
+			);
 		}
 		if !recovery.is_empty() {
 			log_info!(

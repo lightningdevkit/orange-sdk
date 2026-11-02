@@ -158,9 +158,10 @@ created as needed, leaving existing keyset counters and quote signing keys intac
 Legacy proof reservation indexes remain readable during recovery.
 
 Startup runs saga recovery before starting payment tasks, on every open (including
-wallets already restored from seed). Storage errors or failed recoveries stop
-initialization; reopen the wallet to retry. Operations still pending at the mint
-remain reserved and are retried on the next startup.
+wallets already restored from seed). Database initialization errors or an unreadable
+recovery queue stop initialization. Individual failed recoveries are logged and
+startup continues, so a mint outage does not block access to the rest of the wallet.
+Unresolved operations retain their reservations and are retried on the next startup.
 
 Back up the complete store before upgrading and open it with only one active
 wallet instance. Downgrading an upgraded store is not supported; restore the

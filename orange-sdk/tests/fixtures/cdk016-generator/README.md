@@ -31,7 +31,9 @@ an actual old-version wallet, mints 64 sats, and prepares an 8-sat melt. Without
 `submit` it exits without destructor cleanup. With `submit`, it confirms the
 payment; the integration test holds the mint's response and kills the process
 before that response reaches the old wallet. These tests use real Cashu
-signatures from a local CDK mint and a fake Lightning backend.
+signatures from a local CDK mint and a fake Lightning backend. Passing `issue`
+instead of `INVOICE` lets the test hold the initial mint response and kill the
+process with its issue saga still in `MintRequested`.
 
 All upgrades go through Orange's production `Cashu::init`, with the seed-restore
 flag already set and Orange's `Seed64([7; 64])` derivation. The suite verifies:
@@ -44,6 +46,8 @@ flag already set and Orange's `Seed64([7; 64])` derivation. The suite verifies:
 - A pending melt keeps its 10 sats reserved across repeated startup attempts.
 - HTTP 503 responses during recovery preserve the reservation, and reopening
   once the mint is available recovers the paid melt and change.
+- An issue saga with a lost mint response does not block startup while the mint
+  returns HTTP 503; reopening online recovers all 64 sats exactly once.
 
 Repeated startup must neither resubmit the melt nor duplicate payment history.
 
@@ -53,10 +57,12 @@ bash ci/test-cashu-upgrade.sh
 
 Run this from the repository root in the Rust development environment. It builds
 the generator from the pinned old commit and discovers Cargo's actual executable
-path, honoring configured target directories. It supports JJ and Git checkouts;
-the checkout must contain commit `a3aa1c592625c45314004987430498307b9a1819`. These
+path, honoring configured target directories. It uses Git to read the pinned sources;
+the Git checkout (including a colocated JJ checkout) must contain commit `a3aa1c592625c45314004987430498307b9a1819`. These
 tests remain ignored in ordinary `cargo test` runs because they need that separate
-generator, but the Cashu CI job explicitly runs this script on every build.
+generator, but the Cashu CI job explicitly runs this script on every build. CI caches
+both Cargo workspaces, including the generator's separate CDK 0.16 dependency tree;
+a cold build still needs to compile both versions.
 
 The ordinary Cashu unit suite runs the exported-data and before/after I/O failure
 tests without this executable or any external services. The asynchronous fault

@@ -97,42 +97,62 @@ fn startup_recovers_legacy_reservations_even_when_seed_restore_is_complete() {
 	std::fs::remove_dir_all(path).unwrap();
 }
 
-#[tokio::test]
-async fn startup_rejects_unreadable_or_failed_recovery_without_releasing_proofs() {
-	for malformed in [false, true] {
-		let (path, store) = migration_store();
-		seed_legacy_store(&store).await;
-		let db = CashuKvDatabase::new(store.clone()).await.unwrap();
-		let id = uuid::Uuid::from_u128(1);
-		let reserved = db.get_reserved_proofs(&id).await.unwrap();
-		if malformed {
-			store
-				.write_async(
-					CASHU_PRIMARY_KEY,
-					SAGAS_KEY,
-					&id.to_string(),
-					b"invalid JSON".to_vec(),
-				)
-				.await
-				.unwrap();
-		} else {
-			let mut saga = db.get_saga(&id).await.unwrap().unwrap();
-			// Valid serialization, but recovery cannot interpret melt data as a swap.
-			saga.state = cdk::wallet::types::WalletSagaState::Swap(
-				cdk::wallet::types::SwapSagaState::ProofsReserved,
-			);
-			db.add_saga(saga).await.unwrap();
+#[test]
+fn startup_preserves_reservations_on_unreadable_or_failed_recovery() {
+	let runtime =
+		tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build().unwrap();
+	let paths = runtime.block_on(async {
+		let mut paths = Vec::new();
+		for malformed in [false, true] {
+			let (path, store) = migration_store();
+			seed_legacy_store(&store).await;
+			let db = CashuKvDatabase::new(store.clone()).await.unwrap();
+			let id = uuid::Uuid::from_u128(1);
+			let reserved = db.get_reserved_proofs(&id).await.unwrap();
+			// Avoid background requests for the synthetic invoice and seed restoration.
+			db.remove_mint_quote("mint-quote").await.unwrap();
+			write_has_recovered(&store, true).await.unwrap();
+			if malformed {
+				store
+					.write_async(
+						CASHU_PRIMARY_KEY,
+						SAGAS_KEY,
+						&id.to_string(),
+						b"invalid JSON".to_vec(),
+					)
+					.await
+					.unwrap();
+			} else {
+				let mut saga = db.get_saga(&id).await.unwrap().unwrap();
+				// Valid serialization, but recovery cannot interpret melt data as a swap.
+				saga.state = cdk::wallet::types::WalletSagaState::Swap(
+					cdk::wallet::types::SwapSagaState::ProofsReserved,
+				);
+				db.add_saga(saga).await.unwrap();
+			}
+			drop(db);
+			let result = open_cashu(store.clone(), "http://127.0.0.1:1").await;
+			if malformed {
+				assert!(matches!(
+					result,
+					Err(crate::InitFailure::TrustedFailure(TrustedError::WalletOperationFailed(_)))
+				));
+			} else {
+				let cashu = result.expect("individual recovery failures must not block startup");
+				assert_eq!(
+					cashu.cashu_wallet.localstore.get_incomplete_sagas().await.unwrap().len(),
+					1
+				);
+				cashu.runtime.abort_cancellable_background_tasks();
+			}
+			let db = CashuKvDatabase::new(store.clone()).await.unwrap();
+			assert_eq!(db.get_reserved_proofs(&id).await.unwrap(), reserved);
+			paths.push(path);
 		}
-		drop(db);
-		let result = open_cashu(store.clone(), "https://mint.example.com").await;
-		assert!(matches!(
-			result,
-			Err(crate::InitFailure::TrustedFailure(TrustedError::WalletOperationFailed(_)))
-		));
-		let db = CashuKvDatabase::new(store.clone()).await.unwrap();
-		assert_eq!(db.get_reserved_proofs(&id).await.unwrap(), reserved);
-		drop(db);
-		drop(store);
+		paths
+	});
+	drop(runtime);
+	for path in paths {
 		std::fs::remove_dir_all(path).unwrap();
 	}
 }

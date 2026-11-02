@@ -14,11 +14,7 @@ for source in cashu_store dyn_store; do
     else
         source_path=orange-sdk/src/dyn_store.rs
     fi
-    if [[ -d .jj ]]; then
-        jj --ignore-working-copy file show -r "$old_revision" "$source_path" > "$scratch/$source.rs"
-    else
-        git show "$old_revision:$source_path" > "$scratch/$source.rs"
-    fi
+    git show "$old_revision:$source_path" > "$scratch/$source.rs"
 done
 # include! does not accept inner module documentation comments.
 sed -i '/^\/\/!/d' "$scratch/dyn_store.rs"

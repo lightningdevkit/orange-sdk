@@ -5,7 +5,7 @@ use axum::http::{Method, StatusCode};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use cdk::nuts::MeltQuoteState;
-use cdk::wallet::types::{MeltSagaState, TransactionStatus, WalletSagaState};
+use cdk::wallet::types::{IssueSagaState, MeltSagaState, TransactionStatus, WalletSagaState};
 use cdk_common::payment::{MintPayment, PaymentIdentifier};
 use std::process::Stdio;
 use std::time::Duration;
@@ -14,6 +14,7 @@ use tokio::sync::Notify;
 #[derive(Default)]
 struct HttpControl {
 	hold_next_melt: AtomicBool,
+	hold_next_issue: AtomicBool,
 	response_ready: Notify,
 	release_response: Notify,
 	offline: AtomicBool,
@@ -25,10 +26,6 @@ struct HttpControl {
 async fn control_http(
 	HttpState(control): HttpState<Arc<HttpControl>>, request: Request, next: Next,
 ) -> Response {
-	if control.offline.load(Ordering::SeqCst) {
-		control.offline_requests.fetch_add(1, Ordering::SeqCst);
-		return StatusCode::SERVICE_UNAVAILABLE.into_response();
-	}
 	let is_melt = request.method() == Method::POST && request.uri().path() == "/v1/melt/bolt11";
 	if is_melt {
 		control.melt_requests.fetch_add(1, Ordering::SeqCst);
@@ -36,7 +33,13 @@ async fn control_http(
 	if request.method() == Method::POST && request.uri().path() == "/v1/restore" {
 		control.restore_requests.fetch_add(1, Ordering::SeqCst);
 	}
-	let hold = is_melt && control.hold_next_melt.swap(false, Ordering::SeqCst);
+	if control.offline.load(Ordering::SeqCst) {
+		control.offline_requests.fetch_add(1, Ordering::SeqCst);
+		return StatusCode::SERVICE_UNAVAILABLE.into_response();
+	}
+	let is_issue = request.method() == Method::POST && request.uri().path() == "/v1/mint/bolt11";
+	let hold = (is_melt && control.hold_next_melt.swap(false, Ordering::SeqCst))
+		|| (is_issue && control.hold_next_issue.swap(false, Ordering::SeqCst));
 	let response = next.run(request).await;
 	if hold {
 		// The mint has handled the submission, but the old wallet cannot see its
@@ -95,6 +98,12 @@ impl LiveMint {
 	async fn old_wallet(
 		&self, submitted: bool, outcome: MeltQuoteState,
 	) -> (std::path::PathBuf, Arc<dyn DynStore>) {
+		self.old_wallet_operation(submitted, outcome, false).await
+	}
+
+	async fn old_wallet_operation(
+		&self, submitted: bool, outcome: MeltQuoteState, issue: bool,
+	) -> (std::path::PathBuf, Arc<dyn DynStore>) {
 		let generator = std::env::var_os("ORANGE_CDK016_GENERATOR")
 			.expect("run ci/test-cashu-upgrade.sh to build the old-version generator");
 		let description = cdk_fake_wallet::FakeInvoiceDescription {
@@ -114,16 +123,18 @@ impl LiveMint {
 		command
 			.arg(&path)
 			.arg(&self.url)
-			.arg(invoice)
+			.arg(if issue { "issue".to_owned() } else { invoice })
 			.kill_on_drop(true)
 			.stdout(Stdio::null())
 			.stderr(Stdio::inherit());
-		if submitted {
+		if issue {
+			self.control.hold_next_issue.store(true, Ordering::SeqCst);
+		} else if submitted {
 			self.control.hold_next_melt.store(true, Ordering::SeqCst);
 			command.arg("submit");
 		}
 		let mut child = command.spawn().unwrap();
-		if submitted {
+		if submitted || issue {
 			tokio::select! {
 				_ = self.control.response_ready.notified() => {},
 				status = child.wait() => panic!("old wallet exited before the response gate: {status:?}"),
@@ -350,4 +361,49 @@ fn cdk016_funded_wallet_keeps_pending_melt_reserved_after_lost_response() {
 #[ignore = "requires the CDK 0.16 fixture generator; run ci/test-cashu-upgrade.sh"]
 fn cdk016_funded_wallet_retries_recovery_after_mint_unavailability() {
 	recover_submitted_melt(MeltQuoteState::Paid, true);
+}
+
+#[test]
+#[ignore = "requires the CDK 0.16 fixture generator; run ci/test-cashu-upgrade.sh"]
+fn cdk016_funded_wallet_opens_with_issue_saga_offline_then_recovers() {
+	run_upgrade_test(async {
+		let mint = LiveMint::new().await;
+		let (path, store) = mint.old_wallet_operation(false, MeltQuoteState::Paid, true).await;
+		let db = CashuKvDatabase::new(store.clone()).await.unwrap();
+		let sagas = db.get_incomplete_sagas().await.unwrap();
+		assert_eq!(sagas.len(), 1);
+		assert_eq!(sagas[0].state, WalletSagaState::Issue(IssueSagaState::MintRequested));
+		let operation = sagas[0].id;
+		drop(db);
+		mint.control.offline.store(true, Ordering::SeqCst);
+		let cashu = open_cashu(store.clone(), &mint.url)
+			.await
+			.expect("offline issue recovery must not block startup");
+		let wallet = &cashu.cashu_wallet;
+		assert_eq!(wallet.total_balance().await.unwrap(), cdk::Amount::ZERO);
+		assert_eq!(wallet.localstore.get_incomplete_sagas().await.unwrap()[0].id, operation);
+		assert_eq!(wallet.recover_incomplete_sagas().await.unwrap().failed, 1);
+		assert!(mint.control.offline_requests.load(Ordering::SeqCst) > 0);
+		assert!(mint.control.restore_requests.load(Ordering::SeqCst) > 0);
+		close_wallet(cashu);
+		mint.control.offline.store(false, Ordering::SeqCst);
+		for _ in 0..2 {
+			let cashu = open_cashu(store.clone(), &mint.url).await.unwrap();
+			let wallet = &cashu.cashu_wallet;
+			assert_eq!(wallet.total_balance().await.unwrap(), cdk::Amount::from(64));
+			assert!(wallet.localstore.get_incomplete_sagas().await.unwrap().is_empty());
+			let transactions = wallet
+				.localstore
+				.list_transactions(None, Some(TransactionDirection::Incoming), None)
+				.await
+				.unwrap();
+			assert_eq!(transactions.len(), 1);
+			assert_eq!(transactions[0].status, TransactionStatus::Completed);
+			assert_eq!(transactions[0].amount, cdk::Amount::from(64));
+			close_wallet(cashu);
+		}
+		drop(store);
+		mint.stop().await;
+		path
+	});
 }

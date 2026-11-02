@@ -345,9 +345,25 @@ impl CashuKvDatabase {
 		if self.proofs_cache_needs_reload.load(Ordering::Relaxed) {
 			let proofs = self.load_proofs_from_store().await?;
 			*self.proofs_cache.write().unwrap() = proofs;
-			self.proofs_cache_needs_reload.store(false, Ordering::Relaxed);
+			self.proofs_cache_needs_reload.store(false, Ordering::Release);
 		}
 		Ok(())
+	}
+
+	// Reads can use a committed cache without waiting for the mutation mutex.
+	// An in-flight or uncertain write still requires synchronization and reload.
+	async fn read_proofs<T>(
+		&self, read: impl FnOnce(&[ProofInfo]) -> T,
+	) -> Result<T, DatabaseError> {
+		{
+			let cache = self.proofs_cache.read().unwrap();
+			if !self.proofs_cache_needs_reload.load(Ordering::Acquire) {
+				return Ok(read(&cache));
+			}
+		}
+		let _lock = self.proofs_mutation_lock.lock().await;
+		self.reload_uncertain_proofs().await?;
+		Ok(read(&self.proofs_cache.read().unwrap()))
 	}
 
 	async fn reserved_proofs(
@@ -387,7 +403,7 @@ impl CashuKvDatabase {
 
 		// An interrupted write or lost acknowledgement leaves the commit uncertain.
 		// Keep readers/writers from trusting the old cache until it is reloaded.
-		self.proofs_cache_needs_reload.store(true, Ordering::Relaxed);
+		self.proofs_cache_needs_reload.store(true, Ordering::Release);
 		KVStore::write(self.store.as_ref(), CASHU_PRIMARY_KEY, PROOFS_KEY, PROOFS_BLOB_KEY, data)
 			.await
 			.map_err(DatabaseError::Io)
@@ -938,7 +954,7 @@ impl WalletDatabase<cdk::cdk_database::Error> for CashuKvDatabase {
 		if changed {
 			self.persist_proofs(&updated_proofs).await?;
 			*self.proofs_cache.write().unwrap() = updated_proofs;
-			self.proofs_cache_needs_reload.store(false, Ordering::Relaxed);
+			self.proofs_cache_needs_reload.store(false, Ordering::Release);
 		}
 
 		Ok(())
@@ -948,10 +964,7 @@ impl WalletDatabase<cdk::cdk_database::Error> for CashuKvDatabase {
 		&self, mint_url: Option<MintUrl>, unit: Option<CurrencyUnit>, state: Option<Vec<State>>,
 		spending_conditions: Option<Vec<SpendingConditions>>,
 	) -> Result<Vec<ProofInfo>, cdk::cdk_database::Error> {
-		let _lock = self.proofs_mutation_lock.lock().await;
-		self.reload_uncertain_proofs().await?;
-		let cache = self.proofs_cache.read().unwrap();
-		let mut filtered_proofs = cache.clone();
+		let mut filtered_proofs = self.read_proofs(|cache| cache.to_vec()).await?;
 
 		// Apply filters
 		if let Some(mint_url) = mint_url {
@@ -1004,7 +1017,7 @@ impl WalletDatabase<cdk::cdk_database::Error> for CashuKvDatabase {
 		if changed {
 			self.persist_proofs(&updated_proofs).await?;
 			*self.proofs_cache.write().unwrap() = updated_proofs;
-			self.proofs_cache_needs_reload.store(false, Ordering::Relaxed);
+			self.proofs_cache_needs_reload.store(false, Ordering::Release);
 		}
 
 		Ok(())
@@ -1173,10 +1186,9 @@ impl WalletDatabase<cdk::cdk_database::Error> for CashuKvDatabase {
 	async fn get_proofs_by_ys(
 		&self, ys: Vec<PublicKey>,
 	) -> Result<Vec<ProofInfo>, cdk::cdk_database::Error> {
-		let _lock = self.proofs_mutation_lock.lock().await;
-		self.reload_uncertain_proofs().await?;
-		let cache = self.proofs_cache.read().unwrap();
-		Ok(cache.iter().filter(|p| ys.contains(&p.y)).cloned().collect())
+		Ok(self
+			.read_proofs(|cache| cache.iter().filter(|p| ys.contains(&p.y)).cloned().collect())
+			.await?)
 	}
 
 	async fn add_saga(&self, saga: WalletSaga) -> Result<(), cdk::cdk_database::Error> {
@@ -1281,7 +1293,7 @@ impl WalletDatabase<cdk::cdk_database::Error> for CashuKvDatabase {
 		}
 		self.persist_proofs(&proofs).await?;
 		*self.proofs_cache.write().unwrap() = proofs;
-		self.proofs_cache_needs_reload.store(false, Ordering::Relaxed);
+		self.proofs_cache_needs_reload.store(false, Ordering::Release);
 		Ok(())
 	}
 
@@ -1302,7 +1314,7 @@ impl WalletDatabase<cdk::cdk_database::Error> for CashuKvDatabase {
 		}
 		self.persist_proofs(&proofs).await?;
 		*self.proofs_cache.write().unwrap() = proofs;
-		self.proofs_cache_needs_reload.store(false, Ordering::Relaxed);
+		self.proofs_cache_needs_reload.store(false, Ordering::Release);
 		KVStore::remove(
 			self.store.as_ref(),
 			CASHU_PRIMARY_KEY,
@@ -1825,6 +1837,39 @@ mod tests {
 
 		assert_eq!(cache, vec![replacement]);
 		assert_eq!(cache.iter().filter(|proof| proof.y == original.y).count(), 1);
+	}
+
+	#[test]
+	fn update_proofs_cache_deduplicates_added_proofs_by_y() {
+		let original = proof_info("duplicate added proof", 1);
+		let replacement = proof_info("duplicate added proof", 2);
+		let mut cache = Vec::new();
+		CashuKvDatabase::update_proofs_cache(
+			&mut cache,
+			vec![original.clone(), replacement.clone()],
+			vec![],
+		);
+		assert_eq!(cache, vec![replacement]);
+		assert_eq!(cache.iter().filter(|proof| proof.y == original.y).count(), 1);
+	}
+
+	#[tokio::test]
+	async fn committed_proof_reads_do_not_wait_for_the_mutation_lock() {
+		let store = Arc::new(ProofTestStore::default());
+		let database = CashuKvDatabase::new(store).await.unwrap();
+		let proof = proof_info("committed proof", 2);
+		database.update_proofs(vec![proof.clone()], vec![]).await.unwrap();
+		let _writer = database.proofs_mutation_lock.lock().await;
+		tokio::time::timeout(std::time::Duration::from_secs(1), async {
+			assert_eq!(
+				database.get_proofs_by_ys(vec![proof.y]).await.unwrap(),
+				vec![proof.clone()]
+			);
+			assert_eq!(all_proofs(&database).await, vec![proof]);
+			assert_eq!(database.get_balance(None, None, None).await.unwrap(), 2);
+		})
+		.await
+		.expect("committed reads should not wait for a writer");
 	}
 
 	#[test]

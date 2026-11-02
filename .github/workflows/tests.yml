@@ -79,6 +79,11 @@ jobs:
           repo-token: ${{ secrets.GITHUB_TOKEN }}
 
       - uses: Swatinem/rust-cache@v2.7.8
+        with:
+          # Include the standalone old-version generator's dependency tree.
+          workspaces: |
+            . -> target
+            orange-sdk/tests/fixtures/cdk016-generator -> target
 
       - name: Cache package-enabled Esplora
         id: cache-esplora

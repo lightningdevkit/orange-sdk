@@ -58,7 +58,12 @@ async fn main() {
 		})
 		.await
 		.unwrap();
-		wallet.mint(&quote.id, Default::default(), None).await.unwrap();
+		let issue_only = std::env::args().nth(3).as_deref() == Some("issue");
+		let result = wallet.mint(&quote.id, Default::default(), None).await;
+		if issue_only {
+			panic!("test server unexpectedly delivered the mint response: {result:?}");
+		}
+		result.unwrap();
 		assert_eq!(wallet.total_balance().await.unwrap(), Amount::from(64));
 		let invoice = std::env::args().nth(3).expect("external fake invoice");
 		let quote = wallet.melt_quote(PaymentMethod::BOLT11, invoice, None, None).await.unwrap();
