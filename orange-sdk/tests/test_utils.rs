@@ -683,7 +683,8 @@ pub async fn open_channel_from_lsp(wallet: &orange_sdk::Wallet, payer: Arc<Node>
 	// wait for payment success from payer side
 	let p = Arc::clone(&payer);
 	wait_for_condition("payer payment success", || {
-		let res = p.payment(&payment_id).is_some_and(|p| p.status == PaymentStatus::Succeeded);
+		let res =
+			p.payment(&payment_id).unwrap().is_some_and(|p| p.status == PaymentStatus::Succeeded);
 		async move { res }
 	})
 	.await;
