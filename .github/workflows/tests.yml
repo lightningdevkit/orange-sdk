@@ -18,7 +18,7 @@ env:
 jobs:
   rust_tests:
     name: Rust Checks
-    runs-on: self-hosted
+    runs-on: ubuntu-latest
     timeout-minutes: 120
     steps:
       - uses: actions/checkout@v4
@@ -63,7 +63,7 @@ jobs:
 
   cashu_tests:
     name: Cashu Tests
-    runs-on: self-hosted
+    runs-on: ubuntu-latest
     timeout-minutes: 120
     steps:
       - uses: actions/checkout@v4
