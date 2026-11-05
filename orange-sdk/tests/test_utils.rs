@@ -525,6 +525,7 @@ async fn build_test_nodes() -> TestParams {
 			t.local_addr().unwrap().port()
 		};
 		let cdk_addr = SocketAddr::from_str(format!("127.0.0.1:{cdk_port}").as_str()).unwrap();
+		let mem_db = Arc::new(cdk_sqlite::mint::memory::empty().await.unwrap());
 		let cdk = cdk_ldk_node::CdkLdkNodeBuilder::new(
 			Network::Regtest,
 			cdk_ldk_node::ChainSource::BitcoinRpc(BitcoinRpcConfig {
@@ -537,6 +538,7 @@ async fn build_test_nodes() -> TestParams {
 			tmp.to_str().unwrap().to_string(),
 			FeeReserve { min_fee_reserve: Default::default(), percent_fee_reserve: 0.0 },
 			vec![cdk_addr.into()],
+			mem_db.clone(),
 		)
 		.build()
 		.unwrap();
@@ -552,7 +554,6 @@ async fn build_test_nodes() -> TestParams {
 		let lsp_listen_clone = lsp_listen.clone();
 		let mint = {
 			// build mint
-			let mem_db = Arc::new(cdk_sqlite::mint::memory::empty().await.unwrap());
 			let mut mint_seed: [u8; 64] = [0; 64];
 			rand::thread_rng().fill_bytes(&mut mint_seed);
 			let mut builder = MintBuilder::new(mem_db.clone());

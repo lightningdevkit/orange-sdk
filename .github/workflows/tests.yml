@@ -67,6 +67,9 @@ jobs:
     timeout-minutes: 120
     steps:
       - uses: actions/checkout@v4
+        with:
+          # The upgrade generator compiles the adapter from a pinned old commit.
+          fetch-depth: 0
       - uses: dtolnay/rust-toolchain@stable
 
       - name: Install Protoc
@@ -76,6 +79,11 @@ jobs:
           repo-token: ${{ secrets.GITHUB_TOKEN }}
 
       - uses: Swatinem/rust-cache@v2.7.8
+        with:
+          # Include the standalone old-version generator's dependency tree.
+          workspaces: |
+            . -> target
+            orange-sdk/tests/fixtures/cdk016-generator -> target
 
       - name: Cache package-enabled Esplora
         id: cache-esplora
@@ -94,3 +102,8 @@ jobs:
 
       - name: Run cashu tests
         run: cargo test --features _cashu-tests -- --test-threads=2 --nocapture
+
+      - name: Test funded Cashu upgrades from CDK 0.16
+        env:
+          TMPDIR: ${{ runner.temp }}
+        run: bash ci/test-cashu-upgrade.sh

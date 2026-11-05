@@ -19,7 +19,7 @@ impl From<CdkCurrencyUnit> for CurrencyUnit {
 			CdkCurrencyUnit::Usd => CurrencyUnit::Usd,
 			CdkCurrencyUnit::Eur => CurrencyUnit::Eur,
 			CdkCurrencyUnit::Auth => CurrencyUnit::Auth,
-			CdkCurrencyUnit::Custom(unit) => CurrencyUnit::Custom(unit),
+			CdkCurrencyUnit::Custom(unit) => CurrencyUnit::Custom(unit.to_string()),
 			_ => CurrencyUnit::Sat,
 		}
 	}
@@ -33,7 +33,7 @@ impl From<CurrencyUnit> for CdkCurrencyUnit {
 			CurrencyUnit::Usd => CdkCurrencyUnit::Usd,
 			CurrencyUnit::Eur => CdkCurrencyUnit::Eur,
 			CurrencyUnit::Auth => CdkCurrencyUnit::Auth,
-			CurrencyUnit::Custom(unit) => CdkCurrencyUnit::Custom(unit),
+			CurrencyUnit::Custom(unit) => CdkCurrencyUnit::Custom(unit.into()),
 		}
 	}
 }

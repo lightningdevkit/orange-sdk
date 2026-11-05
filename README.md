@@ -141,6 +141,38 @@ The wallet's behavior is controlled by `Tunables`:
 - **Spark** - Custodial Lightning wallet (default)
 - **Cashu** - Ecash-based wallet
 
+### Upgrading Cashu wallets from CDK 0.16 to 0.18.3
+
+Orange stores Cashu wallet records in its own KV namespaces within `orange.sqlite`
+(or the configured remote store), rather than CDK's SQL wallet tables. On startup,
+it automatically rekeys existing saga transactions to CDK's new transaction IDs
+before wallet recovery runs. The migration copies before deleting, resumes after
+interruption, and rejects conflicting records without overwriting them. Orange's
+public payment IDs remain based on quote IDs.
+
+Existing proofs, quotes, keysets, and in-flight sagas remain readable. CDK supplies
+serde defaults for the new fields and accepts the old `payment_preimage` field.
+Existing transactions default to completed; new transactions preserve their
+pending/completed/failed status. A separate persistent derivation counter is
+created as needed, leaving existing keyset counters and quote signing keys intact.
+Legacy proof reservation indexes remain readable during recovery.
+
+Startup runs saga recovery before starting payment tasks, on every open (including
+wallets already restored from seed). Database initialization errors or an unreadable
+recovery queue stop initialization. Individual failed recoveries are logged and
+startup continues, so a mint outage does not block access to the rest of the wallet.
+Unresolved operations retain their reservations and are retried on the next startup.
+
+Back up the complete store before upgrading and open it with only one active
+wallet instance. Downgrading an upgraded store is not supported; restore the
+pre-upgrade backup if a rollback is needed. The test mint uses an ephemeral CDK
+SQLite database; Orange does not manage persistent mint databases or `cdk-mintd`
+configuration. Operators of a separate mint must follow the upstream
+[CDK migration guide](https://github.com/cashubtc/cdk/blob/v0.18.2/docs/migrations/v0.18.md).
+
+See the [CDK 0.18.2 release notes](https://github.com/cashubtc/cdk/releases/tag/v0.18.2)
+and the upstream [transaction rekey migration](https://github.com/cashubtc/cdk/blob/v0.18.2/crates/cdk-sql-common/src/wallet/migrations/sqlite/20260726000000_rekey_saga_transactions.sql).
+
 ### Chain Sources
 - Electrum servers
 - Esplora servers (with optional Basic auth)
