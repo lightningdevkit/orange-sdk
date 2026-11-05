@@ -1071,8 +1071,24 @@ async fn test_concurrent_splice_in_and_out_preserve_pending_events() {
 			ev => panic!("Expected first SplicePending event, got {ev:?}"),
 		};
 
+		// Regtest can confirm immediately, before the peer processes our signatures.
+		// Wait for both sides to negotiate before mining the splice transaction.
+		test_utils::wait_for_condition("LSP splice-in negotiation", || async {
+			params.lsp_splices.lock().unwrap().contains(&first_splice.1)
+		})
+		.await;
+		wait_for_tx(&electrsd.client, first_splice.1.txid).await;
 		generate_blocks(&bitcoind, &electrsd, 6).await;
 		wallet.sync_ln_wallet().unwrap();
+		lsp.sync_wallets().unwrap();
+		test_utils::wait_for_condition("splice-in locked on both peers", || async {
+			wallet.channels().iter().any(|c| c.funding_txo == Some(first_splice.1) && c.is_usable)
+				&& lsp
+					.list_channels()
+					.iter()
+					.any(|c| c.funding_txo == Some(first_splice.1) && c.is_usable)
+		})
+		.await;
 
 		let addr = third_party.onchain_payment().new_address().unwrap();
 		let send_amount = Amount::from_sats(10_000).unwrap();
