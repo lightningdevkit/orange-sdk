@@ -568,7 +568,9 @@ impl Cashu {
 			let l = Arc::clone(&logger);
 			runtime.spawn_background_task(async move {
 				match w.restore().await {
-					Err(e) => log_error!(l, "Failed to restore cashu mint: {e}"),
+					Err(e) => {
+						log_error!(l, "Failed to restore cashu mint: {e}");
+					},
 					Ok(restored) => {
 						if restored.unspent > cdk::Amount::ZERO {
 							log_info!(l, "Restored cashu mint: {}: {:#?}", w.mint_url, restored);

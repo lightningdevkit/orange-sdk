@@ -516,7 +516,10 @@ impl SparkEventHandler {
 						self.payment_success_sender.send(()).unwrap();
 					},
 					_ => {
-						log_debug!(self.logger, "Unsupported payment details for Send: {payment:?}")
+						log_debug!(
+							self.logger,
+							"Unsupported payment details for Send: {payment:?}"
+						);
 					},
 				}
 			},
@@ -548,7 +551,7 @@ impl SparkEventHandler {
 						log_debug!(
 							self.logger,
 							"Unsupported payment details for Receive: {payment:?}"
-						)
+						);
 					},
 				}
 			},
@@ -595,7 +598,7 @@ impl SparkEventHandler {
 						.await?;
 				},
 				_ => {
-					log_debug!(self.logger, "Unsupported payment details for Send: {payment:?}")
+					log_debug!(self.logger, "Unsupported payment details for Send: {payment:?}");
 				},
 			},
 			PaymentType::Receive => {
