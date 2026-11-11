@@ -36,7 +36,11 @@ async fn open_cashu(
 	let logger = Arc::new(crate::logging::Logger::new(&config.logger_type).unwrap());
 	let runtime = Arc::new(crate::runtime::Runtime::new(logger.clone()).unwrap());
 	let metadata = crate::store::TxMetadataStore::new(store.clone()).await;
-	let events = Arc::new(crate::EventQueue::new(store.clone(), metadata.clone(), logger.clone()));
+	let events = Arc::new(
+		crate::EventQueue::new(store.clone(), metadata.clone(), logger.clone())
+			.await
+			.expect("event queue"),
+	);
 	Cashu::init(&config, cashu_config, store, events, metadata, logger, runtime).await
 }
 

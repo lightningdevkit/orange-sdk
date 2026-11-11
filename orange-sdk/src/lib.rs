@@ -640,8 +640,9 @@ impl Wallet {
 
 		let tx_metadata = TxMetadataStore::new(Arc::clone(&store)).await;
 
-		let event_queue =
-			Arc::new(EventQueue::new(Arc::clone(&store), tx_metadata.clone(), Arc::clone(&logger)));
+		let event_queue = Arc::new(
+			EventQueue::new(Arc::clone(&store), tx_metadata.clone(), Arc::clone(&logger)).await?,
+		);
 
 		// Cashu must init before LDK Node because CashuKvDatabase does
 		// synchronous SQLite reads that deadlock with LDK Node's background
