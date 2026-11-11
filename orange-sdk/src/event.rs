@@ -17,9 +17,8 @@ use ldk_node::{CustomTlvRecord, UserChannelId};
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
-use std::task::{Poll, Waker};
 use std::time::SystemTime;
-use tokio::sync::{Mutex, watch};
+use tokio::sync::{Mutex, Notify, watch};
 
 /// The event queue will be persisted under this key.
 pub(crate) const EVENT_QUEUE_PERSISTENCE_PRIMARY_NAMESPACE: &str = "";
@@ -210,7 +209,11 @@ impl_writeable_tlv_based_enum!(Event,
 pub struct EventQueue {
 	queue: Arc<Mutex<VecDeque<Event>>>,
 	pending_mpp_events: Arc<Mutex<HashMap<PaymentHash, Vec<Event>>>>,
-	waker: Arc<Mutex<Option<Waker>>>,
+	/// Signals a waiting [`EventQueue::next_event_async`] that the queue changed. A push or an
+	/// acknowledgement calls [`Notify::notify_one`] after releasing the queue lock; the waiter
+	/// registers before it checks the queue, so no change can slip between its check and its
+	/// wait.
+	notify: Arc<Notify>,
 	kv_store: Arc<dyn DynStore>,
 	rebalance_enabled: RebalanceEnabledCache,
 	tx_metadata: TxMetadataStore,
@@ -223,9 +226,9 @@ impl EventQueue {
 	) -> Self {
 		let queue = Arc::new(Mutex::new(VecDeque::new()));
 		let pending_mpp_events = Arc::new(Mutex::new(HashMap::new()));
-		let waker = Arc::new(Mutex::new(None));
+		let notify = Arc::new(Notify::new());
 		let rebalance_enabled = RebalanceEnabledCache::new(Arc::clone(&kv_store));
-		Self { queue, pending_mpp_events, waker, kv_store, rebalance_enabled, tx_metadata, logger }
+		Self { queue, pending_mpp_events, notify, kv_store, rebalance_enabled, tx_metadata, logger }
 	}
 
 	pub(crate) async fn get_rebalance_enabled(&self) -> bool {
@@ -333,9 +336,7 @@ impl EventQueue {
 			self.persist_queue(&locked_queue).await?;
 		}
 
-		if let Some(waker) = self.waker.lock().await.take() {
-			waker.wake();
-		}
+		self.notify.notify_one();
 		Ok(())
 	}
 
@@ -344,8 +345,25 @@ impl EventQueue {
 		locked_queue.front().cloned()
 	}
 
+	/// Waits until the queue has an event and returns it (without removing it).
+	///
+	/// The wait is registered before the queue is checked, so a push that lands between the
+	/// check and the wait is not lost: [`EventQueue::push_event`] and
+	/// [`EventQueue::event_handled`] call [`Notify::notify_one`] after releasing the queue lock,
+	/// and a `notify_one` with no registered waiter leaves a permit that completes the next wait
+	/// at once. A wait that is dropped after being notified (the caller raced it against a
+	/// shutdown, say) passes the notification on to the next waiter, so cancelling this future
+	/// cannot swallow an event either. Waking spuriously is harmless: the loop checks the queue
+	/// again.
 	pub(crate) async fn next_event_async(&self) -> Event {
-		EventFuture { event_queue: Arc::clone(&self.queue), waker: Arc::clone(&self.waker) }.await
+		loop {
+			let mut notified = std::pin::pin!(self.notify.notified());
+			notified.as_mut().enable();
+			if let Some(event) = self.queue.lock().await.front().cloned() {
+				return event;
+			}
+			notified.await;
+		}
 	}
 
 	pub(crate) async fn event_handled(&self) -> Result<(), ldk_node::lightning::io::Error> {
@@ -355,9 +373,7 @@ impl EventQueue {
 			self.persist_queue(&locked_queue).await?;
 		}
 
-		if let Some(waker) = self.waker.lock().await.take() {
-			waker.wake();
-		}
+		self.notify.notify_one();
 		Ok(())
 	}
 
@@ -402,7 +418,12 @@ mod tests {
 	use crate::logging::LoggerType;
 	use crate::store::{PaymentId, PaymentType, TxMetadata, TxMetadataStore, TxType};
 	use ldk_node::io::sqlite_store::SqliteStore;
+	use ldk_node::lightning::io;
+	use ldk_node::lightning::util::persist::{PageToken, PaginatedListResponse};
+	use std::future::Future;
 	use std::path::PathBuf;
+	use std::pin::Pin;
+	use std::sync::atomic::{AtomicUsize, Ordering};
 	use std::time::{Duration, UNIX_EPOCH};
 
 	fn temp_sqlite_store() -> (PathBuf, Arc<dyn DynStore>) {
@@ -484,6 +505,167 @@ mod tests {
 			})
 		);
 	}
+
+	fn failed_payment(tag: u8) -> Event {
+		Event::PaymentFailed {
+			payment_id: PaymentId::SelfCustodial([tag; 32]),
+			payment_hash: Some(PaymentHash([tag; 32])),
+			reason: None,
+		}
+	}
+
+	/// A store whose writes wait for the test to open a gate, so a push can be held inside
+	/// `persist_queue` with the queue lock taken, where a slow remote store (VSS over a mobile
+	/// link) holds it for hundreds of milliseconds.
+	struct GatedStore {
+		inner: Arc<dyn DynStore>,
+		gate: watch::Receiver<bool>,
+	}
+
+	impl DynStore for GatedStore {
+		fn read_async(
+			&self, p: &str, s: &str, k: &str,
+		) -> Pin<Box<dyn Future<Output = Result<Vec<u8>, io::Error>> + Send + 'static>> {
+			self.inner.read_async(p, s, k)
+		}
+
+		fn write_async(
+			&self, p: &str, s: &str, k: &str, buf: Vec<u8>,
+		) -> Pin<Box<dyn Future<Output = Result<(), io::Error>> + Send + 'static>> {
+			let inner = Arc::clone(&self.inner);
+			let mut gate = self.gate.clone();
+			let (p, s, k) = (p.to_owned(), s.to_owned(), k.to_owned());
+			Box::pin(async move {
+				gate.wait_for(|open| *open)
+					.await
+					.map_err(|_| io::Error::new(io::ErrorKind::Other, "gate dropped"))?;
+				inner.write_async(&p, &s, &k, buf).await
+			})
+		}
+
+		fn remove_async(
+			&self, p: &str, s: &str, k: &str, lazy: bool,
+		) -> Pin<Box<dyn Future<Output = Result<(), io::Error>> + Send + 'static>> {
+			self.inner.remove_async(p, s, k, lazy)
+		}
+
+		fn list_async(
+			&self, p: &str, s: &str,
+		) -> Pin<Box<dyn Future<Output = Result<Vec<String>, io::Error>> + Send + 'static>> {
+			self.inner.list_async(p, s)
+		}
+
+		fn list_paginated_async(
+			&self, p: &str, s: &str, page_token: Option<PageToken>,
+		) -> Pin<Box<dyn Future<Output = Result<PaginatedListResponse, io::Error>> + Send + 'static>>
+		{
+			self.inner.list_paginated_async(p, s, page_token)
+		}
+	}
+
+	/// Stands in for the thread `Wallet::wait_next_event` parks in `block_on`: a wake-up polls
+	/// the consumer again at once, so the poll lands wherever the wake-up came from.
+	struct PollOnWake {
+		consumer: std::sync::Mutex<Option<Pin<Box<dyn Future<Output = Event> + Send>>>>,
+		delivered: std::sync::Mutex<Option<Event>>,
+		polls: AtomicUsize,
+		reentrant_wakes: AtomicUsize,
+	}
+
+	impl PollOnWake {
+		fn new(consumer: Pin<Box<dyn Future<Output = Event> + Send>>) -> Self {
+			Self {
+				consumer: std::sync::Mutex::new(Some(consumer)),
+				delivered: std::sync::Mutex::new(None),
+				polls: AtomicUsize::new(0),
+				reentrant_wakes: AtomicUsize::new(0),
+			}
+		}
+
+		fn poll_consumer(self: &Arc<Self>) {
+			let Ok(mut slot) = self.consumer.try_lock() else {
+				self.reentrant_wakes.fetch_add(1, Ordering::SeqCst);
+				return;
+			};
+			let Some(consumer) = slot.as_mut() else { return };
+			self.polls.fetch_add(1, Ordering::SeqCst);
+			let waker = std::task::Waker::from(Arc::clone(self));
+			let mut cx = std::task::Context::from_waker(&waker);
+			if let std::task::Poll::Ready(event) = consumer.as_mut().poll(&mut cx) {
+				*self.delivered.lock().unwrap() = Some(event);
+				*slot = None;
+			}
+		}
+
+		fn delivered(&self) -> Option<Event> {
+			self.delivered.lock().unwrap().clone()
+		}
+	}
+
+	impl std::task::Wake for PollOnWake {
+		fn wake(self: Arc<Self>) {
+			self.poll_consumer();
+		}
+
+		fn wake_by_ref(self: &Arc<Self>) {
+			self.poll_consumer();
+		}
+	}
+
+	/// The consumer is woken while one pusher still holds its post-persist section and a second
+	/// pusher holds the queue inside its own persist. Its poll must leave it registered for the
+	/// next change. Before the `Notify` rewrite, `EventFuture::poll` read both `try_lock`
+	/// failures as "nothing to do" and returned `Pending` without a waker, so the second push,
+	/// and every push after it, woke nobody: the wallet kept queueing events that no
+	/// `wait_next_event` would ever return.
+	#[tokio::test]
+	async fn a_poll_that_lands_on_two_busy_pushers_is_still_woken() {
+		let (_path, sqlite) = temp_sqlite_store();
+		let (open_gate, gate) = watch::channel(false);
+		let store: Arc<dyn DynStore> = Arc::new(GatedStore { inner: Arc::clone(&sqlite), gate });
+		let logger = Arc::new(Logger::new(&LoggerType::LogFacade).expect("logger"));
+		let tx_metadata = TxMetadataStore::new(sqlite).await;
+		let queue = Arc::new(EventQueue::new(store, tx_metadata, logger));
+
+		// The consumer waits on an empty queue.
+		let consumer = Arc::new(PollOnWake::new({
+			let queue = Arc::clone(&queue);
+			Box::pin(async move { queue.next_event_async().await })
+		}));
+		consumer.poll_consumer();
+		assert_eq!(consumer.delivered(), None);
+
+		// Pusher A takes the queue lock and parks in its persist; pusher B queues up behind it.
+		let a = tokio::spawn({
+			let queue = Arc::clone(&queue);
+			async move { queue.add_event(failed_payment(1)).await }
+		});
+		for _ in 0..8 {
+			tokio::task::yield_now().await;
+		}
+		let b = tokio::spawn({
+			let queue = Arc::clone(&queue);
+			async move { queue.add_event(failed_payment(2)).await }
+		});
+		for _ in 0..8 {
+			tokio::task::yield_now().await;
+		}
+		assert!(!a.is_finished() && !b.is_finished());
+
+		// A's persist completes: the queue lock passes to B, and A wakes the consumer, whose poll
+		// lands while B holds the queue. Then B's persist completes.
+		open_gate.send(true).expect("gate");
+		a.await.expect("join").expect("push A");
+		b.await.expect("join").expect("push B");
+
+		assert_eq!(consumer.reentrant_wakes.load(Ordering::SeqCst), 0);
+		assert_eq!(
+			consumer.delivered(),
+			Some(failed_payment(1)),
+			"polled {} time(s), never handed the event",
+			consumer.polls.load(Ordering::SeqCst)
+		);
+	}
 }
 
 struct EventQueueSerWrapper<'a>(&'a VecDeque<Event>);
@@ -495,28 +677,6 @@ impl Writeable for EventQueueSerWrapper<'_> {
 			e.write(writer)?;
 		}
 		Ok(())
-	}
-}
-
-struct EventFuture {
-	event_queue: Arc<Mutex<VecDeque<Event>>>,
-	waker: Arc<Mutex<Option<Waker>>>,
-}
-
-impl Future for EventFuture {
-	type Output = Event;
-
-	fn poll(
-		self: core::pin::Pin<&mut Self>, cx: &mut core::task::Context<'_>,
-	) -> Poll<Self::Output> {
-		if let Some(event) = self.event_queue.try_lock().ok().and_then(|q| q.front().cloned()) {
-			Poll::Ready(event)
-		} else {
-			if let Ok(mut waker) = self.waker.try_lock() {
-				*waker = Some(cx.waker().clone());
-			}
-			Poll::Pending
-		}
 	}
 }
 
